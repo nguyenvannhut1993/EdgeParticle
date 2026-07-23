@@ -66,7 +66,24 @@ namespace EdgeLighting
         float dt = 0.0f;
         if (mLastTime >= 0.0f)
         {
-            dt = std::max(0.0f, time - mLastTime);
+            if (time < mLastTime)
+            {
+                // The clock's time moved backward — e.g. Clock::Stop() resets
+                // it to 0 (Pause leaves it unchanged, so this doesn't fire for
+                // a plain pause). The existing pool no longer corresponds to
+                // any sensible point on the new timeline, so start over
+                // instead of leaving a frozen "ghost" of stale particles on
+                // screen forever (dt would otherwise just clamp to 0 below
+                // and freeze them in place rather than clearing them).
+                mParticles.clear();
+                mArcSpawnAcc.clear();
+                mPrevArcSites.clear();
+                mMovementSpawnAcc = 0.0f;
+            }
+            else
+            {
+                dt = time - mLastTime;
+            }
         }
         mLastTime = time;
         // Floor the simulated frame rate at kMinSimulatedFps: this both caps
