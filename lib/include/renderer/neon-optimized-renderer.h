@@ -1,0 +1,74 @@
+#ifndef _EDGE_LIGHTING_NEON_OPTIMIZED_RENDERER_H_
+#define _EDGE_LIGHTING_NEON_OPTIMIZED_RENDERER_H_
+
+#include "renderer/base-renderer.h"
+#include "gl/shader-program.h"
+#include "gl/vertex-array.h"
+#include "gl/texture-2d.h"
+#include "gl/framebuffer.h"
+#include <glm/glm.hpp>
+#include <vector>
+
+namespace EdgeLighting
+{
+    /// Half-resolution single-pass neon renderer for edge devices.
+    ///
+    /// Two-pass approach:
+    ///   Pass 1 — render the neon shader (highp, up to 64 gather samples) into
+    ///             a half-resolution RGBA8 FBO.
+    ///   Pass 2 — bilinear blit the half-res FBO to the full-res backbuffer.
+    ///
+    /// The perf wins are the half-res FBO, reduced sample count, data-texture
+    /// sample lookup and baked colour LUT — not reduced precision. The shader
+    /// uses highp: on desktop GLES (ANGLE) mediump = fp16, which overflows on
+    /// the large fragment coordinates and produced NaN "noise dots".
+    ///
+    /// Visual parameters are read from Config::neon (shared with the
+    /// standard single-pass NeonRenderer), so switching between them for
+    /// comparison is a one-click toggle.
+    class NeonOptimizedRenderer : public BaseRenderer
+    {
+    public:
+        NeonOptimizedRenderer() = default;
+        virtual ~NeonOptimizedRenderer() = default;
+
+        virtual bool Initialize() override;
+        virtual void Update(float deltaTime, float time, const Config &config) override;
+        virtual void Render(int viewportWidth, int viewportHeight, float time, const Config &config) override;
+        virtual void OnConfigChanged(const Config &config) override;
+
+        static constexpr int MAX_LOOP_SAMPLES = 64;
+
+    private:
+        bool setupShaders();
+        void setupGeometry(const Config &config);
+        void rebuildLoopSamples(const Config &config);
+        void rebuildGradientLUT(const Config &config);
+
+    private:
+        Config mCurrentConfig;
+        ShaderProgram mNeonShader;      // Pass 1 — half-res neon
+        ShaderProgram mBlackRectShader; // Opaque-mode fullscreen black fill
+        ShaderProgram mBlitShader;      // Pass 2 — upscale to full-res
+        Framebuffer mHalfResBuffer{"NeonOptimized.HalfRes"};
+        VertexArray mNeonVertexArray{"NeonOpt.Pass1"};
+        VertexArray mBlitVertexArray{"NeonOpt.Blit"};
+
+        std::vector<glm::vec2> mLoopSamples;
+        float mSampleSpacing = 0.0f;
+        float mQuadMargin = 0.0f; ///< Scaled/FBO-space margin to the Pass-1 quad edge (shader soft-fade).
+
+        Texture2D mGradientLUT;
+        std::vector<float> mLUTScratch;
+
+        /// Loop sample positions as an N×1 RGBA8 data texture (16-bit-packed xy),
+        /// texelFetch'd in the shader instead of a `uniform vec2[]` array. Byte
+        /// texture only (Tizen/Mali), encoded over [-mSampleMaxCoord, mSampleMaxCoord].
+        Texture2D mLoopSamplesTex;
+        std::vector<unsigned char> mLoopSamplesBytes;
+        float mSampleMaxCoord = 1.0f;
+    };
+
+} // namespace EdgeLighting
+
+#endif // _EDGE_LIGHTING_NEON_OPTIMIZED_RENDERER_H_
