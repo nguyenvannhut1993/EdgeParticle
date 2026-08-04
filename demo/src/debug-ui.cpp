@@ -765,12 +765,14 @@ void DebugUI::buildParticleSection(EdgeLighting::Config &cfg)
     ImGui::SliderFloat("Drag##Particle", &cfg.particle.drag, 0.0f, 10.0f, "%.2f");
     ImGui::SliderInt("Max alive##Particle", &cfg.particle.maxParticles, 32, 4096);
 
+    // Shared spawn tunables — same fields drive both modes (see ParticleConfig).
+    ImGui::SliderFloat("Rate (per sec)##Particle", &cfg.particle.emissionRate, 0.0f, 2000.0f, "%.0f");
+    ImGui::SliderFloat("Lifetime (s)##Particle", &cfg.particle.lifetime, 0.05f, 3.0f, "%.2f");
+    ImGui::SliderFloat("Speed (px/s)##Particle", &cfg.particle.speed, 0.0f, 400.0f, "%.0f");
+    ImGui::SliderFloat("Size (px)##Particle", &cfg.particle.sizeStart, 1.0f, 30.0f, "%.1f");
+
     if (cfg.particle.mode == EdgeLighting::ParticleMode::ARC_HEAD_TAIL)
     {
-        ImGui::SliderFloat("Rate (per sec)##Particle", &cfg.particle.emissionRate, 0.0f, 2000.0f, "%.0f");
-        ImGui::SliderFloat("Lifetime (s)##Particle", &cfg.particle.lifetime, 0.05f, 3.0f, "%.2f");
-        ImGui::SliderFloat("Speed (px/s)##Particle", &cfg.particle.speed, 0.0f, 400.0f, "%.0f");
-        ImGui::SliderFloat("Size (px)##Particle", &cfg.particle.sizeStart, 1.0f, 30.0f, "%.1f");
         ImGui::SliderFloat("Outward bias##Particle", &cfg.particle.outwardBias, 0.0f, 1.0f, "%.2f");
         ImGui::SliderFloat("Spread (deg)##Particle", &cfg.particle.spreadDeg, 0.0f, 180.0f, "%.0f");
         ImGui::Checkbox("Emit from head##Particle", &cfg.particle.emitFromHead);
@@ -779,11 +781,8 @@ void DebugUI::buildParticleSection(EdgeLighting::Config &cfg)
     }
     else
     {
-        ImGui::SliderFloat("Rate (per sec)##ParticleMv", &cfg.particle.movementEmissionRate, 0.0f, 2000.0f, "%.0f");
-        ImGui::SliderFloat("Lifetime (s)##ParticleMv", &cfg.particle.movementLifetime, 0.05f, 3.0f, "%.2f");
-        ImGui::SliderFloat("Drift speed (px/s)##ParticleMv", &cfg.particle.movementSpeed, 0.0f, 200.0f, "%.0f");
-        ImGui::SliderFloat("Size (px)##ParticleMv", &cfg.particle.movementSizeStart, 1.0f, 15.0f, "%.1f");
         ImGui::SliderFloat("Scatter radius (px)##ParticleMv", &cfg.particle.scatterRadius, 0.0f, 30.0f, "%.1f");
+        ImGui::SliderFloat("Scatter speed (px/s)##ParticleMv", &cfg.particle.scatterSpeed, 0.0f, 100.0f, "%.0f");
         ImGui::SliderFloat("Head bias##ParticleMv", &cfg.particle.headBias, 0.05f, 1.0f, "%.2f");
         ImGui::SliderFloat("Tail size fraction##ParticleMv", &cfg.particle.tailSizeFraction, 0.0f, 1.0f, "%.2f");
     }

@@ -79,6 +79,8 @@ namespace EdgeLighting
                 mArcSpawnAcc.clear();
                 mPrevArcSites.clear();
                 mMovementSpawnAcc = 0.0f;
+                mPrevMovementHead = -1.0f;
+                mFlowSign = 1.0f;
             }
             else
             {
@@ -368,12 +370,40 @@ namespace EdgeLighting
     void ParticleRenderer::emitAlongArc(const Config &config, float dt, float time)
     {
         const auto &p = config.particle;
-        if (p.movementEmissionRate <= 0.0f || dt <= 0.0f || config.neon.arcLength <= 0.001f)
+        if (p.emissionRate <= 0.0f || dt <= 0.0f || config.neon.arcLength <= 0.001f)
         {
             return;
         }
 
-        mMovementSpawnAcc += p.movementEmissionRate * dt;
+        // Track the arc's head (arcStart + arcLength, its leading edge)
+        // frame to frame so newly spawned motes drift the same way the lit
+        // arc is actually sweeping. Without this, spawnAlongArc's tangent
+        // always pointed toward increasing perimeter parameter regardless
+        // of which way the arc itself was moving — fine while arcStart only
+        // ever increased, but as soon as the effect swept the other way
+        // (a back-and-forth modulator, a shrinking arc, reversed winding)
+        // the motes drifted against the arc's motion and flew out ahead of
+        // it instead of trailing behind like a comet tail.
+        // Unwrap the perimeter's 1.0 -> 0.0 seam the same way emitFromArcs
+        // does, taking the shortest signed distance around the loop.
+        float head = config.neon.arcStart + config.neon.arcLength;
+        head -= std::floor(head);
+        if (mPrevMovementHead >= 0.0f)
+        {
+            float headDelta = head - mPrevMovementHead;
+            headDelta -= std::round(headDelta);
+            // Ignore sub-epsilon jitter (float noise, or the arc genuinely
+            // holding still) so the flow direction doesn't flicker frame to
+            // frame; keep the last direction observed while actually moving.
+            constexpr float kFlowDeadzone = 1e-4f;
+            if (std::fabs(headDelta) > kFlowDeadzone)
+            {
+                mFlowSign = (headDelta > 0.0f) ? 1.0f : -1.0f;
+            }
+        }
+        mPrevMovementHead = head;
+
+        mMovementSpawnAcc += p.emissionRate * dt;
         int toSpawn = static_cast<int>(mMovementSpawnAcc);
         mMovementSpawnAcc -= static_cast<float>(toSpawn);
 
@@ -391,11 +421,11 @@ namespace EdgeLighting
             // frame's time slice so they land pre-aged, as if they'd
             // actually spawned continuously through the frame.
             float initialAge = (static_cast<float>(toSpawn - 1 - n) / static_cast<float>(toSpawn)) * dt;
-            spawnAlongArc(config, time, initialAge);
+            spawnAlongArc(config, time, initialAge, mFlowSign);
         }
     }
 
-    void ParticleRenderer::spawnAlongArc(const Config &config, float time, float initialAge)
+    void ParticleRenderer::spawnAlongArc(const Config &config, float time, float initialAge, float flowSign)
     {
         const auto &p = config.particle;
 
@@ -411,8 +441,12 @@ namespace EdgeLighting
 
         // Tangent direction: sample a point a hair further along the arc and
         // use the vector between them, so drift is consistently oriented
-        // along the arc's increasing-parameter direction (the "flow" of the
-        // line) instead of a per-particle coin flip.
+        // (the "flow" of the line) instead of a per-particle coin flip. This
+        // raw tangent always points toward increasing perimeter parameter;
+        // flowSign (tracked in emitAlongArc from the arc's actual head
+        // movement) flips it to match whichever way the effect is really
+        // sweeping, so motes trail behind the moving arc instead of running
+        // out ahead of it when the sweep reverses.
         constexpr float kTangentEps = 0.001f;
         float aheadT = perimeterPos + kTangentEps;
         aheadT -= std::floor(aheadT);
@@ -420,10 +454,11 @@ namespace EdgeLighting
         glm::vec2 tangent = ahead - pos;
         float tangentLen = glm::length(tangent);
         tangent = tangentLen > 1e-5f ? tangent / tangentLen : glm::vec2(1.0f, 0.0f);
+        tangent *= flowSign;
 
         // Outward normal: perpendicular to the tangent above, sign-corrected
-        // to point away from the rect centre. Used only to jitter the spawn
-        // point off the line, not to drive drift direction. (Deriving this
+        // to point away from the rect centre. Jitters the spawn point off
+        // the line and seeds the perpendicular drift below. (Deriving this
         // from the tangent — rather than direction-from-centre — matters
         // because direction-from-centre is only the true outward normal at
         // the midpoint of a straight edge; elsewhere, including rounded
@@ -433,9 +468,16 @@ namespace EdgeLighting
         {
             outward = -outward;
         }
-        pos += outward * (gRng.Signed() * p.scatterRadius);
+        // Same random sign drives both the initial offset and the ongoing
+        // drift, so a mote that starts jittered to one side keeps drifting
+        // further that way instead of the two being independently random —
+        // the cloud fans out wider the longer a mote has been alive/moving,
+        // rather than the width being fixed the instant it spawns.
+        float scatterSign = gRng.Signed();
+        pos += outward * (scatterSign * p.scatterRadius);
 
-        glm::vec2 vel = tangent * p.movementSpeed * (0.5f + gRng.Uniform() * 0.5f);
+        glm::vec2 vel = tangent * p.speed * (0.5f + gRng.Uniform() * 0.5f)
+                      + outward * (scatterSign * p.scatterSpeed);
 
         // Colour from the neon gradient at the emit position, matching the
         // same time-rotated colour the neon shader is showing at that point.
@@ -467,10 +509,10 @@ namespace EdgeLighting
         Particle np;
         np.pos = pos + vel * initialAge;
         np.vel = driftedVel;
-        np.life = p.movementLifetime - initialAge;
-        np.lifeMax = p.movementLifetime;
+        np.life = p.lifetime - initialAge;
+        np.lifeMax = p.lifetime;
         np.color = col;
-        np.sizeStart = p.movementSizeStart * sizeMul;
+        np.sizeStart = p.sizeStart * sizeMul;
 
         if (np.life > 0.0f)
         {

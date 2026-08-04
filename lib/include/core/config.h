@@ -297,21 +297,32 @@ namespace EdgeLighting
         /// free slots come back.
         int maxParticles = 1024;
 
-        // --- ARC_HEAD_TAIL mode ---
+        // --- Shared spawn tunables (both modes) ---
 
-        /// Particles spawned per second per emitter site.
+        /// Particles spawned per second. ARC_HEAD_TAIL applies this per
+        /// emitter site (so e.g. head + tail active doubles the effective
+        /// total); MOVEMENT applies it as a single rate scattered across the
+        /// whole lit arc.
         float emissionRate = 200.0f;
 
         /// Lifetime in seconds. Longer lives = more particles alive at once.
         float lifetime = 0.7f;
 
         /// Initial speed in pixels/second. Actual speed randomised in
-        /// [0.5, 1.0] × this so sparks don't fly in a rigid line.
+        /// [0.5, 1.0] × this so particles don't move in a rigid line.
+        /// ARC_HEAD_TAIL blends this between tangential and outward via
+        /// @ref outwardBias; MOVEMENT applies it purely along the arc's
+        /// tangent (see @ref scatterSpeed for MOVEMENT's perpendicular
+        /// component).
         float speed = 90.0f;
 
         /// Spawn size in pixels. gl_PointSize shrinks to zero as the particle
-        /// ages, so this is the visible size right at spawn.
+        /// ages, so this is the visible size right at spawn. MOVEMENT tapers
+        /// this down toward the tail via @ref tailSizeFraction, so here it's
+        /// the size at the arc's head end.
         float sizeStart = 5.0f;
+
+        // --- ARC_HEAD_TAIL mode ---
 
         /// Fraction of the initial velocity aimed outward from the rect
         /// centre. 0 = purely tangential, 1 = purely outward. In-between mixes.
@@ -329,24 +340,18 @@ namespace EdgeLighting
 
         // --- MOVEMENT mode ---
 
-        /// Particles spawned per second, scattered across the whole lit arc.
-        float movementEmissionRate = 400.0f;
-
-        /// Lifetime in seconds for MOVEMENT-mode motes.
-        float movementLifetime = 0.5f;
-
-        /// Drift speed in pixels/second along the arc's tangent direction.
-        /// Actual speed randomised in [0.5, 1.0] × this so motes don't drift
-        /// in lockstep.
-        float movementSpeed = 30.0f;
-
-        /// Spawn size in pixels for MOVEMENT-mode motes at the head end.
-        float movementSizeStart = 3.0f;
-
         /// Max perpendicular jitter off the line, in pixels, applied at spawn
         /// so motes scatter into a soft halo around the streak instead of
         /// sitting exactly on it.
         float scatterRadius = 6.0f;
+
+        /// Perpendicular drift speed in pixels/second, signed the same way as
+        /// each mote's spawn-time scatterRadius offset so it keeps moving
+        /// outward in that direction rather than just sitting at its initial
+        /// jitter — the cloud actively widens over a mote's lifetime instead
+        /// of the width being fixed the instant it spawns. 0 = spread comes
+        /// only from the one-time spawn jitter.
+        float scatterSpeed = 15.0f;
 
         /// Skews where along the arc motes spawn, toward the head end
         /// (arcStart + arcLength) so the cloud reads as a meteor — dense at
@@ -357,7 +362,7 @@ namespace EdgeLighting
         float headBias = 0.35f;
 
         /// Spawn size at the tail end (arcStart), as a fraction of
-        /// `movementSizeStart` at the head end (arcStart + arcLength). Motes
+        /// `sizeStart` at the head end (arcStart + arcLength). Motes
         /// between the two ends are scaled by linear interpolation, so
         /// lowering this tapers the cloud from a big head to a small tail.
         float tailSizeFraction = 0.2f;
