@@ -47,7 +47,7 @@ namespace EdgeLighting
 
         // --- MOVEMENT mode: motes scattered along the whole lit arc. ---
         void emitAlongArc(const Config &config, float dt, float time);
-        void spawnAlongArc(const Config &config, float time, float initialAge, float flowSign);
+        void spawnAlongArc(const Config &config, float time, float initialAge);
 
         void uploadAndDraw();
 
@@ -68,16 +68,6 @@ namespace EdgeLighting
         /// MOVEMENT: single fractional spawn accumulator (spawns are scattered
         /// across the whole arc rather than tied to discrete sites).
         float mMovementSpawnAcc = 0.0f;
-        /// MOVEMENT: the arc's head position (arcStart + arcLength) last
-        /// frame, wrapped to [0, 1). Used to detect which way the lit arc is
-        /// actually sweeping, so newly spawned motes drift the same way
-        /// (see spawnAlongArc) instead of a fixed assumed direction.
-        /// Negative = not yet seeded.
-        float mPrevMovementHead = -1.0f;
-        /// MOVEMENT: sign of the arc's last observed sweep direction (+1 or
-        /// -1), persisted across frames where the arc is momentarily
-        /// stationary so the drift direction doesn't flicker.
-        float mFlowSign = 1.0f;
 
         float mLastTime = -1.0f;
     };
