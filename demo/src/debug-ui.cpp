@@ -1,15 +1,381 @@
 #include "debug-ui.h"
+#include "renderer/spotlight-tuning.h"
+#include <cstdio>
+#include "animation/animation-manager.h"
 #include "core/config.h"
 #include "core/edge-lighting.h"
+#include "renderer/neon-tuning.h"
+#include "renderer/particle-renderer.h"
 #include "ui-controls.h"
 #include "util/log-util.h"
-#include "util/screenshot-util.h"
 
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_opengl3.h"
 
+#include <algorithm>
+#include <cstring>
+#include <cmath>
+#include <cstdio>
+#include <filesystem>
 #include <memory>
+
+namespace
+{
+    /// Upper bound the debug UI enforces on colour-stop lists.
+    constexpr int MAX_COLOR_STOPS = 128;
+    /// Max value for the neon "LUT Size" slider. Matches the LUT
+    /// width baked by NeonRenderer (256), which is more than enough for any
+    /// gradient the human eye can resolve.
+    constexpr int MAX_GRADIENT_LUT_SIZE = 256;
+
+    /// Width of the typed-entry box that sits beside every slider.
+    constexpr float INPUT_FIELD_WIDTH = 62.0f;
+
+    /// Item width for the compact colour-stop rows, which keep slider, colour
+    /// swatch and remove button on one line. Wide enough that the slider part
+    /// stays usable once INPUT_FIELD_WIDTH is taken out of it.
+    constexpr float STOP_ROW_ITEM_WIDTH = 180.0f;
+
+    /// Draw the trailing label, stopping at ImGui's "##" id separator so
+    /// "Glow Radius##Neon" renders as "Glow Radius".
+    inline void DrawSliderLabel(const char *label)
+    {
+        const char *sep = std::strstr(label, "##");
+        ImGui::SameLine(0.0f, ImGui::GetStyle().ItemInnerSpacing.x);
+        if (sep != nullptr)
+        {
+            ImGui::TextUnformatted(label, sep);
+        }
+        else
+        {
+            ImGui::TextUnformatted(label);
+        }
+    }
+
+    /// Split the usual item width into "slider | entry box", leaving the label
+    /// to be drawn afterwards by DrawSliderLabel. Keeps the row's total
+    /// footprint identical to a plain ImGui slider.
+    inline float SliderPartWidth()
+    {
+        const float spacing = ImGui::GetStyle().ItemInnerSpacing.x;
+        return std::max(ImGui::CalcItemWidth() - INPUT_FIELD_WIDTH - spacing, 1.0f);
+    }
+
+    /// Typed-entry box paired with a slider. Commits on Enter or when focus
+    /// leaves, and clamps to the slider's range so the two controls can never
+    /// disagree. (ImGui's ctrl+click-to-type does much the same thing, but it
+    /// is undiscoverable and several of these ranges are wide enough that
+    /// dragging cannot land an exact value.)
+    inline bool EntryBox(float &value, float shown, float minVal, float maxVal,
+                         const char *fmt)
+    {
+        float typed = shown;
+        ImGui::SameLine(0.0f, ImGui::GetStyle().ItemInnerSpacing.x);
+        ImGui::SetNextItemWidth(INPUT_FIELD_WIDTH);
+        bool commit = ImGui::InputFloat("##entry", &typed, 0.0f, 0.0f, fmt,
+                                        ImGuiInputTextFlags_EnterReturnsTrue);
+        commit = commit || ImGui::IsItemDeactivatedAfterEdit();
+        if (commit)
+        {
+            value = std::clamp(typed, minVal, maxVal);
+            return true;
+        }
+        return false;
+    }
+
+    /// Plain slider + typed entry.
+    inline bool SliderWithInput(const char *label, float &value,
+                                float minVal, float maxVal, const char *fmt = "%.2f")
+    {
+        ImGui::PushID(label);
+        ImGui::SetNextItemWidth(SliderPartWidth());
+        bool changed = ImGui::SliderFloat("##slider", &value, minVal, maxVal, fmt);
+        changed = EntryBox(value, value, minVal, maxVal, fmt) || changed;
+        DrawSliderLabel(label);
+        ImGui::PopID();
+        return changed;
+    }
+
+    /// Integer flavour of SliderWithInput.
+    inline bool SliderIntWithInput(const char *label, int &value,
+                                   int minVal, int maxVal)
+    {
+        ImGui::PushID(label);
+        ImGui::SetNextItemWidth(SliderPartWidth());
+        bool changed = ImGui::SliderInt("##slider", &value, minVal, maxVal);
+        int typed = value;
+        ImGui::SameLine(0.0f, ImGui::GetStyle().ItemInnerSpacing.x);
+        ImGui::SetNextItemWidth(INPUT_FIELD_WIDTH);
+        bool commit = ImGui::InputInt("##entry", &typed, 0, 0,
+                                      ImGuiInputTextFlags_EnterReturnsTrue);
+        commit = commit || ImGui::IsItemDeactivatedAfterEdit();
+        if (commit)
+        {
+            value = std::clamp(typed, minVal, maxVal);
+            changed = true;
+        }
+        DrawSliderLabel(label);
+        ImGui::PopID();
+        return changed;
+    }
+
+    inline bool AnimatedSlider(const char *label, float &baseVal, float activeVal,
+                               float minVal, float maxVal, const char *fmt = "%.2f")
+    {
+        // "Was I actively dragged last frame?" - stored per-slider via ImGui's
+        // built-in state storage keyed by the slider's ID. We can't call
+        // IsItemActive() BEFORE drawing (there's no item yet), so we consult
+        // the previous frame's result to decide what to show, then record this
+        // frame's active state for the next call.
+        ImGuiStorage *storage = ImGui::GetStateStorage();
+        const ImGuiID id = ImGui::GetID(label);
+        const bool wasDragging = storage->GetBool(id, false);
+
+        float shown = wasDragging ? baseVal : activeVal;
+
+        ImGui::PushID(label);
+        ImGui::SetNextItemWidth(SliderPartWidth());
+        bool changed = ImGui::SliderFloat("##slider", &shown, minVal, maxVal, fmt);
+        const bool isDragging = ImGui::IsItemActive();
+        storage->SetBool(id, isDragging);
+
+        if (changed && isDragging)
+        {
+            baseVal = shown;
+        }
+
+        // The entry box shows whatever the slider shows (the animated value
+        // when one is driving this field), but writes the BASE value - typing
+        // is an explicit set, the same thing a drag does.
+        changed = EntryBox(baseVal, shown, minVal, maxVal, fmt) || changed;
+        DrawSliderLabel(label);
+        ImGui::PopID();
+        return changed;
+    }
+
+    /// Slider whose knob follows the currently-animated (active) value each
+    /// frame so the user sees what the shader is actually drawing. Dragging
+    /// still edits the BASE (authored) value: while the user is actively
+    /// dragging THIS slider, the display is pinned to the base to avoid a
+    /// tug-of-war between the drag and the per-frame animation overlay.
+    ///
+    /// Detected via @c ImGui::GetActiveID() - we compute the slider's ID
+    /// before drawing so we know whether to seed the shown value from base
+    /// (dragging) or active (idle / animating). The base is written whenever
+    /// the widget reports a change; the animation on the next @c
+    /// EdgeLightingEffect::Update then overlays on top of the new base.
+    /// Draw one segment-lights row (Pos/Len/Boost + collapsible per-segment
+    /// stops editor). Caller wraps in @c PushID so repeated rows can share the
+    /// same widget IDs without colliding.
+    /// @return true if the row's remove button was clicked - caller erases.
+    inline bool DrawSegmentRow(EdgeLighting::SegmentBoost &seg, size_t index)
+    {
+        // Header line carries the identity and the remove button; each
+        // parameter then gets its own full-width line. Packing all three onto
+        // one row left roughly 24 px of actual slider once each carries a
+        // typed entry box, and gave no room for the value to be read.
+        ImGui::Text("Segment %zu", index);
+        ImGui::SameLine();
+        bool remove = ImGui::SmallButton("X");
+
+        ImGui::Indent();
+        SliderWithInput("Pos##Seg", seg.position, 0.0f, 1.0f, "%.2f");
+        SliderWithInput("Len##Seg", seg.length, 0.02f, 0.5f, "%.2f");
+        SliderWithInput("Boost##Seg", seg.boost, 0.0f, 10.0f, "%.1f");
+        ImGui::Unindent();
+
+        // Collapsible per-segment stops editor. Header shows the count and an
+        // "inherits base" hint when empty (which is the default and means the
+        // segment reads its colour from the base gradient at each sample).
+        char stopsHdr[64];
+        std::snprintf(stopsHdr, sizeof(stopsHdr),
+                      "Stops (%zu)%s##SegStops",
+                      seg.colorStops.size(),
+                      seg.colorStops.empty() ? " - inherits base" : "");
+        ImGui::Indent();
+        if (ImGui::CollapsingHeader(stopsHdr))
+        {
+            const char *blendItems[] = {"RGB", "HSV", "HSL"};
+            int blendIdx = static_cast<int>(seg.blendSpace);
+            ImGui::SetNextItemWidth(120.0f);
+            if (ImGui::Combo("Blend##Seg", &blendIdx, blendItems, IM_ARRAYSIZE(blendItems)))
+            {
+                seg.blendSpace = static_cast<EdgeLighting::BlendSpace>(blendIdx);
+            }
+            for (size_t j = 0; j < seg.colorStops.size(); ++j)
+            {
+                ImGui::PushID(static_cast<int>(j));
+                ImGui::SetNextItemWidth(STOP_ROW_ITEM_WIDTH);
+                SliderWithInput("Pos##SegStop", seg.colorStops[j].position, 0.0f, 1.0f, "%.2f");
+                ImGui::SameLine();
+                ImGui::ColorEdit4("Col##SegStop", &seg.colorStops[j].color.x,
+                                  ImGuiColorEditFlags_NoInputs);
+                ImGui::SameLine();
+                if (ImGui::SmallButton("X"))
+                {
+                    seg.colorStops.erase(seg.colorStops.begin() +
+                                         static_cast<ptrdiff_t>(j));
+                    ImGui::PopID();
+                    break;
+                }
+                ImGui::PopID();
+            }
+            if (seg.colorStops.size() < MAX_COLOR_STOPS && ImGui::Button("+ Add Stop##Seg"))
+            {
+                float lastPos = seg.colorStops.empty() ? 0.0f
+                                                       : seg.colorStops.back().position;
+                seg.colorStops.push_back(
+                    {std::min(1.0f, lastPos + 0.25f), glm::vec4(1.0f)});
+            }
+        }
+        ImGui::Unindent();
+        ImGui::Separator();
+        return remove;
+    }
+
+    /// Draw one arc row (Start / Length / Intensity + collapsible per-arc
+    /// stops editor). Mirrors DrawSegmentRow. Caller wraps in @c PushID so
+    /// repeated rows can share widget IDs without collision.
+    /// @return true if the row's remove button was clicked - caller erases.
+    inline bool DrawArcRow(EdgeLighting::Arc &arc, size_t index)
+    {
+        // See DrawSegmentRow: header line + one parameter per line.
+        ImGui::Text("Arc %zu", index);
+        ImGui::SameLine();
+        bool remove = ImGui::SmallButton("X");
+
+        ImGui::Indent();
+        SliderWithInput("Start##Arc", arc.start, 0.0f, 1.0f, "%.2f");
+        SliderWithInput("Len##Arc", arc.length, 0.0f, 1.0f, "%.2f");
+        SliderWithInput("Int##Arc", arc.intensity, 0.0f, 4.0f, "%.2f");
+        ImGui::Unindent();
+
+        // Collapsible per-arc stops editor. Header shows the count and an
+        // "inherits base" hint when empty (default = read colour from the
+        // base gradient at each sample the arc touches).
+        char stopsHdr[64];
+        std::snprintf(stopsHdr, sizeof(stopsHdr),
+                      "Stops (%zu)%s##ArcStops",
+                      arc.colorStops.size(),
+                      arc.colorStops.empty() ? " - inherits base" : "");
+        ImGui::Indent();
+        if (ImGui::CollapsingHeader(stopsHdr))
+        {
+            const char *blendItems[] = {"RGB", "HSV", "HSL"};
+            int blendIdx = static_cast<int>(arc.blendSpace);
+            ImGui::SetNextItemWidth(120.0f);
+            if (ImGui::Combo("Blend##Arc", &blendIdx, blendItems, IM_ARRAYSIZE(blendItems)))
+            {
+                arc.blendSpace = static_cast<EdgeLighting::BlendSpace>(blendIdx);
+            }
+            for (size_t j = 0; j < arc.colorStops.size(); ++j)
+            {
+                ImGui::PushID(static_cast<int>(j));
+                ImGui::SetNextItemWidth(STOP_ROW_ITEM_WIDTH);
+                SliderWithInput("Pos##ArcStop", arc.colorStops[j].position, 0.0f, 1.0f, "%.2f");
+                ImGui::SameLine();
+                ImGui::ColorEdit4("Col##ArcStop", &arc.colorStops[j].color.x,
+                                  ImGuiColorEditFlags_NoInputs);
+                ImGui::SameLine();
+                if (ImGui::SmallButton("X"))
+                {
+                    arc.colorStops.erase(arc.colorStops.begin() +
+                                         static_cast<ptrdiff_t>(j));
+                    ImGui::PopID();
+                    break;
+                }
+                ImGui::PopID();
+            }
+            if (arc.colorStops.size() < MAX_COLOR_STOPS && ImGui::Button("+ Add Stop##Arc"))
+            {
+                float lastPos = arc.colorStops.empty() ? 0.0f
+                                                       : arc.colorStops.back().position;
+                arc.colorStops.push_back(
+                    {std::min(1.0f, lastPos + 0.25f), glm::vec4(1.0f)});
+            }
+        }
+        ImGui::Unindent();
+        ImGui::Separator();
+        return remove;
+    }
+
+    /// "Opaque Only" debug toggle, drawn in the Debug section alongside the
+    /// other @c DebugConfig fields. It only does anything while
+    /// @c NeonConfig::opaqueMode is set - there is no fill to keep otherwise -
+    /// so the caller passes @p opaqueModeSet to grey it out and say why rather
+    /// than hiding it, which would leave the Debug section's contents shifting
+    /// as an unrelated combo changes. The @p id keeps the ImGui widget state
+    /// distinct from any other checkbox sharing the label.
+    inline void OpaqueOnlyCheckbox(const char *id, bool &opaqueOnly, bool opaqueModeSet)
+    {
+        char label[64];
+        std::snprintf(label, sizeof(label), "Opaque Only%s", id);
+        ImGui::BeginDisabled(!opaqueModeSet);
+        ImGui::Checkbox(label, &opaqueOnly);
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        {
+            ImGui::SetTooltip("Draw only the opaque fill - no filament, halo or bloom.\n"
+                              "Isolates the fill silhouette so it can be compared\n"
+                              "against how far the light actually reaches.\n\n"
+                              "Needs Neon > Opaque set to something other than None.");
+        }
+    }
+
+    /// One row per Cutoff struct: enable checkbox on the left, size + softness
+    /// sliders indented on the right. Grays out the sliders when enable is off
+    /// so the "unbounded on this side" state reads at a glance.
+    /// @p subsumed - glowSide already culls this side, so the renderer ignores
+    ///               this cutoff for the GLOW (see neon.frag's band-distance
+    ///               block). @p fillUses - the current opaqueMode still bounds
+    ///               its fill with it, which is a separate layer with no notion
+    ///               of a glow side.
+    ///
+    /// Without the note the sliders look live and move nothing, which is
+    /// exactly the confusion that produced the report behind
+    /// docs/glow-side-comparison.md section 4.3. Deliberately a note and not a
+    /// BeginDisabled: a subsumed cutoff is still doing real work whenever the
+    /// fill uses it, and greying it out would be a lie in that case.
+    inline void CutoffRow(const char *label, const char *idSuffix,
+                          EdgeLighting::Cutoff &cutoff,
+                          const EdgeLighting::Cutoff &activeCutoff,
+                          bool subsumed, bool fillUses)
+    {
+        ImGui::PushID(idSuffix);
+        char enableLabel[64];
+        std::snprintf(enableLabel, sizeof(enableLabel), "%s##Enable", label);
+        ImGui::Checkbox(enableLabel, &cutoff.enable);
+        ImGui::Indent();
+        if (!cutoff.enable)
+        {
+            ImGui::BeginDisabled();
+        }
+        char sizeLabel[64];
+        char softLabel[64];
+        std::snprintf(sizeLabel, sizeof(sizeLabel), "size##%s", idSuffix);
+        std::snprintf(softLabel, sizeof(softLabel), "softness##%s", idSuffix);
+        AnimatedSlider(sizeLabel, cutoff.size, activeCutoff.size, 0.0f, 200.0f, "%.0f");
+        AnimatedSlider(softLabel, cutoff.softness, activeCutoff.softness, 0.0f, 20.0f, "%.1f");
+        if (!cutoff.enable)
+        {
+            ImGui::EndDisabled();
+        }
+        if (cutoff.enable && subsumed)
+        {
+            if (fillUses)
+            {
+                ImGui::TextDisabled("subsumed by Glow Side - bounds the fill only");
+            }
+            else
+            {
+                ImGui::TextDisabled("subsumed by Glow Side - no effect");
+            }
+        }
+        ImGui::Unindent();
+        ImGui::PopID();
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Lifecycle
@@ -35,6 +401,17 @@ bool DebugUI::Init(GLFWwindow *mainWindow, int mainW, int mainH)
     glfwSetWindowAttrib(mWindow, GLFW_FLOATING, GLFW_TRUE);
 
     mMainWindow = mainWindow;
+
+    // Seed the capture size from the main window's FRAMEBUFFER size, not its
+    // logical size: Config::geometry is in framebuffer pixels, so a capture
+    // that is half the framebuffer (as it would be on a 2x display) shows only
+    // the top-left quadrant of the scene. This is a starting value the user can
+    // edit, not a live binding - the capture itself never reads the drawable,
+    // which is what keeps it reproducible on a machine with a different scale.
+    int mainFbW = mainW, mainFbH = mainH;
+    glfwGetFramebufferSize(mainWindow, &mainFbW, &mainFbH);
+    mCaptureSize[0] = mainFbW;
+    mCaptureSize[1] = mainFbH;
 
     // Keep main context current after window creation (shared context)
     glfwMakeContextCurrent(mainWindow);
@@ -90,15 +467,18 @@ void DebugUI::Build(EdgeLighting::Config &cfg, EdgeLighting::EdgeLightingEffect 
                 io.Framerate, 1000.0f / io.Framerate, mLastRenderTimeMs);
     ImGui::Separator();
 
+    // The active config carries every animation's current overlay values
+    const EdgeLighting::Config &active = effect.GetActiveConfig();
     buildGeometrySection(cfg);
-    buildNeonSection(cfg);
-    buildMultiPassNeonSection(cfg);
-    buildOptimizedNeonSection(cfg);
-    buildAnimationSection(cfg, effect.GetClock().GetTime());
+    buildNeonSection(cfg, active);
+    buildDebugSection(cfg);
+    buildDropletsSection(cfg);
+    buildLensFlareSection(cfg);
+    buildSpotlightSection(cfg);
     buildParticleSection(cfg);
+    buildColorPickerSection(cfg);
+    buildAnimationSection(cfg, effect.GetAnimationManager());
     buildBackgroundSection();
-
-    ImGui::Checkbox("Wireframe", &cfg.wireframe.enable);
 
     ImGui::Separator();
     ImGui::Text("Animation: %s", playing ? "PLAYING" : "PAUSED");
@@ -119,42 +499,47 @@ void DebugUI::Build(EdgeLighting::Config &cfg, EdgeLighting::EdgeLightingEffect 
         effect.GetClock().Stop();
     }
     ImGui::SameLine();
-    if (ImGui::Button("Screenshot"))
+    if (ImGui::Button("Capture"))
     {
-        int fbW, fbH;
-        glfwGetFramebufferSize(mMainWindow, &fbW, &fbH);
-        std::string path = EdgeLighting::ScreenshotUtil::TimestampedPath(RES_DIR, "screenshot_", "png");
-        EdgeLighting::ScreenshotUtil::SaveScreenshot(path, fbW, fbH);
-        LOG_I("Screenshot saved: %s", path.c_str());
+        // Deferred to the render loop - see ConsumeCaptureRequest.
+        mCaptureRequested = true;
     }
+    if (ImGui::IsItemHovered())
+    {
+        ImGui::SetTooltip("Renders one frame into an offscreen RGBA8 framebuffer at the size below\n"
+                          "and writes it to RES_DIR as a PNG. Independent of the window and of the\n"
+                          "display's DPI scale, so the same config gives the same pixels anywhere.\n"
+                          "Geometry is in framebuffer pixels, so the capture size also decides\n"
+                          "the framing - shrink it and you crop rather than zoom out.");
+    }
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(120.0f);
+    ImGui::InputInt2("Capture size", mCaptureSize);
     ImGui::SameLine();
     if (ImGui::Button("Dump Config"))
     {
-        EdgeLightingDemo::PrintCurrentConfig(effect.GetConfig(), effect.GetClock().IsPlaying());
-        std::cout << "\n";
+        EdgeLightingDemo::PrintFullConfig(effect.GetConfig(), effect.GetClock().IsPlaying());
     }
     ImGui::End();
 }
 
-void DebugUI::ApplyActiveAnimation(EdgeLighting::Config &config, float clockTime)
+bool DebugUI::ConsumeCaptureRequest(int &outWidth, int &outHeight)
 {
-    // Compute the frame delta ourselves: main.cpp still hands us the effect's
-    // clock time so we can freeze animations by pausing that clock, but the
-    // animation itself now owns state / elapsed / completion latching, so we
-    // just forward dt to Update() and call Apply().
-    float dt = clockTime - mLastClockTime;
-    mLastClockTime = clockTime;
-
-    // AnimationGroup::Update / Apply broadcast to each child, respecting each
-    // child's own state (Stopped → skip, Paused → hold, Playing → advance).
-    // The shader consumes cfg.neon.hueRotationRate directly via uTime; a
-    // preset that modulates the rate (HueRotationReverse etc.) writes into
-    // config and the next frame's Render sends the new rate to the shader.
-    if (mActiveGroup)
+    if (!mCaptureRequested)
     {
-        mActiveGroup->Update(dt);
-        mActiveGroup->Apply(config);
+        return false;
     }
+    mCaptureRequested = false;
+
+    if (mCaptureSize[0] <= 0 || mCaptureSize[1] <= 0)
+    {
+        LOG_W("Capture size %dx%d is invalid; ignoring the request.", mCaptureSize[0], mCaptureSize[1]);
+        return false;
+    }
+
+    outWidth = mCaptureSize[0];
+    outHeight = mCaptureSize[1];
+    return true;
 }
 
 void DebugUI::Render()
@@ -182,11 +567,11 @@ void DebugUI::buildGeometrySection(EdgeLighting::Config &cfg)
         return;
     }
 
-    ImGui::SliderFloat("Width", &cfg.geometry.width, 100.0f, 1600.0f, "%.0f");
-    ImGui::SliderFloat("Height", &cfg.geometry.height, 100.0f, 1200.0f, "%.0f");
-    ImGui::SliderFloat("Pos X", &cfg.geometry.position.x, 0.0f, 1600.0f, "%.0f");
-    ImGui::SliderFloat("Pos Y", &cfg.geometry.position.y, 0.0f, 1200.0f, "%.0f");
-    ImGui::SliderFloat("Corner Radius", &cfg.geometry.cornerRadius, 0.0f, 200.0f, "%.0f");
+    SliderWithInput("Width", cfg.geometry.width, 100.0f, 1920.0f * 2, "%.0f");
+    SliderWithInput("Height", cfg.geometry.height, 100.0f, 1080.0f * 2, "%.0f");
+    SliderWithInput("Pos X", cfg.geometry.position.x, 0.0f, 1600.0f, "%.0f");
+    SliderWithInput("Pos Y", cfg.geometry.position.y, 0.0f, 1200.0f, "%.0f");
+    SliderWithInput("Corner Radius", cfg.geometry.cornerRadius, 0.0f, 1080.0f, "%.0f");
 
     const char *windingItems[] = {"CW", "CCW"};
     int windingIdx = static_cast<int>(cfg.geometry.winding);
@@ -196,7 +581,8 @@ void DebugUI::buildGeometrySection(EdgeLighting::Config &cfg)
     }
 }
 
-void DebugUI::buildNeonSection(EdgeLighting::Config &cfg)
+void DebugUI::buildNeonSection(EdgeLighting::Config &cfg,
+                               const EdgeLighting::Config &active)
 {
     if (!ImGui::CollapsingHeader("Neon", ImGuiTreeNodeFlags_DefaultOpen))
     {
@@ -209,13 +595,44 @@ void DebugUI::buildNeonSection(EdgeLighting::Config &cfg)
         return;
     }
 
-    ImGui::Checkbox("Opaque (no blend)##Neon", &cfg.neon.opaque);
-    ImGui::SliderFloat("Line Width##Neon", &cfg.neon.lineWidth, 0.0f, 20.0f, "%.0f");
-    ImGui::SliderFloat("Filament Falloff##Neon", &cfg.neon.filamentFalloff, 0.0f, 5.0f, "%.2f");
-    ImGui::SliderFloat("Intensity##Neon", &cfg.neon.intensity, 0.0f, 3.0f, "%.2f");
-    ImGui::SliderFloat("Glow Radius##Neon", &cfg.neon.glowRadius, 0.0f, 80.0f, "%.0f");
-    ImGui::SliderFloat("Bloom Strength##Neon", &cfg.neon.bloomStrength, 0.0f, 2.0f, "%.2f");
-    ImGui::SliderFloat("Hue Rotation Rate##Neon", &cfg.neon.hueRotationRate, 0.0f, 2.0f, "%.2f");
+    // --- Performance ------------------------------------------------------
+    // Was its own "Optimized Neon" section back when the half-res path was a
+    // second renderer. It is one renderer now, so these are just knobs on it:
+    // Res Scale 1.0 is the full-resolution path (no offscreen buffer, no
+    // blit), anything lower renders scaled and composites back.
+    if (ImGui::TreeNodeEx("Performance##Neon", ImGuiTreeNodeFlags_DefaultOpen))
+    {
+        SliderWithInput("Res Scale##Neon", cfg.neon.resolutionScale, 0.125f, 1.0f, "%.3f");
+        if (ImGui::IsItemHovered())
+        {
+            ImGui::SetTooltip("1.0 draws straight onto the target at full resolution.\n"
+                              "Below that the glow renders into a scaled buffer and is\n"
+                              "bilinear-blitted back - fewer fragments, softer edges.");
+        }
+        SliderIntWithInput("Samples##Neon", cfg.neon.numSamples, 8, NEON_MAX_LOOP_SAMPLES);
+        SliderIntWithInput("LUT Size##Neon", cfg.neon.gradientLutSize, 32, MAX_GRADIENT_LUT_SIZE);
+        ImGui::TreePop();
+    }
+
+    const char *opaqueItems[] = {"None", "Outside", "Inside", "Both", "All"};
+    int opaqueIdx = static_cast<int>(cfg.neon.opaqueMode);
+    if (ImGui::Combo("Opaque##Neon", &opaqueIdx, opaqueItems, IM_ARRAYSIZE(opaqueItems)))
+    {
+        cfg.neon.opaqueMode = static_cast<EdgeLighting::OpaqueMode>(opaqueIdx);
+    }
+    if (cfg.neon.opaqueMode != EdgeLighting::OpaqueMode::NONE)
+    {
+        ImGui::SameLine();
+        ImGui::ColorEdit4("Opaque Color##Neon", &cfg.neon.opaqueColor.x,
+                          ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_AlphaPreview);
+        SliderWithInput("Opaque Softness##Neon", cfg.neon.opaqueSoftness, 0.0f, 20.0f, "%.1f");
+    }
+    AnimatedSlider("Line Width##Neon", cfg.neon.lineWidth, active.neon.lineWidth, 0.0f, 20.0f, "%.0f");
+    AnimatedSlider("Filament Falloff##Neon", cfg.neon.filamentFalloff, active.neon.filamentFalloff, 0.0f, 5.0f);
+    AnimatedSlider("Intensity##Neon", cfg.neon.intensity, active.neon.intensity, 0.0f, 3.0f);
+    AnimatedSlider("Glow Radius##Neon", cfg.neon.glowRadius, active.neon.glowRadius, 0.0f, 80.0f, "%.0f");
+    AnimatedSlider("Bloom Strength##Neon", cfg.neon.bloomStrength, active.neon.bloomStrength, 0.0f, 2.0f);
+    AnimatedSlider("Hue Rotation Rate##Neon", cfg.neon.hueRotationRate, active.neon.hueRotationRate, 0.0f, 2.0f);
 
     const char *sideItems[] = {"Both", "Inside", "Outside"};
     int sideIdx = static_cast<int>(cfg.neon.glowSide);
@@ -225,30 +642,88 @@ void DebugUI::buildNeonSection(EdgeLighting::Config &cfg)
     }
     if (cfg.neon.glowSide != EdgeLighting::GlowSide::BOTH)
     {
-        ImGui::SliderFloat("Side Softness##Neon", &cfg.neon.glowSideSoftness, 0.0f, 20.0f, "%.1f");
+        SliderWithInput("Side Softness##Neon", cfg.neon.glowSideSoftness, 0.0f, 20.0f, "%.1f");
     }
 
-    // --- Travelling segment (set Boost > 0 to enable) ---
-    ImGui::SliderFloat("Segment Pos##Neon", &cfg.neon.segmentPosition, 0.0f, 1.0f, "%.2f");
-    ImGui::SliderFloat("Segment Length##Neon", &cfg.neon.segmentLength, 0.02f, 0.5f, "%.2f");
-    ImGui::SliderFloat("Segment Boost##Neon", &cfg.neon.segmentBoost, 0.0f, 10.0f, "%.1f");
+    // A cutoff on the side glowSide culls is ignored for the glow, but still
+    // bounds an opaque fill on that same side - insideCutoff caps INSIDE / BOTH
+    // fills, outsideCutoff caps OUTSIDE / BOTH.
+    const EdgeLighting::OpaqueMode om = cfg.neon.opaqueMode;
+    const bool fillUsesInside = (om == EdgeLighting::OpaqueMode::INSIDE ||
+                                 om == EdgeLighting::OpaqueMode::BOTH);
+    const bool fillUsesOutside = (om == EdgeLighting::OpaqueMode::OUTSIDE ||
+                                  om == EdgeLighting::OpaqueMode::BOTH);
+    CutoffRow("Inside Cutoff", "NeonInside", cfg.neon.insideCutoff, active.neon.insideCutoff,
+              cfg.neon.glowSide == EdgeLighting::GlowSide::OUTSIDE, fillUsesInside);
+    CutoffRow("Outside Cutoff", "NeonOutside", cfg.neon.outsideCutoff, active.neon.outsideCutoff,
+              cfg.neon.glowSide == EdgeLighting::GlowSide::INSIDE, fillUsesOutside);
 
-    // --- Arc gating (0..1 = full perimeter; shrink to "draw" part of the rect) ---
-    ImGui::SliderFloat("Arc Start##Neon", &cfg.neon.arcStart, 0.0f, 1.0f, "%.2f");
-    ImGui::SliderFloat("Arc Length##Neon", &cfg.neon.arcLength, 0.0f, 1.0f, "%.2f");
+    // --- Travelling segments (independent additive lights on the perimeter) ---
+    ImGui::TextDisabled("Segment Lights (%zu / %d) - additive, independent of intensity",
+                        cfg.neon.segmentBoosts.size(),
+                        EdgeLighting::NeonConfig::MAX_SEGMENT_BOOSTS_CAP);
+    for (size_t i = 0; i < cfg.neon.segmentBoosts.size(); ++i)
+    {
+        ImGui::PushID(static_cast<int>(300 + i));
+        bool remove = DrawSegmentRow(cfg.neon.segmentBoosts[i], i);
+        ImGui::PopID();
+        if (remove)
+        {
+            cfg.neon.segmentBoosts.erase(cfg.neon.segmentBoosts.begin() +
+                                         static_cast<ptrdiff_t>(i));
+            break;
+        }
+    }
+    if (static_cast<int>(cfg.neon.segmentBoosts.size()) <
+        EdgeLighting::NeonConfig::MAX_SEGMENT_BOOSTS_CAP)
+    {
+        if (ImGui::Button("+ Add Segment##Neon"))
+        {
+            cfg.neon.segmentBoosts.push_back({0.0f, 0.15f, 4.0f});
+        }
+    }
 
-    const char *blendItems[] = {"RGB", "HSV"};
+    // --- Arcs (multiple lit slices; winner-take-all in overlap regions) ---
+    ImGui::TextDisabled("Arcs (%zu / %d) - overlap resolves winner-take-all",
+                        cfg.neon.arcs.size(),
+                        EdgeLighting::NeonConfig::MAX_ARCS_CAP);
+    for (size_t i = 0; i < cfg.neon.arcs.size(); ++i)
+    {
+        ImGui::PushID(static_cast<int>(500 + i));
+        bool remove = DrawArcRow(cfg.neon.arcs[i], i);
+        ImGui::PopID();
+        if (remove)
+        {
+            cfg.neon.arcs.erase(cfg.neon.arcs.begin() +
+                                static_cast<ptrdiff_t>(i));
+            break;
+        }
+    }
+    if (static_cast<int>(cfg.neon.arcs.size()) <
+        EdgeLighting::NeonConfig::MAX_ARCS_CAP)
+    {
+        if (ImGui::Button("+ Add Arc##Neon"))
+        {
+            cfg.neon.arcs.push_back(EdgeLighting::Arc{});
+        }
+    }
+
+    const char *blendItems[] = {"RGB", "HSV", "HSL"};
     int blendIdx = static_cast<int>(cfg.neon.blendSpace);
     if (ImGui::Combo("Blend Space##Neon", &blendIdx, blendItems, IM_ARRAYSIZE(blendItems)))
     {
         cfg.neon.blendSpace = static_cast<EdgeLighting::BlendSpace>(blendIdx);
     }
 
+    // Cross-fade time when the stop set / blend space changes (0 = instant).
+    SliderWithInput("Color Transition (s)##Neon", cfg.neon.colorTransitionDuration,
+                    0.0f, 2.0f, "%.2f");
+
     for (size_t i = 0; i < cfg.neon.colorStops.size(); ++i)
     {
         ImGui::PushID(static_cast<int>(i));
         float p = cfg.neon.colorStops[i].position;
-        if (ImGui::SliderFloat("Pos##Neon", &p, 0.0f, 1.0f, "%.2f"))
+        if (SliderWithInput("Pos##Neon", p, 0.0f, 1.0f, "%.2f"))
         {
             cfg.neon.colorStops[i].position = p;
         }
@@ -266,177 +741,11 @@ void DebugUI::buildNeonSection(EdgeLighting::Config &cfg)
         ImGui::PopID();
     }
 
-    if (cfg.neon.colorStops.size() < EdgeLighting::NeonConfig::MAX_COLOR_STOPS)
+    if (cfg.neon.colorStops.size() < MAX_COLOR_STOPS)
     {
         if (ImGui::Button("+ Add Stop##Neon"))
         {
             float lastPos = cfg.neon.colorStops.empty() ? 0.0f : cfg.neon.colorStops.back().position;
-            cfg.neon.colorStops.push_back(
-                {std::min(1.0f, lastPos + 0.1f), glm::vec4(1.0f, 1.0f, 1.0f, 1.0f)});
-        }
-    }
-}
-
-void DebugUI::buildMultiPassNeonSection(EdgeLighting::Config &cfg)
-{
-    if (!ImGui::CollapsingHeader("MultiPass Neon", ImGuiTreeNodeFlags_DefaultOpen))
-    {
-        return;
-    }
-
-    ImGui::Checkbox("Enable##MultiPass", &cfg.multipassNeon.enable);
-    ImGui::SameLine();
-    ImGui::Checkbox("Show Perimeter##MP", &cfg.multipassNeon.showPerimeterGradient);
-    ImGui::SameLine();
-    ImGui::Checkbox("Show Full Grad##MP", &cfg.multipassNeon.showFullGradient);
-    if (!cfg.multipassNeon.enable)
-    {
-        return;
-    }
-
-    ImGui::SliderFloat("Line Width##MP", &cfg.multipassNeon.lineWidth, 1.0f, 20.0f, "%.0f");
-    ImGui::SliderFloat("Intensity##MP", &cfg.multipassNeon.intensity, 0.0f, 3.0f, "%.2f");
-    ImGui::SliderFloat("Glow Radius##MP", &cfg.multipassNeon.glowRadius, 1.0f, 80.0f, "%.0f");
-    ImGui::SliderFloat("Bloom Strength##MP", &cfg.multipassNeon.bloomStrength, 0.0f, 2.0f, "%.2f");
-    ImGui::SliderFloat("Hue Rotation Rate##MP", &cfg.multipassNeon.hueRotationRate, 0.0f, 2.0f, "%.2f");
-
-    const char *mpSideItems[] = {"Both", "Inside", "Outside"};
-    int mpSideIdx = static_cast<int>(cfg.multipassNeon.glowSide);
-    if (ImGui::Combo("Glow Side##MP", &mpSideIdx, mpSideItems, IM_ARRAYSIZE(mpSideItems)))
-    {
-        cfg.multipassNeon.glowSide = static_cast<EdgeLighting::GlowSide>(mpSideIdx);
-    }
-    if (cfg.multipassNeon.glowSide != EdgeLighting::GlowSide::BOTH)
-    {
-        ImGui::SliderFloat("Side Softness##MP", &cfg.multipassNeon.glowSideSoftness, 0.0f, 20.0f, "%.1f");
-    }
-
-    const char *blendItems[] = {"RGB", "HSV"};
-    int blendIdx = static_cast<int>(cfg.multipassNeon.blendSpace);
-    if (ImGui::Combo("Blend Space##MP", &blendIdx, blendItems, IM_ARRAYSIZE(blendItems)))
-    {
-        cfg.multipassNeon.blendSpace = static_cast<EdgeLighting::BlendSpace>(blendIdx);
-    }
-
-    for (size_t i = 0; i < cfg.multipassNeon.colorStops.size(); ++i)
-    {
-        ImGui::PushID(static_cast<int>(i + 100));
-        float p = cfg.multipassNeon.colorStops[i].position;
-        if (ImGui::SliderFloat("Pos##MP", &p, 0.0f, 1.0f, "%.2f"))
-        {
-            cfg.multipassNeon.colorStops[i].position = p;
-        }
-        ImGui::SameLine();
-        glm::vec4 c = cfg.multipassNeon.colorStops[i].color;
-        if (ImGui::ColorEdit4("Col##MP", &c.x, ImGuiColorEditFlags_NoInputs))
-        {
-            cfg.multipassNeon.colorStops[i].color = c;
-        }
-        ImGui::SameLine();
-        if (cfg.multipassNeon.colorStops.size() > 1 && ImGui::SmallButton("X"))
-        {
-            cfg.multipassNeon.colorStops.erase(cfg.multipassNeon.colorStops.begin() + static_cast<ptrdiff_t>(i));
-        }
-        ImGui::PopID();
-    }
-
-    if (cfg.multipassNeon.colorStops.size() < EdgeLighting::MultiPassNeonConfig::MAX_COLOR_STOPS)
-    {
-        if (ImGui::Button("+ Add Stop##MP"))
-        {
-            float lastPos = cfg.multipassNeon.colorStops.empty() ? 0.0f : cfg.multipassNeon.colorStops.back().position;
-            cfg.multipassNeon.colorStops.push_back(
-                {std::min(1.0f, lastPos + 0.1f), glm::vec4(1.0f, 1.0f, 1.0f, 1.0f)});
-        }
-    }
-}
-
-void DebugUI::buildOptimizedNeonSection(EdgeLighting::Config &cfg)
-{
-    if (!ImGui::CollapsingHeader("Optimized Neon (½-res)", ImGuiTreeNodeFlags_DefaultOpen))
-    {
-        return;
-    }
-
-    ImGui::Checkbox("Enable##Optimized", &cfg.optimizedNeon.enable);
-    if (!cfg.optimizedNeon.enable)
-    {
-        return;
-    }
-
-    ImGui::SameLine();
-    ImGui::Checkbox("Show Half-Res##Optimized", &cfg.optimizedNeon.showHalfRes);
-
-    ImGui::SliderFloat("Res Scale##Opt", &cfg.optimizedNeon.resolutionScale, 0.125f, 1.0f, "%.3f");
-    ImGui::SliderInt("Samples##Opt", &cfg.optimizedNeon.numSamples, 8, 64);
-    ImGui::SliderInt("LUT Size##Opt", &cfg.optimizedNeon.gradientLutSize, 32, 256);
-
-    ImGui::Separator();
-    ImGui::TextDisabled("Visual params (shared with Neon)");
-
-    ImGui::Checkbox("Opaque (no blend)##Opt", &cfg.neon.opaque);
-    ImGui::SliderFloat("Line Width##Opt", &cfg.neon.lineWidth, 0.0f, 20.0f, "%.0f");
-    ImGui::SliderFloat("Filament Falloff##Opt", &cfg.neon.filamentFalloff, 0.5f, 5.0f, "%.2f");
-    ImGui::SliderFloat("Intensity##Opt", &cfg.neon.intensity, 0.0f, 3.0f, "%.2f");
-    ImGui::SliderFloat("Glow Radius##Opt", &cfg.neon.glowRadius, 0.0f, 80.0f, "%.0f");
-    ImGui::SliderFloat("Bloom Strength##Opt", &cfg.neon.bloomStrength, 0.0f, 2.0f, "%.2f");
-    ImGui::SliderFloat("Hue Rotation Rate##Opt", &cfg.neon.hueRotationRate, 0.0f, 2.0f, "%.2f");
-
-    const char *sideItems[] = {"Both", "Inside", "Outside"};
-    int sideIdx = static_cast<int>(cfg.neon.glowSide);
-    if (ImGui::Combo("Glow Side##Opt", &sideIdx, sideItems, IM_ARRAYSIZE(sideItems)))
-    {
-        cfg.neon.glowSide = static_cast<EdgeLighting::GlowSide>(sideIdx);
-    }
-    // Always show Side Softness so the control is discoverable regardless of
-    // the Glow Side mode (it only feathers the one-sided cut, but keeping it
-    // live avoids the slider vanishing when Glow Side is Both).
-    ImGui::SliderFloat("Side Softness##Opt", &cfg.neon.glowSideSoftness, 0.0f, 20.0f, "%.1f");
-
-    ImGui::SliderFloat("Segment Pos##Opt", &cfg.neon.segmentPosition, 0.0f, 1.0f, "%.2f");
-    ImGui::SliderFloat("Segment Length##Opt", &cfg.neon.segmentLength, 0.02f, 0.5f, "%.2f");
-    ImGui::SliderFloat("Segment Boost##Opt", &cfg.neon.segmentBoost, 0.0f, 10.0f, "%.1f");
-
-    ImGui::SliderFloat("Arc Start##Opt", &cfg.neon.arcStart, 0.0f, 1.0f, "%.2f");
-    ImGui::SliderFloat("Arc Length##Opt", &cfg.neon.arcLength, 0.0f, 1.0f, "%.2f");
-
-    const char *blendItems[] = {"RGB", "HSV"};
-    int blendIdx = static_cast<int>(cfg.neon.blendSpace);
-    if (ImGui::Combo("Blend Space##Opt", &blendIdx, blendItems, IM_ARRAYSIZE(blendItems)))
-    {
-        cfg.neon.blendSpace = static_cast<EdgeLighting::BlendSpace>(blendIdx);
-    }
-
-    for (size_t i = 0; i < cfg.neon.colorStops.size(); ++i)
-    {
-        ImGui::PushID(static_cast<int>(i + 200));
-        float p = cfg.neon.colorStops[i].position;
-        if (ImGui::SliderFloat("Pos##Opt", &p, 0.0f, 1.0f, "%.2f"))
-        {
-            cfg.neon.colorStops[i].position = p;
-        }
-        ImGui::SameLine();
-        glm::vec4 c = cfg.neon.colorStops[i].color;
-        if (ImGui::ColorEdit4("Col##Opt", &c.x, ImGuiColorEditFlags_NoInputs))
-        {
-            cfg.neon.colorStops[i].color = c;
-        }
-        ImGui::SameLine();
-        if (cfg.neon.colorStops.size() > 1 && ImGui::SmallButton("X"))
-        {
-            cfg.neon.colorStops.erase(
-                cfg.neon.colorStops.begin() + static_cast<ptrdiff_t>(i));
-        }
-        ImGui::PopID();
-    }
-
-    if (cfg.neon.colorStops.size() < EdgeLighting::NeonConfig::MAX_COLOR_STOPS)
-    {
-        if (ImGui::Button("+ Add Stop##Opt"))
-        {
-            float lastPos = cfg.neon.colorStops.empty()
-                                ? 0.0f
-                                : cfg.neon.colorStops.back().position;
             cfg.neon.colorStops.push_back(
                 {std::min(1.0f, lastPos + 0.1f), glm::vec4(1.0f, 1.0f, 1.0f, 1.0f)});
         }
@@ -452,21 +761,17 @@ namespace
         const char *label = "?";
         switch (s)
         {
-        case EdgeLighting::AnimationState::Playing:
+        case EdgeLighting::AnimationState::PLAYING:
             col = ImVec4(0.30f, 0.85f, 0.35f, 1.0f);
             label = "PLAYING";
             break;
-        case EdgeLighting::AnimationState::Paused:
+        case EdgeLighting::AnimationState::PAUSED:
             col = ImVec4(0.95f, 0.75f, 0.15f, 1.0f);
             label = "PAUSED";
             break;
-        case EdgeLighting::AnimationState::Stopped:
+        case EdgeLighting::AnimationState::STOPPED:
             col = ImVec4(0.55f, 0.55f, 0.60f, 1.0f);
             label = "STOPPED";
-            break;
-        case EdgeLighting::AnimationState::Completed:
-            col = ImVec4(0.40f, 0.70f, 1.00f, 1.0f);
-            label = "DONE";
             break;
         }
         ImGui::TextColored(col, "%-7s", label);
@@ -503,7 +808,7 @@ namespace
         }
         ImGui::SameLine();
         // Reset rewinds elapsed to 0 AND writes the modulator@t=0 baseline
-        // into cfg — leaves state unchanged (Playing keeps playing from the
+        // into cfg - leaves state unchanged (Playing keeps playing from the
         // top; Stopped stays Stopped but the config field is restored).
         if (ImGui::SmallButton("Reset"))
         {
@@ -525,17 +830,17 @@ namespace
         // every subclass. Editing them here is a "live tweak" of the added
         // instance; subclass-specific ctor arguments (baseRate, easing,
         // segment length, …) are still baked in at Add-time via the preset
-        // — those would need a per-subclass params panel to expose here.
+        // - those would need a per-subclass params panel to expose here.
 
-        // Speed multiplier — 0 acts as "pause at the value level".
+        // Speed multiplier - 0 acts as "pause at the value level".
         float speed = anim.GetSpeed();
         ImGui::SetNextItemWidth(160.0f);
-        if (ImGui::SliderFloat("Speed", &speed, 0.0f, 4.0f, "%.2fx"))
+        if (SliderWithInput("Speed", speed, 0.0f, 4.0f, "%.2fx"))
         {
             anim.SetSpeed(speed);
         }
 
-        // Playback mode — LOOP wraps elapsed at duration; ONE_SHOT completes
+        // Playback mode - LOOP wraps elapsed at duration; ONE_SHOT completes
         // after one cycle. Toggling is live: switching a Playing looper to
         // ONE_SHOT will complete on the next Update if elapsed already >= dur.
         int modeIdx = (anim.GetPlaybackMode() == EdgeLighting::PlaybackMode::LOOP)
@@ -550,7 +855,29 @@ namespace
                                      : EdgeLighting::PlaybackMode::ONE_SHOT);
         }
 
-        // Duration — cycle length in seconds. Subclasses with internal
+        // End action - what STOPPED-Apply writes to the target field:
+        //   Hold current : field settles at wherever elapsed was when stopped. (Default.)
+        //   Hold end     : field settles at ApplyAt(cfg, duration).
+        //   Hold start   : field settles at ApplyAt(cfg, 0).
+        //   Restore      : field settles at the pre-play value (subclass hook).
+        // Only meaningful once the animation has played at least once; a
+        // freshly-added Stopped animation is a no-op regardless. If you want
+        // the base config to show through after Stop, detach the animation.
+        const char *endActionItems[] = {
+            "Hold current",
+            "Hold end",
+            "Hold start",
+            "Restore",
+        };
+        int endActionIdx = static_cast<int>(anim.GetEndAction());
+        ImGui::SetNextItemWidth(160.0f);
+        if (ImGui::Combo("End action", &endActionIdx,
+                         endActionItems, IM_ARRAYSIZE(endActionItems)))
+        {
+            anim.SetEndAction(static_cast<EdgeLighting::EndAction>(endActionIdx));
+        }
+
+        // Duration - cycle length in seconds. Subclasses with internal
         // modulators (FadeIn/FadeOut/OutlineTracer) rebuild them via
         // OnDurationChanged so the visual matches the completion latch.
         // 0 means "modulator owns its own periodicity" (oscillator-based
@@ -561,7 +888,7 @@ namespace
         if (dur > 0.0f)
         {
             float editable = dur;
-            if (ImGui::SliderFloat("Duration", &editable, 0.05f, 10.0f, "%.2fs"))
+            if (SliderWithInput("Duration", editable, 0.05f, 10.0f, "%.2fs"))
             {
                 anim.SetDuration(editable);
             }
@@ -590,7 +917,7 @@ namespace
         }
         else
         {
-            const char *status = anim.IsCompleted() ? "done" : "running";
+            const char *status = anim.IsPlaying() ? "running" : "stopped";
             ImGui::TextDisabled("t=%.2fs / dur=%.2fs (%s)", elapsed, dur, status);
         }
 
@@ -637,14 +964,479 @@ namespace
     }
 }
 
-void DebugUI::buildAnimationSection(EdgeLighting::Config &cfg, float clockTime)
+void DebugUI::buildDebugSection(EdgeLighting::Config &cfg)
+{
+    if (!ImGui::CollapsingHeader("Debug"))
+    {
+        return;
+    }
+
+    // Two kinds of thing live in DebugConfig and they are drawn as two groups,
+    // because `enable` governs only the first: the overlay layer is a renderer
+    // that can be muted, while Opaque Only is a mode of the NEON renderer that
+    // happens to be a debug control. Muting the overlays must not quietly
+    // change what the effect itself draws.
+
+    // --- The overlay layer (DebugRenderer) ---
+    ImGui::Checkbox("Enable Overlays##Debug", &cfg.debug.enable);
+    if (ImGui::IsItemHovered())
+    {
+        ImGui::SetTooltip("Master switch for the overlay layer (DebugRenderer).\n"
+                          "Nothing is drawn unless one of the toggles below is on.");
+    }
+    if (cfg.debug.enable)
+    {
+        ImGui::Indent();
+        ImGui::Checkbox("Show Gradient LUT##Debug", &cfg.debug.showGradientLUT);
+        if (ImGui::IsItemHovered())
+        {
+            ImGui::SetTooltip("Draw the baked colour ring as a strip across the rect,\n"
+                              "so what the shader samples can be checked by eye.");
+        }
+        ImGui::Checkbox("Show Color Stops##Debug", &cfg.debug.showColorStops);
+        if (ImGui::IsItemHovered())
+        {
+            ImGui::SetTooltip("Draw a disc in each stop's colour at its perimeter position.");
+        }
+        ImGui::Checkbox("Show Wireframe##Debug", &cfg.debug.showWireframe);
+        if (ImGui::IsItemHovered())
+        {
+            ImGui::SetTooltip("1 px bounding box at the configured extent - sharp even\n"
+                              "when cornerRadius is set, so the two can be compared.\n"
+                              "Drawn OVER the glow (it used to be under it).");
+        }
+        if (cfg.debug.showWireframe)
+        {
+            ImGui::SameLine();
+            ImGui::ColorEdit4("##WireColor", &cfg.debug.wireframeColor.x,
+                              ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_AlphaPreview);
+        }
+
+        // The strip and the markers annotate the GLOW, so they follow its
+        // state - see DebugRenderer::Render, which skips both in either case.
+        // The box annotates the geometry and survives both, so the wording
+        // says which overlays are affected rather than implying all three.
+        if (!cfg.neon.enable)
+        {
+            ImGui::TextDisabled("Neon is off - LUT / stops have nothing to annotate.");
+        }
+        else if (cfg.debug.opaqueOnly)
+        {
+            ImGui::TextDisabled("Opaque Only is on - LUT / stops suppressed.");
+        }
+        ImGui::Unindent();
+    }
+
+    ImGui::Separator();
+
+    // --- Neon debug mode ---
+    // Deliberately OUTSIDE the `enable` block above: this one is read by
+    // NeonRenderer, not by the overlay layer, so the overlay mute has no
+    // business hiding it or turning it off.
+    OpaqueOnlyCheckbox("##DebugOpaqueOnly", cfg.debug.opaqueOnly,
+                       cfg.neon.opaqueMode != EdgeLighting::OpaqueMode::NONE);
+}
+
+void DebugUI::buildDropletsSection(EdgeLighting::Config &cfg)
+{
+    if (!ImGui::CollapsingHeader("Droplets (rain on glass)", ImGuiTreeNodeFlags_DefaultOpen))
+    {
+        return;
+    }
+
+    ImGui::Checkbox("Enable##Droplets", &cfg.droplets.enable);
+    if (!cfg.droplets.enable)
+    {
+        return;
+    }
+
+    SliderWithInput("Band Width##Droplets", cfg.droplets.bandWidth, 4.0f, 200.0f);
+    SliderWithInput("Band Offset##Droplets", cfg.droplets.bandOffset, -50.0f, 50.0f);
+    SliderWithInput("Rain Amount##Droplets", cfg.droplets.amount, 0.0f, 1.0f);
+    SliderWithInput("Speed##Droplets", cfg.droplets.speed, 0.0f, 4.0f);
+    SliderIntWithInput("Lanes##Droplets", cfg.droplets.lanes, 1, 6);
+    ImGui::ColorEdit4("Tint##Droplets", &cfg.droplets.tint.x,
+                      ImGuiColorEditFlags_AlphaBar | ImGuiColorEditFlags_AlphaPreview);
+
+    ImGui::TextDisabled("Side follows Neon > Glow Side / Softness");
+}
+
+void DebugUI::buildLensFlareSection(EdgeLighting::Config &cfg)
+{
+    if (!ImGui::CollapsingHeader("Lens Flare", ImGuiTreeNodeFlags_DefaultOpen))
+    {
+        return;
+    }
+
+    // One flare layer at a resolution scale. There is no second renderer to
+    // enable any more, so the "both paths on, flare drawn twice" warning that
+    // used to live here has nothing left to warn about.
+    ImGui::Checkbox("Enable##Lens", &cfg.lensFlare.enable);
+
+    if (!cfg.lensFlare.enable)
+    {
+        return;
+    }
+
+    // 1.0 is the direct path (no offscreen buffer, no blit); below it the
+    // flare renders scaled and is blitted back.
+    SliderWithInput("Res Scale##Lens", cfg.lensFlare.resolutionScale,
+                    0.125f, 1.0f, "%.3f");
+
+    // Visual params.
+    SliderWithInput("Perimeter Pos##Lens", cfg.lensFlare.perimeterPosition, 0.0f, 1.0f, "%.3f");
+    SliderWithInput("Perimeter Offset##Lens", cfg.lensFlare.perimeterOffset, -500.0f, 500.0f, "%.1f px");
+    SliderWithInput("Size##Lens", cfg.lensFlare.size, 0.1f, 5.0f, "%.2f");
+    ImGui::ColorEdit4("Color##Lens", &cfg.lensFlare.color.x,
+                      ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_HDR |
+                          ImGuiColorEditFlags_Float);
+    SliderWithInput("Intensity##Lens", cfg.lensFlare.intensity, 0.0f, 4.0f, "%.2f");
+    SliderWithInput("Spread##Lens", cfg.lensFlare.spread, 0.0f, 3.0f, "%.2f");
+    SliderWithInput("Ghost Spacing##Lens", cfg.lensFlare.ghostSpacing, 0.1f, 4.0f, "%.2f");
+    SliderWithInput("Ghost Size##Lens", cfg.lensFlare.ghostSize, 1.0f, 5.0f, "%.2f");
+    SliderWithInput("Ghost Offset##Lens", cfg.lensFlare.ghostOffset, -4.0f, 3.0f, "%.2f");
+    ImGui::ColorEdit3("Ghost Color##Lens", &cfg.lensFlare.ghostColor.x);
+    SliderWithInput("Ghost Tint##Lens", cfg.lensFlare.ghostTint, 0.0f, 1.0f, "%.2f");
+    ImGui::SliderFloat2("Flare Center##Lens", &cfg.lensFlare.flareCenter.x, 0.0f, 1.0f, "%.2f");
+    SliderWithInput("Ray Density##Lens", cfg.lensFlare.rayDensity, 0.0f, 1.0f, "%.2f");
+    SliderWithInput("Rotation Rate##Lens", cfg.lensFlare.rotationRate, -2.0f, 2.0f, "%.3f rev/s");
+}
+
+void DebugUI::buildParticleSection(EdgeLighting::Config &cfg)
+{
+    if (!ImGui::CollapsingHeader("Particles", ImGuiTreeNodeFlags_DefaultOpen))
+    {
+        return;
+    }
+
+    ImGui::Checkbox("Enable##Particle", &cfg.particle.enable);
+    // Live count against the cap - the cap silently pauses emission, so this
+    // is the one place a "why did the sparks thin out" question is answered.
+    if (mParticleRenderer)
+    {
+        const size_t alive = mParticleRenderer->GetParticleCount();
+        ImGui::SameLine();
+        ImGui::Text("alive %zu / %d", alive, cfg.particle.maxParticles);
+        if (cfg.particle.enable && static_cast<int>(alive) >= cfg.particle.maxParticles)
+        {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "[cap reached]");
+        }
+    }
+    if (!cfg.particle.enable)
+    {
+        return;
+    }
+
+    // Which source the newborns took their colour from last frame. It moves
+    // with settings that live in OTHER sections - the drawn glow needs
+    // Neon > Res Scale below 1 and the neon drawing (not off, not
+    // Debug > Opaque only) - so it is worth seeing here.
+    if (mParticleRenderer)
+    {
+        switch (mParticleRenderer->GetColorSource())
+        {
+        case EdgeLighting::ParticleColorSource::NEON_OUTPUT:
+        {
+            ImGui::TextDisabled("Colour: neon as drawn (latched at spawn)");
+            break;
+        }
+        case EdgeLighting::ParticleColorSource::COLOR_RING:
+        {
+            ImGui::TextDisabled("Colour: CPU colour ring - no drawn glow to copy\n"
+                                "(needs Neon on and Neon > Res Scale below 1)");
+            break;
+        }
+        }
+    }
+
+    // A density here, not a rate: emitAlongArc spawns
+    // arcPixelLength * 2 * emissionRate / 100 motes per second.
+    SliderWithInput("Density##Particle", cfg.particle.emissionRate, 0.0f, 200.0f, "%.1f");
+    if (ImGui::IsItemHovered())
+    {
+        ImGui::SetTooltip("Motes/s = lit arc length (px) x 2 x Density / 100");
+    }
+    SliderWithInput("Lifetime##Particle", cfg.particle.lifetime, 0.05f, 3.0f, "%.2f s");
+    // A drift multiplier, not px/s - see ParticleConfig::speed.
+    SliderWithInput("Speed##Particle", cfg.particle.speed, 0.0f, 400.0f, "%.0f");
+    SliderWithInput("Drag##Particle", cfg.particle.drag, 0.0f, 10.0f);
+    SliderWithInput("Size##Particle", cfg.particle.sizeStart, 1.0f, 30.0f, "%.1f px");
+    SliderIntWithInput("Max Alive##Particle", cfg.particle.maxParticles, 32,
+                       EdgeLighting::ParticleConfig::MAX_PARTICLES_CAP);
+    SliderWithInput("Head Bias##Particle", cfg.particle.headBias, 0.05f, 4.0f);
+    SliderWithInput("Scatter Radius##Particle", cfg.particle.scatterRadius, 0.0f, 40.0f, "%.1f px");
+    SliderWithInput("Tail Size##Particle", cfg.particle.tailSizeFraction, 0.0f, 1.0f);
+
+    ImGui::TextDisabled("Emits along Neon > Arcs[0]. A static arc keeps the trail in\n"
+                        "place - add an Outline Tracer or Arc Wipe animation to move it.");
+}
+
+void DebugUI::buildSpotlightSection(EdgeLighting::Config &cfg)
+{
+    if (!ImGui::CollapsingHeader("Spotlights", ImGuiTreeNodeFlags_DefaultOpen))
+    {
+        return;
+    }
+
+    ImGui::Checkbox("Enable##Spot", &cfg.spotlight.enable);
+    if (!cfg.spotlight.enable)
+    {
+        return;
+    }
+
+    // 1.0 is the direct path (no offscreen buffer, no blit). Unlike the neon
+    // and flare scales, lowering this is NOT automatically cheaper here - the
+    // strips are already bounded, so the blit is a fixed full-viewport cost
+    // that only pays above roughly six lamps.
+    SliderWithInput("Res Scale##Spot", cfg.spotlight.resolutionScale, 0.125f, 1.0f, "%.3f");
+    if (cfg.spotlight.resolutionScale < 1.0f)
+    {
+        // The library holds the scale at 1.0 while a clipped lamp is enabled,
+        // because the clip edge has to be resolved at full resolution. Say so
+        // here, or the slider reads as broken: it moves and the frame does not
+        // change. Mirrors SpotlightRenderer's own HasClippedLamp test - the
+        // lamps that DRAW, within the ceiling.
+        size_t drawnLamps = std::min(cfg.spotlight.lamps.size(), size_t(SPOT_MAX_LAMPS));
+        bool anyClippedLamp = false;
+        for (size_t i = 0; i < drawnLamps; i++)
+        {
+            const auto &lamp = cfg.spotlight.lamps[i];
+            if (lamp.clipped && lamp.enable && lamp.intensity > 0.0f)
+            {
+                anyClippedLamp = true;
+                break;
+            }
+        }
+
+        if (anyClippedLamp)
+        {
+            ImGui::TextDisabled("Held at 1.0: a clipped lamp is enabled.");
+        }
+        else if (cfg.spotlight.lamps.size() < 6)
+        {
+            ImGui::TextDisabled("Below 1.0 costs more than it saves at this lamp count.");
+        }
+    }
+
+    // --- Clip area: ONE region for the layer, opted into per lamp below. ---
+    //
+    // Always shown, never gated behind an enable: the area has none, and
+    // whether it bites is each lamp's own "Clip This Lamp". Hiding it behind a
+    // checkbox here would invent a second switch in the UI that does not exist
+    // in the config.
+    ImGui::SeparatorText("Clip Area");
+    auto &clipArea = cfg.spotlight.clipArea;
+    {
+        ImGui::Indent();
+
+        const char *clipItems[] = {"Keep Inside", "Keep Outside"};
+        int modeIdx = static_cast<int>(clipArea.mode);
+        if (ImGui::Combo("Mode##SpotClip", &modeIdx, clipItems, IM_ARRAYSIZE(clipItems)))
+        {
+            clipArea.mode = static_cast<EdgeLighting::ClipMode>(modeIdx);
+        }
+
+        // Same app coordinates as the lamp positions and Geometry > Position:
+        // top-left origin, +y down.
+        SliderWithInput("X##SpotClip", clipArea.position.x, -200.0f, 2400.0f, "%.0f px");
+        SliderWithInput("Y##SpotClip", clipArea.position.y, -200.0f, 1600.0f, "%.0f px");
+        SliderWithInput("Width##SpotClip", clipArea.width, 0.0f, 2400.0f, "%.0f px");
+        SliderWithInput("Height##SpotClip", clipArea.height, 0.0f, 1600.0f, "%.0f px");
+        SliderWithInput("Corner Radius##SpotClip", clipArea.cornerRadius, 0.0f, 400.0f, "%.0f px");
+        SliderWithInput("Edge Softness##SpotClip", clipArea.edgeSoftness, 0.0f, 40.0f, "%.1f px");
+
+        // The clip is NOT bound to Config::geometry - the spotlight layer
+        // reads nothing but its own sub-config, which is what keeps a rect
+        // move off this renderer's rebuild path. This button is the bridge:
+        // it copies the four numbers across once, on demand.
+        if (ImGui::SmallButton("Match Rect##SpotClip"))
+        {
+            clipArea.position = cfg.geometry.position;
+            clipArea.width = cfg.geometry.width;
+            clipArea.height = cfg.geometry.height;
+            clipArea.cornerRadius = cfg.geometry.cornerRadius;
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("copy once - it does not follow the rect");
+
+        // The one trap left now that the area has no enable of its own: the
+        // defaults are 0 x 0, and a zero-size KEEP_INSIDE area keeps nothing.
+        // Only worth saying when a lamp has actually opted in, since otherwise
+        // the area is inert whatever it holds.
+        bool anyClipped = false;
+        for (const auto &lamp : cfg.spotlight.lamps)
+        {
+            if (lamp.clipped)
+            {
+                anyClipped = true;
+                break;
+            }
+        }
+        if (anyClipped &&
+            clipArea.mode == EdgeLighting::ClipMode::KEEP_INSIDE &&
+            (clipArea.width <= 0.0f || clipArea.height <= 0.0f))
+        {
+            ImGui::TextDisabled("Zero-size area: every clipped lamp draws nothing.");
+        }
+
+        ImGui::Unindent();
+    }
+    ImGui::Separator();
+
+    auto &lamps = cfg.spotlight.lamps;
+    const int maxLamps = SPOT_MAX_LAMPS;
+
+    ImGui::Text("%d / %d lamps", static_cast<int>(lamps.size()), maxLamps);
+    ImGui::SameLine();
+    if (ImGui::SmallButton("+ Add##Spot") && static_cast<int>(lamps.size()) < maxLamps)
+    {
+        // New lamps land above the rect pointing down, which is where a
+        // showcase rig starts, rather than at the origin where they would be
+        // half off screen.
+        EdgeLighting::SpotLight l;
+        l.position = glm::vec2(cfg.geometry.position.x + cfg.geometry.width * 0.5f,
+                               cfg.geometry.position.y - 60.0f);
+        l.angle = 90.0f;
+        lamps.push_back(l);
+        mSpotlightSelected = static_cast<int>(lamps.size()) - 1;
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Clear##Spot"))
+    {
+        lamps.clear();
+        mSpotlightSelected = 0;
+    }
+
+    if (lamps.empty())
+    {
+        ImGui::TextDisabled("No lamps. Add one to light something.");
+        return;
+    }
+
+    if (mSpotlightSelected >= static_cast<int>(lamps.size()))
+    {
+        mSpotlightSelected = static_cast<int>(lamps.size()) - 1;
+    }
+    if (mSpotlightSelected < 0)
+    {
+        mSpotlightSelected = 0;
+    }
+
+    // Lamp picker: one row each, so the selected index (which any animation
+    // binding also addresses) is always visible.
+    for (int i = 0; i < static_cast<int>(lamps.size()); i++)
+    {
+        char label[64];
+        std::snprintf(label, sizeof(label), "lamp %d  %.0f deg##SpotPick%d",
+                      i, lamps[static_cast<size_t>(i)].angle, i);
+        if (ImGui::RadioButton(label, mSpotlightSelected == i))
+        {
+            mSpotlightSelected = i;
+        }
+        ImGui::SameLine();
+        char killLabel[32];
+        std::snprintf(killLabel, sizeof(killLabel), "x##SpotKill%d", i);
+        if (ImGui::SmallButton(killLabel))
+        {
+            lamps.erase(lamps.begin() + i);
+            if (mSpotlightSelected >= static_cast<int>(lamps.size()))
+            {
+                mSpotlightSelected = static_cast<int>(lamps.size()) - 1;
+            }
+            return;
+        }
+    }
+
+    if (lamps.empty())
+    {
+        return;
+    }
+
+    EdgeLighting::SpotLight &l = lamps[static_cast<size_t>(mSpotlightSelected)];
+
+    ImGui::Separator();
+    ImGui::Checkbox("Lamp Enabled##Spot", &l.enable);
+
+    ImGui::Checkbox("Clip This Lamp##Spot", &l.clipped);
+
+    // App coordinates, top-left origin, +y down - the same space as
+    // Geometry > Position, which is why the ranges here are viewport-sized
+    // rather than centred on zero.
+    SliderWithInput("Position X##Spot", l.position.x, -200.0f, 2400.0f, "%.0f px");
+    SliderWithInput("Position Y##Spot", l.position.y, -200.0f, 1600.0f, "%.0f px");
+    SliderWithInput("Direction##Spot", l.angle, -180.0f, 360.0f, "%.1f deg");
+
+    ImGui::Separator();
+    SliderWithInput("Beam Angle##Spot", l.beamAngle, 3.0f, 120.0f, "%.1f deg");
+    // Up to 3000, where the old top was 900. It reaches further without
+    // brightening the core, so it is the one to reach for before intensity -
+    // but it is NOT the only distance term, which an earlier version of this
+    // comment claimed. Past about 1000 px the beam's own spread
+    // (apertureWidth / halfW) is what has dimmed it, and no throw value
+    // touches that: at this lamp's defaults the throw term is still at 72% at
+    // 1000 px while the spread term is at 5%. That is what Spread Falloff
+    // below is for. Note this is also what the layer's cost is made of: the
+    // strip is bounded to what the lamp lights, and at 3000 that is ~6x the
+    // pixels it is at the default 215.
+    SliderWithInput("Throw##Spot", l.throwLength, 20.0f, 3000.0f, "%.0f px");
+    SliderWithInput("Aperture##Spot", l.apertureWidth, 2.0f, 120.0f, "%.1f px");
+    SliderWithInput("Softness##Spot", l.softness, 0.0f, 1.0f, "%.2f");
+
+    // The exponent on that spread term, and the real reach control. 1.0 is
+    // physical and the default; 0 removes the spread loss entirely and leaves
+    // Throw as the only thing dimming the beam. Measured on one lamp at
+    // 1920x1080 (throw 3000, intensity 8), 1000 px down the axis: 78/255 at
+    // 1.0, 183 at 0.5, 235 at 0.0.
+    SliderWithInput("Spread Falloff##Spot", l.spreadFalloff, 0.0f, 2.0f, "%.2f");
+    if (ImGui::IsItemHovered())
+    {
+        ImGui::SetTooltip("Exponent on the beam's spread loss.\n"
+                          "1.0 = physical (default), 0 = none, >1 = a tighter pool.\n"
+                          "Lowering it grows the strip the lamp draws, so it costs fill:\n"
+                          "that is the light travelling further.");
+    }
+
+    ImGui::Separator();
+    // 8.0, well past the 3.0 the other look sliders use, because the highlight
+    // shoulder changed what this control means. It used to blow the core out to
+    // white above about 0.7; now it compresses above SPOT_HIGHLIGHT_KNEE and
+    // stays linear below it, so turning it up adds light to the BEAM and
+    // almost none to the emitter - at 700 px out, 1.15 to 8 is 18 to 112 while
+    // the core moves 156 to 236, nothing clipped. Pair it with Throw above.
+    //
+    // The field itself is not clamped - the C ABI and animations can drive it
+    // past this - so this bounds the slider's feel, not the effect.
+    SliderWithInput("Intensity##Spot", l.intensity, 0.0f, 8.0f, "%.2f");
+    SliderWithInput("Bloom##Spot", l.bloom, 0.0f, 3.0f, "%.2f");
+    SliderWithInput("Bloom Radius##Spot", l.bloomRadius, 4.0f, 160.0f, "%.0f px");
+    SliderWithInput("Color Temp##Spot", l.colorTemp, 1800.0f, 8000.0f, "%.0f K");
+
+    // Multiplied onto the colour temperature above, not a replacement for it -
+    // blackbody cannot reach a saturated green or magenta at any Kelvin. Left
+    // unclamped on purpose: above 1 brightens, and the strip solve folds the
+    // brightest channel into its bound so the geometry follows.
+    ImGui::ColorEdit3("Tint##Spot", &l.tint.x,
+                      ImGuiColorEditFlags_Float | ImGuiColorEditFlags_HDR);
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Reset##SpotTint"))
+    {
+        l.tint = glm::vec3(1.0f, 1.0f, 1.0f);
+    }
+
+    ImGui::TextDisabled("Positions are app coords (0,0 = top-left).");
+    ImGui::TextDisabled("Lamps do not follow the rect when it moves.");
+}
+
+void DebugUI::buildAnimationSection(EdgeLighting::Config &cfg,
+                                    EdgeLighting::AnimationManager &manager)
 {
     if (!ImGui::CollapsingHeader("Animations", ImGuiTreeNodeFlags_DefaultOpen))
     {
         return;
     }
 
-    // --- Add row: preset combo (no separate Add button — changing the
+    // --- Add row: preset combo (no separate Add button - changing the
     // selection commits immediately, so picking a preset is a single click). ---
     static constexpr int PRESET_COUNT = static_cast<int>(EdgeLightingDemo::AnimationPreset::COUNT);
     const char *names[PRESET_COUNT];
@@ -659,78 +1451,74 @@ void DebugUI::buildAnimationSection(EdgeLighting::Config &cfg, float clockTime)
         auto preset = static_cast<EdgeLightingDemo::AnimationPreset>(mAddPresetIdx);
         if (auto anim = EdgeLightingDemo::CreateAnimation(preset))
         {
-            const char *presetName = EdgeLightingDemo::PresetName(preset);
-            // Log completion + state changes for the added animation. In a
-            // real app these hooks would drive UI transitions, chain the
-            // next animation, etc.
-            anim->OnComplete = [presetName]()
-            { LOG_I("Animation '%s' completed.", presetName); };
+            anim->SetName(EdgeLightingDemo::PresetName(preset));
+
+            std::weak_ptr<EdgeLighting::Animation> weakAnim = anim;
+            anim->OnComplete = [weakAnim]()
+            {
+                if (auto a = weakAnim.lock())
+                {
+                    LOG_I("Animation '%s' completed.", a->GetName().c_str());
+                }
+            };
             anim->OnStateChanged =
-                [presetName](EdgeLighting::AnimationState /*prev*/,
-                             EdgeLighting::AnimationState now)
+                [weakAnim](EdgeLighting::AnimationState /*prev*/,
+                           EdgeLighting::AnimationState now)
             {
                 const char *stateName = "?";
                 switch (now)
                 {
-                case EdgeLighting::AnimationState::Playing:
+                case EdgeLighting::AnimationState::PLAYING:
+                {
                     stateName = "Playing";
                     break;
-                case EdgeLighting::AnimationState::Paused:
+                }
+                case EdgeLighting::AnimationState::PAUSED:
+                {
                     stateName = "Paused";
                     break;
-                case EdgeLighting::AnimationState::Stopped:
+                }
+                case EdgeLighting::AnimationState::STOPPED:
+                {
                     stateName = "Stopped";
                     break;
-                case EdgeLighting::AnimationState::Completed:
-                    stateName = "Completed";
-                    break;
                 }
-                LOG_I("Animation '%s' → %s", presetName, stateName);
+                }
+                if (auto a = weakAnim.lock())
+                {
+                    LOG_I("Animation '%s' -> %s", a->GetName().c_str(), stateName);
+                }
             };
-            // Added animations start Stopped and DON'T touch the config
-            // yet — the animated field keeps whatever value it was showing
-            // in the sliders. The animation only starts writing when the
-            // user clicks Play on the row. (Reset(cfg) is available on the
-            // row's Reset button for the "seed baseline before Play" case,
-            // but we don't force it here.)
-            mActiveGroup->Add(anim);
-            // Remember the human-readable name so the row header reads
-            // "Breathing" instead of "Animation #3". Parallel vector because
-            // AnimationGroup only stores AnimationPtr, not names.
-            mActiveNames.push_back(presetName);
+            manager.Attach(anim);
         }
-        mLastClockTime = clockTime;
     }
 
     ImGui::Separator();
 
     // --- Added animation rows ---
-    // Iterate a snapshot of the children so removing during iteration is
-    // safe (mActiveGroup->Remove(...) invalidates any iterator otherwise).
-    const auto children = mActiveGroup->GetChildren();
+    // Snapshot the manager's attached animations so a Detach during iteration
+    // stays safe (Detach erases from the manager's own vector).
+    std::vector<EdgeLighting::AnimationPtr> children;
+    children.reserve(manager.GetCount());
+    for (size_t i = 0; i < manager.GetCount(); ++i)
+    {
+        children.push_back(manager.GetAnimation(i));
+    }
     if (children.empty())
     {
         ImGui::TextDisabled("No animations added. Pick a preset above to add one.");
     }
     for (size_t i = 0; i < children.size(); ++i)
     {
-        const char *presetName = i < mActiveNames.size() ? mActiveNames[i]
-                                                         : "Animation";
+        const std::string &name = children[i]->GetName();
+        const char *presetName = name.empty() ? "Animation" : name.c_str();
         char label[80];
         std::snprintf(label, sizeof(label), "%s##%zu", presetName, i);
         if (DrawAnimationRow(label, *children[i], cfg, /*allowRemove=*/true))
         {
-            mActiveGroup->Remove(children[i]);
-            if (i < mActiveNames.size())
-            {
-                mActiveNames.erase(mActiveNames.begin() + static_cast<ptrdiff_t>(i));
-            }
-            continue; // vector snapshot means the iterator is still valid,
-                      // but the child is gone — skip its group-children draw.
+            manager.Detach(children[i]);
+            continue;
         }
-        // If this preset is an AnimationGroup (Shimmer, Aurora, …), expose
-        // its children as indented sub-rows so the per-child Duration slider
-        // is reachable. Non-group animations skip this branch.
         if (auto sub = std::dynamic_pointer_cast<EdgeLighting::AnimationGroup>(
                 children[i]))
         {
@@ -739,54 +1527,7 @@ void DebugUI::buildAnimationSection(EdgeLighting::Config &cfg, float clockTime)
     }
 
     ImGui::TextDisabled(
-        "Sliders for animated fields will be overwritten each frame.");
-}
-
-void DebugUI::buildParticleSection(EdgeLighting::Config &cfg)
-{
-    if (!ImGui::CollapsingHeader("Particles", ImGuiTreeNodeFlags_DefaultOpen))
-    {
-        return;
-    }
-
-    ImGui::Checkbox("Enable##Particle", &cfg.particle.enable);
-    if (!cfg.particle.enable)
-    {
-        return;
-    }
-
-    const char *modeNames[] = {"Arc head/tail sparks", "Movement (meteor trail)"};
-    int modeIdx = static_cast<int>(cfg.particle.mode);
-    if (ImGui::Combo("Mode##Particle", &modeIdx, modeNames, IM_ARRAYSIZE(modeNames)))
-    {
-        cfg.particle.mode = static_cast<EdgeLighting::ParticleMode>(modeIdx);
-    }
-
-    ImGui::SliderFloat("Drag##Particle", &cfg.particle.drag, 0.0f, 10.0f, "%.2f");
-    ImGui::SliderInt("Max alive##Particle", &cfg.particle.maxParticles, 32, 4096);
-
-    if (cfg.particle.mode == EdgeLighting::ParticleMode::ARC_HEAD_TAIL)
-    {
-        ImGui::SliderFloat("Rate (per sec)##Particle", &cfg.particle.emissionRate, 0.0f, 2000.0f, "%.0f");
-        ImGui::SliderFloat("Lifetime (s)##Particle", &cfg.particle.lifetime, 0.05f, 3.0f, "%.2f");
-        ImGui::SliderFloat("Speed (px/s)##Particle", &cfg.particle.speed, 0.0f, 400.0f, "%.0f");
-        ImGui::SliderFloat("Size (px)##Particle", &cfg.particle.sizeStart, 1.0f, 30.0f, "%.1f");
-        ImGui::SliderFloat("Outward bias##Particle", &cfg.particle.outwardBias, 0.0f, 1.0f, "%.2f");
-        ImGui::SliderFloat("Spread (deg)##Particle", &cfg.particle.spreadDeg, 0.0f, 180.0f, "%.0f");
-        ImGui::Checkbox("Emit from head##Particle", &cfg.particle.emitFromHead);
-        ImGui::SameLine();
-        ImGui::Checkbox("Emit from tail##Particle", &cfg.particle.emitFromTail);
-    }
-    else
-    {
-        ImGui::SliderFloat("Rate (per sec)##ParticleMv", &cfg.particle.movementEmissionRate, 0.0f, 2000.0f, "%.0f");
-        ImGui::SliderFloat("Lifetime (s)##ParticleMv", &cfg.particle.movementLifetime, 0.05f, 3.0f, "%.2f");
-        ImGui::SliderFloat("Drift speed (px/s)##ParticleMv", &cfg.particle.movementSpeed, 0.0f, 200.0f, "%.0f");
-        ImGui::SliderFloat("Size (px)##ParticleMv", &cfg.particle.movementSizeStart, 1.0f, 15.0f, "%.1f");
-        ImGui::SliderFloat("Scatter radius (px)##ParticleMv", &cfg.particle.scatterRadius, 0.0f, 30.0f, "%.1f");
-        ImGui::SliderFloat("Head bias##ParticleMv", &cfg.particle.headBias, 0.05f, 1.0f, "%.2f");
-        ImGui::SliderFloat("Tail size fraction##ParticleMv", &cfg.particle.tailSizeFraction, 0.0f, 1.0f, "%.2f");
-    }
+        "Animated fields revert to their base (slider) value on Stop.");
 }
 
 void DebugUI::buildBackgroundSection()
@@ -803,7 +1544,242 @@ void DebugUI::buildBackgroundSection()
         return;
     }
 
-    ImGui::SliderFloat("Checker Size##Bg", &mBgCheckerSize, 4.0f, 128.0f, "%.0f");
+    SliderWithInput("Checker Size##Bg", mBgCheckerSize, 4.0f, 128.0f, "%.0f");
     ImGui::ColorEdit3("Color A##Bg", &mBgColorA.x, ImGuiColorEditFlags_NoInputs);
     ImGui::ColorEdit3("Color B##Bg", &mBgColorB.x, ImGuiColorEditFlags_NoInputs);
+}
+
+void DebugUI::scanColorPickerFiles()
+{
+    static const std::vector<std::string> exts = {
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".bmp",
+        ".tga",
+    };
+    // Remember the currently selected filename so we can restore it after
+    // a refresh, in case its index shifted.
+    std::string prev;
+    if (mColorPickerSelectedIdx >= 0 &&
+        mColorPickerSelectedIdx < static_cast<int>(mColorPickerFiles.size()))
+    {
+        prev = mColorPickerFiles[mColorPickerSelectedIdx];
+    }
+    mColorPickerFiles.clear();
+
+    std::error_code ec;
+    for (auto &entry : std::filesystem::directory_iterator(RES_DIR, ec))
+    {
+        if (ec || !entry.is_regular_file())
+        {
+            continue;
+        }
+        std::string ext = entry.path().extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(),
+                       [](unsigned char c)
+                       { return std::tolower(c); });
+        if (std::find(exts.begin(), exts.end(), ext) == exts.end())
+        {
+            continue;
+        }
+        mColorPickerFiles.push_back(entry.path().filename().string());
+    }
+    std::sort(mColorPickerFiles.begin(), mColorPickerFiles.end());
+
+    mColorPickerSelectedIdx = 0;
+    if (!prev.empty())
+    {
+        auto it = std::find(mColorPickerFiles.begin(), mColorPickerFiles.end(), prev);
+        if (it != mColorPickerFiles.end())
+        {
+            mColorPickerSelectedIdx =
+                static_cast<int>(std::distance(mColorPickerFiles.begin(), it));
+        }
+    }
+}
+
+void DebugUI::buildColorPickerSection(EdgeLighting::Config &cfg)
+{
+    if (!ImGui::CollapsingHeader("Border Color Picker", ImGuiTreeNodeFlags_DefaultOpen))
+    {
+        return;
+    }
+
+    ImGui::TextDisabled("Pick an image from res/; sample its border into color stops.");
+
+    if (mColorPickerFiles.empty())
+    {
+        scanColorPickerFiles();
+    }
+
+    // File dropdown + Refresh + Load, all on one line.
+    ImGui::SetNextItemWidth(-160.0f);
+    const char *current =
+        (mColorPickerSelectedIdx >= 0 &&
+         mColorPickerSelectedIdx < static_cast<int>(mColorPickerFiles.size()))
+            ? mColorPickerFiles[mColorPickerSelectedIdx].c_str()
+            : "(no images in res/)";
+    if (ImGui::BeginCombo("##CPFile", current))
+    {
+        for (int i = 0; i < static_cast<int>(mColorPickerFiles.size()); ++i)
+        {
+            bool selected = (i == mColorPickerSelectedIdx);
+            if (ImGui::Selectable(mColorPickerFiles[i].c_str(), selected))
+            {
+                mColorPickerSelectedIdx = i;
+            }
+            if (selected)
+            {
+                ImGui::SetItemDefaultFocus();
+            }
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Refresh##CP"))
+    {
+        scanColorPickerFiles();
+    }
+    ImGui::SameLine();
+    const bool canLoad = mColorPickerSelectedIdx >= 0 &&
+                         mColorPickerSelectedIdx < static_cast<int>(mColorPickerFiles.size());
+    ImGui::BeginDisabled(!canLoad);
+    if (ImGui::Button("Load##CP") && canLoad)
+    {
+        std::string path = std::string(RES_DIR) + "/" +
+                           mColorPickerFiles[mColorPickerSelectedIdx];
+        if (mColorPicker.Load(path))
+        {
+            if (!mColorPickerThumb)
+            {
+                mColorPickerThumb = std::make_unique<EdgeLighting::Texture2D>();
+                mColorPickerThumb->SetParams(GL_LINEAR, GL_LINEAR, GL_CLAMP_TO_EDGE, GL_CLAMP_TO_EDGE);
+            }
+            while (glGetError() != GL_NO_ERROR)
+            {
+            }
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+            mColorPickerThumb->SetData(mColorPicker.Pixels().data(),
+                                       mColorPicker.Width(),
+                                       mColorPicker.Height());
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+            GLenum err = glGetError();
+            if (err != GL_NO_ERROR)
+            {
+                LOG_E("BorderColorPicker: glTexImage2D(%dx%d) failed: 0x%04x",
+                      mColorPicker.Width(), mColorPicker.Height(), err);
+            }
+        }
+    }
+    ImGui::EndDisabled();
+
+    if (!mColorPicker.HasImage())
+    {
+        ImGui::TextDisabled("(no image loaded)");
+        return;
+    }
+
+    ImGui::Text("Loaded: %dx%d", mColorPicker.Width(), mColorPicker.Height());
+    ImGui::Checkbox("Show as backdrop##CP", &mShowImageBackdrop);
+
+    if (mColorPickerThumb && mColorPickerThumb->IsValid())
+    {
+        const float maxW = 200.0f;
+        const float aspect = static_cast<float>(mColorPicker.Height()) /
+                             static_cast<float>(mColorPicker.Width());
+        const ImVec2 size(maxW, maxW * aspect);
+        ImGui::Image(static_cast<ImTextureID>(
+                         static_cast<uintptr_t>(mColorPickerThumb->GetId())),
+                     size);
+    }
+
+    // Cap matches the file-scope MAX_COLOR_STOPS (which mirrors the C ABI's
+    // fixed-size array cap) so the picker can produce one stop per shader
+    // loop sample for near-1:1 image-to-neon colour reproduction.
+    SliderIntWithInput("Stop Count##CP", mColorPickerStopCount, 2,
+                       MAX_COLOR_STOPS);
+    ImGui::TextDisabled("(higher = closer image match)");
+
+    SliderWithInput("Contrast (gamma)##CP", mColorPickerGamma, 0.5f, 4.0f, "%.2f");
+    ImGui::SameLine();
+    ImGui::TextDisabled("(1 = linear, >1 darkens shadows)");
+
+    // Preview the sampled stops as a horizontal color strip so the user sees
+    // what will be applied before clicking Apply.
+    auto stops = mColorPicker.SampleBorder(mColorPickerStopCount,
+                                           cfg.geometry.winding,
+                                           static_cast<int>(cfg.geometry.width),
+                                           static_cast<int>(cfg.geometry.height));
+
+    // Contrast gamma: pow(c, gamma) - dark stops shrink toward 0 while bright
+    // stops stay near 1 (0.9^2 = 0.81, 0.06^2 = 0.0036). Applied before Apply
+    // so the LUT baked into the shader reflects the compressed range.
+    if (std::abs(mColorPickerGamma - 1.0f) > 1e-3f)
+    {
+        for (auto &s : stops)
+        {
+            s.color.r = std::pow(std::clamp(s.color.r, 0.0f, 1.0f), mColorPickerGamma);
+            s.color.g = std::pow(std::clamp(s.color.g, 0.0f, 1.0f), mColorPickerGamma);
+            s.color.b = std::pow(std::clamp(s.color.b, 0.0f, 1.0f), mColorPickerGamma);
+        }
+    }
+
+    if (!stops.empty())
+    {
+        ImDrawList *dl = ImGui::GetWindowDrawList();
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        const float stripW = ImGui::GetContentRegionAvail().x;
+        const float stripH = 20.0f;
+        const float cellW = stripW / static_cast<float>(stops.size());
+        for (size_t i = 0; i < stops.size(); ++i)
+        {
+            const glm::vec4 &c = stops[i].color;
+            ImU32 col = ImGui::ColorConvertFloat4ToU32(ImVec4(c.r, c.g, c.b, c.a));
+            dl->AddRectFilled(ImVec2(p.x + cellW * i, p.y),
+                              ImVec2(p.x + cellW * (i + 1), p.y + stripH),
+                              col);
+        }
+        ImGui::Dummy(ImVec2(stripW, stripH));
+    }
+
+    // Compute an intensity that keeps the brightest sampled colour near the
+    // tone-map knee (pre-tonemap ~3.5, output ~0.85) so dark stops still show
+    // as dark. FILAMENT_GAIN in the shader is 12, and the tone map is
+    // x / (x + 0.6); solving for `output ≈ 0.85` at brightest gives
+    // intensity ≈ 3.5 / (12 * maxChan). Only applied when the auto toggle is
+    // on so users who want the classic HDR-neon look can opt out.
+    float maxChan = 0.0f;
+    for (const auto &s : stops)
+    {
+        maxChan = std::max(maxChan, std::max({s.color.r, s.color.g, s.color.b}));
+    }
+    const float autoIntensity = maxChan > 1e-3f
+                                    ? std::clamp(3.5f / (12.0f * maxChan), 0.05f, 1.0f)
+                                    : 1.0f;
+
+    ImGui::Checkbox("Auto-adjust intensity##CP", &mColorPickerAutoIntensity);
+    if (mColorPickerAutoIntensity)
+    {
+        ImGui::SameLine();
+        ImGui::TextDisabled("(→ %.2f)", autoIntensity);
+    }
+
+    auto applyStops = [&](std::vector<EdgeLighting::ColorStop> &target,
+                          float &hueRate, float &intensity)
+    {
+        target = stops;
+        // Applying picker-sampled colours pins each colour to a specific
+        // perimeter position, so hue-rotation would drift the halo away.
+        hueRate = 0.0f;
+        if (mColorPickerAutoIntensity)
+        {
+            intensity = autoIntensity;
+        }
+    };
+
+    if (ImGui::Button("Apply to Neon##CP"))
+    {
+        applyStops(cfg.neon.colorStops, cfg.neon.hueRotationRate, cfg.neon.intensity);
+    }
 }

@@ -1,11 +1,18 @@
 #include "core/edge-lighting.h"
+#include "animation/animation-manager.h"
 #include "util/log-util.h"
 #include "util/gl-utils.h"
+#include <utility> // std::swap - refreshActiveConfig swaps the composite scratch
 
 namespace EdgeLighting
 {
 
-    EdgeLightingEffect::EdgeLightingEffect() = default;
+    EdgeLightingEffect::EdgeLightingEffect()
+        : mAnimationManager(std::make_unique<AnimationManager>())
+    {
+    }
+
+    EdgeLightingEffect::~EdgeLightingEffect() = default;
 
     bool EdgeLightingEffect::Initialize()
     {
@@ -17,7 +24,7 @@ namespace EdgeLighting
         {
             if (!(*it)->Initialize())
             {
-                LOG_E("EdgeLightingEffect: a renderer failed to initialize — removing it.");
+                LOG_E("EdgeLightingEffect: a renderer failed to initialize - removing it.");
                 it = mRenderers.erase(it);
                 allOk = false;
             }
@@ -26,16 +33,21 @@ namespace EdgeLighting
                 ++it;
             }
         }
+        // From here on AddRenderer has to initialise what it is handed - this
+        // loop is not coming round again for it.
+        mInitialized = true;
         return allOk;
     }
 
     void EdgeLightingEffect::Update(float deltaTime)
     {
-        mClock.Update(deltaTime);
-        float t = mClock.GetTime();
+        mAnimationManager->Update(mClock.Update(deltaTime));
+        refreshActiveConfig();
+
+        float time = mClock.GetTime();
         for (auto &renderer : mRenderers)
         {
-            renderer->Update(deltaTime, t, mConfig);
+            renderer->Update(deltaTime, time, mActiveConfig);
         }
     }
 
@@ -44,34 +56,93 @@ namespace EdgeLighting
         float t = mClock.GetTime();
         for (auto &renderer : mRenderers)
         {
-            renderer->Render(viewportWidth, viewportHeight, t, mConfig);
+            renderer->Render(viewportWidth, viewportHeight, t, mActiveConfig);
         }
     }
 
     void EdgeLightingEffect::SetConfig(const Config &config)
     {
-        mConfig = config;
-        for (auto &renderer : mRenderers)
+        if (config == mBaseConfig)
         {
-            renderer->OnConfigChanged(mConfig);
+            return;
         }
+        mBaseConfig = config;
+        refreshActiveConfig();
     }
 
-    const Config &EdgeLightingEffect::GetConfig() const
-    {
-        return mConfig;
-    }
+    const Config &EdgeLightingEffect::GetConfig() const { return mBaseConfig; }
+    const Config &EdgeLightingEffect::GetActiveConfig() const { return mActiveConfig; }
+
+    void EdgeLightingEffect::Attach(const AnimationPtr &a) { mAnimationManager->Attach(a); }
+    bool EdgeLightingEffect::Detach(const AnimationPtr &a) { return mAnimationManager->Detach(a); }
+    AnimationManager &EdgeLightingEffect::GetAnimationManager() { return *mAnimationManager; }
+    const AnimationManager &EdgeLightingEffect::GetAnimationManager() const { return *mAnimationManager; }
 
     void EdgeLightingEffect::AddRenderer(std::shared_ptr<BaseRenderer> renderer)
     {
-        if (renderer)
+        if (!renderer)
         {
-            mRenderers.push_back(renderer);
-            renderer->OnConfigChanged(mConfig);
+            return;
         }
+
+        // Registering after Initialize used to leave the renderer with no
+        // shaders: Initialize walks the list exactly once, so nothing would
+        // ever compile them, and the renderer's Render then drew with program
+        // 0 every frame. Initialise it here instead, and drop it if that fails
+        // - the same contract Initialize applies to the batch.
+        if (mInitialized && !renderer->Initialize())
+        {
+            LOG_E("EdgeLightingEffect: renderer registered after Initialize failed "
+                  "to initialize - not added.");
+            return;
+        }
+
+        mRenderers.push_back(renderer);
+        // Hand over the current composited config, not the base: a renderer
+        // joining mid-animation should see what every other renderer sees.
+        // Renderers gate their own rebuilds on shader validity, so this is also
+        // safe on the pre-Initialize path where nothing is compiled yet.
+        renderer->OnConfigChanged(mActiveConfig);
     }
 
     Clock &EdgeLightingEffect::GetClock() { return mClock; }
     const Clock &EdgeLightingEffect::GetClock() const { return mClock; }
+
+    void EdgeLightingEffect::refreshActiveConfig()
+    {
+        if (mAnimationManager->GetCount() == 0)
+        {
+            if (mActiveConfig == mBaseConfig)
+            {
+                return;
+            }
+            mActiveConfig = mBaseConfig;
+        }
+        else
+        {
+            // Copy-ASSIGN into the member scratch, never a local copy-construct
+            // - the assignment reuses the vector capacity already in there, so
+            // this whole path allocates nothing once it has run a frame. See
+            // mScratchConfig for the measurements behind that.
+            mScratchConfig = mBaseConfig;
+            mAnimationManager->Apply(mScratchConfig);
+            if (mScratchConfig == mActiveConfig)
+            {
+                return;
+            }
+            // SWAP, not move-assign. A move would leave the scratch holding
+            // moved-from (empty) vectors, and the next frame's assignment would
+            // then have to allocate all of them again - which is the cost this
+            // is here to remove. The swap hands the scratch the buffers the
+            // outgoing active config owned: already allocated, already the
+            // right size for the config it is about to be handed again.
+            std::swap(mActiveConfig, mScratchConfig);
+        }
+
+        for (auto &renderer : mRenderers)
+        {
+            renderer->OnConfigChanged(mActiveConfig);
+        }
+    }
 
 } // namespace EdgeLighting

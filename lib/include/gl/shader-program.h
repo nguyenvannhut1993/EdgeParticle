@@ -27,7 +27,7 @@ namespace EdgeLighting
     /// - Caches @c glGetUniformLocation results so each uniform name is resolved
     ///   exactly once per program lifetime.
     /// - Caches the last value uploaded for every uniform and skips the GL call
-    ///   when the new value is identical — substantial savings when a renderer
+    ///   when the new value is identical - substantial savings when a renderer
     ///   uploads ~20 uniforms per frame but only a couple actually change.
     /// - Warns once if a uniform name doesn't exist in the program (then stays
     ///   silent on subsequent calls so render loops don't spam the log).
@@ -39,7 +39,7 @@ namespace EdgeLighting
         ShaderProgram() = default;
 
         /// Compile @p vertSrc + @p fragSrc and link them. @p name (optional) is
-        /// only used for log messages — pass the renderer / shader name so
+        /// only used for log messages - pass the renderer / shader name so
         /// errors are attributable when several programs live in one process.
         ShaderProgram(const char *vertSrc, const char *fragSrc, const char *name = nullptr)
             : mName(name ? name : "unnamed")
@@ -148,6 +148,21 @@ namespace EdgeLighting
         void Unuse() const
         {
             glUseProgram(0);
+        }
+
+        /// Assigns the named std140 uniform block to @p bindingPoint. Call once
+        /// after linking; pair with UniformBuffer::BindBase on the same point.
+        void SetUniformBlockBinding(const char *blockName, GLuint bindingPoint) const
+        {
+            GLuint index = glGetUniformBlockIndex(mId, blockName);
+            if (index == GL_INVALID_INDEX)
+            {
+                LOG_E("ShaderProgram[%s]: uniform block '%s' not found.",
+                      mName.c_str(), blockName);
+                return;
+            }
+
+            glUniformBlockBinding(mId, index, bindingPoint);
         }
 
         // -------------------------------------------------------------------
@@ -270,15 +285,48 @@ namespace EdgeLighting
 
         // -------------------------------------------------------------------
         // Array uniform setters
-        // Cached by memcmp on the value buffer — collapses N per-element calls
+        // Cached by memcmp on the value buffer - collapses N per-element calls
         // into one and skips the upload when the array hasn't changed.
+        //
+        // Contract (applies to every overload below):
+        //   1. count == 0 is a legal no-op - callers pass N=0 when the feature
+        //      is off, and this must NOT log "uniform not found" for arrays
+        //      the linker optimised away. Check `count <= 0` before touching
+        //      getLocation() so the direct and fallback paths behave the same.
+        //   2. Partial uploads leave stale tail elements: `set(..., N)` then
+        //      `set(..., M<N)` writes M elements and elements [M, N) in GL
+        //      keep their old values, while the byte cache now only tracks M.
+        //      Shaders must gate on a companion count uniform.
+        //   3. Do NOT mix the array overload and the scalar overload for the
+        //      same base uniform. `getLocation("foo")` and `getLocation("foo[0]")`
+        //      resolve to the same GL location, but the array upload writes
+        //      mCacheArray while the scalar upload writes mCacheVec*; the two
+        //      caches drift independently and one path will silently skip a
+        //      stale value.
+        //   4. Tight-packing: glUniform*fv reinterprets the array as
+        //      `count * components` contiguous floats. Default GLM packs
+        //      vec2/vec3/vec4 tightly; GLM_FORCE_DEFAULT_ALIGNED_GENTYPES pads
+        //      vec3 to 16 bytes and breaks this path. static_asserts below
+        //      trip a compile error if that ever changes.
         // -------------------------------------------------------------------
+
+        static_assert(sizeof(glm::vec2) == 2 * sizeof(float),
+                      "glUniform2fv array upload requires tightly packed glm::vec2");
+        static_assert(sizeof(glm::vec3) == 3 * sizeof(float),
+                      "glUniform3fv array upload requires tightly packed glm::vec3 "
+                      "(GLM_FORCE_DEFAULT_ALIGNED_GENTYPES pads to 16 bytes - don't set it)");
+        static_assert(sizeof(glm::vec4) == 4 * sizeof(float),
+                      "glUniform4fv array upload requires tightly packed glm::vec4");
 
         void SetUniform(const char *name, const float *values, int count)
         {
+            if (count <= 0)
+            {
+                return;
+            }
 #if UNIFORM_ARRAY_DIRECT
             GLint loc = getLocation(name);
-            if (loc < 0 || count <= 0)
+            if (loc < 0)
             {
                 return;
             }
@@ -290,11 +338,6 @@ namespace EdgeLighting
 
             glUniform1fv(loc, count, values);
 #else
-            if (count <= 0)
-            {
-                return;
-            }
-
             for (int i = 0; i < count; ++i)
             {
                 char elemName[128];
@@ -306,9 +349,13 @@ namespace EdgeLighting
 
         void SetUniform(const char *name, const glm::vec2 *values, int count)
         {
+            if (count <= 0)
+            {
+                return;
+            }
 #if UNIFORM_ARRAY_DIRECT
             GLint loc = getLocation(name);
-            if (loc < 0 || count <= 0)
+            if (loc < 0)
             {
                 return;
             }
@@ -320,11 +367,35 @@ namespace EdgeLighting
 
             glUniform2fv(loc, count, glm::value_ptr(*values));
 #else
+            for (int i = 0; i < count; ++i)
+            {
+                char elemName[128];
+                snprintf(elemName, sizeof(elemName), "%s[%d]", name, i);
+                SetUniform(elemName, values[i]);
+            }
+#endif
+        }
+
+        void SetUniform(const char *name, const glm::vec3 *values, int count)
+        {
             if (count <= 0)
             {
                 return;
             }
+#if UNIFORM_ARRAY_DIRECT
+            GLint loc = getLocation(name);
+            if (loc < 0)
+            {
+                return;
+            }
 
+            if (!isArrayChanged(loc, values, sizeof(glm::vec3) * static_cast<size_t>(count)))
+            {
+                return;
+            }
+
+            glUniform3fv(loc, count, glm::value_ptr(*values));
+#else
             for (int i = 0; i < count; ++i)
             {
                 char elemName[128];
@@ -336,9 +407,13 @@ namespace EdgeLighting
 
         void SetUniform(const char *name, const glm::vec4 *values, int count)
         {
+            if (count <= 0)
+            {
+                return;
+            }
 #if UNIFORM_ARRAY_DIRECT
             GLint loc = getLocation(name);
-            if (loc < 0 || count <= 0)
+            if (loc < 0)
             {
                 return;
             }
@@ -350,11 +425,6 @@ namespace EdgeLighting
 
             glUniform4fv(loc, count, glm::value_ptr(*values));
 #else
-            if (count <= 0)
-            {
-                return;
-            }
-
             for (int i = 0; i < count; ++i)
             {
                 char elemName[128];

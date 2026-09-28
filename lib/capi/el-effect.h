@@ -1,0 +1,1024 @@
+/**
+ * @file el-effect.h
+ * @brief Effect lifecycle, config setters/getters, clock control, and
+ *        animation management for the EdgeLighting C API.
+ */
+#ifndef _EL_EFFECT_H_
+#define _EL_EFFECT_H_
+
+#include "el-types.h"
+
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
+    /* ======================================================================
+     * Effect - config setters and getters
+     *
+     * Every setter mutates the effect's staging @c Config and immediately
+     * calls @c SetConfig on the underlying effect. Every getter reads that
+     * staging copy - not the animation-overlaid active config. Getters
+     * always require a non-null @p out* pointer.
+     *
+     * Setters are idempotent: assigning the same value twice is a cheap
+     * no-op and still returns @ref EL_SUCCESS.
+     * ==================================================================== */
+
+    /** @name Geometry
+     *  Rectangle position, size, corner radius, and winding.
+     *  @{ */
+
+    /** @brief Set the target rectangle geometry.
+     *  @param effect       Effect handle.
+     *  @param width        Rectangle width in pixels (must be >= 0).
+     *  @param height       Rectangle height in pixels (must be >= 0).
+     *  @param posX         Top-left X in viewport coordinates.
+     *  @param posY         Top-left Y in viewport coordinates.
+     *  @param cornerRadius Corner radius in pixels; 0 = sharp corners. */
+    EL_API el_result_e el_effect_set_geometry(el_effect_handle_t effect,
+                                              float width, float height, float posX, float posY, float cornerRadius);
+    /** @brief Read the target rectangle geometry back from the staging config. */
+    EL_API el_result_e el_effect_get_geometry(el_effect_handle_t effect,
+                                              float *outWidth, float *outHeight, float *outPosX, float *outPosY,
+                                              float *outCornerRadius);
+
+    /** @brief Set the traversal direction around the perimeter (CW / CCW). */
+    EL_API el_result_e el_effect_set_winding(el_effect_handle_t effect, el_winding_e winding);
+    EL_API el_result_e el_effect_get_winding(el_effect_handle_t effect, el_winding_e *outWinding);
+
+    /** @} */
+
+    /** @name Renderer toggles
+     *  On/off switches for the visual layers. Any subset can be enabled at
+     *  once - they composite additively. The debug overlay layer has its own
+     *  switch with the rest of the diagnostics; see @ref el_effect_set_debug_enabled.
+     *  @{ */
+
+    EL_API el_result_e el_effect_set_neon_renderer_enabled(el_effect_handle_t effect, el_bool_t enabled);
+    EL_API el_result_e el_effect_get_neon_renderer_enabled(el_effect_handle_t effect, el_bool_t *outEnabled);
+
+    /** @} */
+
+    /** @name Compositing
+     *  How the effect blends with the framebuffer.
+     *  @{ */
+
+    /** @brief Where the opaque-mode fill covers pixels.
+     *  @details See @ref el_opaque_mode_e. NONE keeps the effect purely
+     *           transparent; the other modes rasterise a coloured band shaped
+     *           by @ref el_effect_set_inside_cutoff /
+     *           @ref el_effect_set_outside_cutoff and filled with
+     *           @ref el_effect_set_opaque_color. To render the fill on its
+     *           own, with the emission suppressed, see
+     *           @ref el_effect_set_debug_opaque_only. */
+    EL_API el_result_e el_effect_set_opaque_mode(el_effect_handle_t effect, el_opaque_mode_e mode);
+    EL_API el_result_e el_effect_get_opaque_mode(el_effect_handle_t effect, el_opaque_mode_e *outMode);
+
+    /** @brief Set the background fill colour used when opaque compositing is on.
+     *  @details Linear RGBA in [0,1]. Only the @c rgb channels are read
+     *           today; @c a is reserved for a future partial-fill pass. */
+    EL_API el_result_e el_effect_set_opaque_color(el_effect_handle_t effect,
+                                                  float r, float g, float b, float a);
+    EL_API el_result_e el_effect_get_opaque_color(el_effect_handle_t effect,
+                                                  float *outR, float *outG, float *outB, float *outA);
+
+    /** @brief Feather width in pixels at the opaque fill's cutoff boundaries.
+     *  @details Applied only when @c opaqueMode != NONE. 0 = hard fill edge;
+     *           larger values soften where the fill fades to background. Kept
+     *           independent of the per-side cutoff softness so the emission
+     *           and the fill can taper at different rates. */
+    EL_API el_result_e el_effect_set_opaque_softness(el_effect_handle_t effect, float softness);
+    EL_API el_result_e el_effect_get_opaque_softness(el_effect_handle_t effect, float *outSoftness);
+
+    /** @brief Inside cutoff (rect interior side): hard geometric limit for the neon glow.
+     *  @details @c enable = 0 leaves the interior uncapped (natural halo/bloom
+     *           decay bounds the emission). @c size is the pixel distance from
+     *           the rect edge to the cutoff boundary along the interior side
+     *           (always positive). @c softness is the TOTAL feather width in
+     *           pixels, centred on the boundary: 0 is a pixel-tight edge, not a
+     *           hard one, because the ramp is floored at one destination pixel
+     *           so the boundary is antialiased where it curves. Also caps the
+     *           geometric footprint of @c INSIDE / @c BOTH opaque fills.
+     *
+     *           NOTE the shader used to spread this over 2x the stated width
+     *           and to apply it ahead of the tone map; a tuned non-zero value
+     *           now feathers over half the span it used to.
+     *
+     *           A cutoff on the side the glow side already culls does nothing
+     *           to the glow and is ignored: OUTSIDE subsumes the inside cutoff,
+     *           INSIDE subsumes the outside one. It still bounds the opaque
+     *           fill, which has no notion of a glow side. See
+     *           docs/glow-side-comparison.md. */
+    EL_API el_result_e el_effect_set_inside_cutoff(el_effect_handle_t effect,
+                                                   el_bool_t enable, float size, float softness);
+    EL_API el_result_e el_effect_get_inside_cutoff(el_effect_handle_t effect,
+                                                   el_bool_t *outEnable, float *outSize, float *outSoftness);
+
+    /** @brief Outside cutoff (rect exterior side). Mirror of @ref el_effect_set_inside_cutoff.
+     *  @details Also caps @c OUTSIDE / @c BOTH opaque fills and sizes the neon
+     *           draw quad so far-exterior pixels are rasteriser-culled. */
+    EL_API el_result_e el_effect_set_outside_cutoff(el_effect_handle_t effect,
+                                                    el_bool_t enable, float size, float softness);
+    EL_API el_result_e el_effect_get_outside_cutoff(el_effect_handle_t effect,
+                                                    el_bool_t *outEnable, float *outSize, float *outSoftness);
+
+    /** @} */
+
+    /** @name Neon filament and glow
+     *  Line width, brightness, and glow shaping.
+     *  @{ */
+
+    /** @brief Set the bright-filament line width in pixels.
+     *  @details Peak brightness stays constant - this only changes the
+     *           thickness of the emitting line. */
+    EL_API el_result_e el_effect_set_line_width(el_effect_handle_t effect, float width);
+    EL_API el_result_e el_effect_get_line_width(el_effect_handle_t effect, float *outWidth);
+
+    /** @brief Set the filament brightness falloff exponent.
+     *  @details 1.0 is a clean Gaussian roll-off (default). Lower values
+     *           give heavier tails (softer peak), higher values sharpen the
+     *           edge until the line reads as a hard plateau. */
+    EL_API el_result_e el_effect_set_filament_falloff(el_effect_handle_t effect, float falloff);
+    EL_API el_result_e el_effect_get_filament_falloff(el_effect_handle_t effect, float *outFalloff);
+
+    /** @brief Set the master brightness multiplier for the arc emission.
+     *  @details Applies uniformly to filament + halo + bloom. Use per-arc
+     *           intensity to fade a single slice while others stay lit.
+     *           Segment boosts deliberately bypass this multiplier. */
+    EL_API el_result_e el_effect_set_intensity(el_effect_handle_t effect, float intensity);
+    EL_API el_result_e el_effect_get_intensity(el_effect_handle_t effect, float *outIntensity);
+
+    /** @brief Set the halo reach in pixels (spread of the coloured glow). */
+    EL_API el_result_e el_effect_set_glow_radius(el_effect_handle_t effect, float radius);
+    EL_API el_result_e el_effect_get_glow_radius(el_effect_handle_t effect, float *outRadius);
+
+    /** @brief Set the wide background bloom strength (0 = halo only). */
+    EL_API el_result_e el_effect_set_bloom_strength(el_effect_handle_t effect, float strength);
+    EL_API el_result_e el_effect_get_bloom_strength(el_effect_handle_t effect, float *outStrength);
+
+    /** @brief Restrict the glow to one side of the line, or let it spill both ways. */
+    EL_API el_result_e el_effect_set_glow_side(el_effect_handle_t effect, el_glow_side_e side);
+    EL_API el_result_e el_effect_get_glow_side(el_effect_handle_t effect, el_glow_side_e *outSide);
+
+    /** @brief TOTAL feather width of the one-sided cut, in pixels, measured
+     *         from the rect edge into the lit side.
+     *  @details Ignored when the glow side is BOTH. 0 is a pixel-tight edge,
+     *           NOT a hard one: the ramp is floored at one destination pixel so
+     *           the cut is antialiased, which is what stops it stair-stepping
+     *           wherever the edge curves. Measured in DESTINATION pixels at
+     *           every resolution scale, so the feather is scale invariant.
+     *
+     *           The cut is coverage applied to the graded output, so a non-zero
+     *           value fades the layer rather than dimming its emission into the
+     *           tone map. A value tuned before that changed reads dimmer and
+     *           wider. See docs/glow-side-comparison.md. */
+    EL_API el_result_e el_effect_set_glow_side_softness(el_effect_handle_t effect, float softness);
+    EL_API el_result_e el_effect_get_glow_side_softness(el_effect_handle_t effect, float *outSoftness);
+
+    /** @} */
+
+    /** @name Colour and animation
+     *  Base gradient blend space, hue rotation, transition duration.
+     *  @{ */
+
+    /** @brief Set the base gradient's colour-interpolation space. */
+    EL_API el_result_e el_effect_set_blend_space(el_effect_handle_t effect, el_blend_space_e space);
+    EL_API el_result_e el_effect_get_blend_space(el_effect_handle_t effect, el_blend_space_e *outSpace);
+
+    /** @brief Set the hue-rotation rate in revolutions per second (0 = static). */
+    EL_API el_result_e el_effect_set_hue_rotation_rate(el_effect_handle_t effect, float rate);
+    EL_API el_result_e el_effect_get_hue_rotation_rate(el_effect_handle_t effect, float *outRate);
+
+    /** @brief Set the cross-fade duration (seconds) applied when colour stops
+     *         or blend space change. 0 = instant snap. */
+    EL_API el_result_e el_effect_set_color_transition_duration(el_effect_handle_t effect, float seconds);
+    EL_API el_result_e el_effect_get_color_transition_duration(el_effect_handle_t effect, float *outSeconds);
+
+    /** @} */
+
+    /** @name Base colour stops (perimeter gradient)
+     *  1 stop = solid colour, 2 = gradient, 3+ = multi-stop circular gradient.
+     *  Stops are addressed by index [0, count). The typical write sequence is
+     *  @ref el_effect_set_color_stop_count then per-index
+     *  @ref el_effect_set_color_stop. Clearing drops the vector entirely.
+     *  @{ */
+
+    /** @brief Resize the base colour-stops vector.
+     *  @details Growing seeds new entries with defaults (position=0, opaque
+     *           white); shrinking truncates. */
+    EL_API el_result_e el_effect_set_color_stop_count(el_effect_handle_t effect, int32_t count);
+    EL_API el_result_e el_effect_get_color_stop_count(el_effect_handle_t effect, int32_t *outCount);
+
+    /** @brief Write one colour stop.
+     *  @param index    Stop index in [0, count).
+     *  @param position Normalised perimeter position in [0, 1].
+     *  @param r,g,b,a  Linear RGBA in [0, 1]. */
+    EL_API el_result_e el_effect_set_color_stop(el_effect_handle_t effect, int32_t index,
+                                                float position, float r, float g, float b, float a);
+    /** @brief Read one colour stop. Returns @ref EL_ERROR_INVALID_PARAMETER on OOB index. */
+    EL_API el_result_e el_effect_get_color_stop(el_effect_handle_t effect, int32_t index,
+                                                float *outPosition, float *outR, float *outG, float *outB, float *outA);
+    /** @brief Drop every base colour stop. */
+    EL_API el_result_e el_effect_clear_color_stops(el_effect_handle_t effect);
+
+    /** @} */
+
+    /** @name Segment boosts (travelling Gaussian hotspots)
+     *  Multiple hotspots layered on top of the base neon. Each has its own
+     *  position, length, boost, colour stops, and blend space. Segments
+     *  compose additively - they can shine on a dark arc. See
+     *  @c EdgeLighting::SegmentBoost for the full semantics.
+     *  @{ */
+
+    /** @brief Resize the segment-boosts vector.
+     *  @details Cap is @c NeonConfig::MAX_SEGMENT_BOOSTS_CAP; values above
+     *           that return @ref EL_ERROR_INVALID_PARAMETER. */
+    EL_API el_result_e el_effect_set_segment_boost_count(el_effect_handle_t effect, int32_t count);
+    EL_API el_result_e el_effect_get_segment_boost_count(el_effect_handle_t effect, int32_t *outCount);
+
+    /** @brief Write the scalar fields of one segment boost.
+     *  @param position Perimeter position of the segment centre in [0, 1).
+     *  @param length   Width as a perimeter fraction (~2sigma of the Gaussian).
+     *  @param boost    Peak brightness added on top of the base arc. */
+    EL_API el_result_e el_effect_set_segment_boost(el_effect_handle_t effect, int32_t index,
+                                                   float position, float length, float boost);
+    EL_API el_result_e el_effect_get_segment_boost(el_effect_handle_t effect, int32_t index,
+                                                   float *outPosition, float *outLength, float *outBoost);
+    /** @brief Drop every segment boost. */
+    EL_API el_result_e el_effect_clear_segment_boosts(el_effect_handle_t effect);
+
+    /** @brief Set the blend space used for the segment's own colour stops.
+     *  @details Ignored when the segment has no colour stops (the base
+     *           gradient's blend space applies). */
+    EL_API el_result_e el_effect_set_segment_blend_space(el_effect_handle_t effect,
+                                                         int32_t segmentIndex, el_blend_space_e blendSpace);
+    EL_API el_result_e el_effect_get_segment_blend_space(el_effect_handle_t effect,
+                                                         int32_t segmentIndex, el_blend_space_e *outBlendSpace);
+
+    /** @brief Resize a segment's own colour-stops vector (empty = inherit
+     *         the base gradient at each perimeter sample). */
+    EL_API el_result_e el_effect_set_segment_color_stop_count(el_effect_handle_t effect,
+                                                              int32_t segmentIndex, int32_t count);
+    EL_API el_result_e el_effect_get_segment_color_stop_count(el_effect_handle_t effect,
+                                                              int32_t segmentIndex, int32_t *outCount);
+
+    /** @brief Write one colour stop inside a segment's own stops list. */
+    EL_API el_result_e el_effect_set_segment_color_stop(el_effect_handle_t effect,
+                                                        int32_t segmentIndex, int32_t stopIndex,
+                                                        float position, float r, float g, float b, float a);
+    EL_API el_result_e el_effect_get_segment_color_stop(el_effect_handle_t effect,
+                                                        int32_t segmentIndex, int32_t stopIndex,
+                                                        float *outPosition, float *outR, float *outG, float *outB, float *outA);
+    /** @brief Drop the segment's own colour stops (revert to inherit-base). */
+    EL_API el_result_e el_effect_clear_segment_color_stops(el_effect_handle_t effect, int32_t segmentIndex);
+
+    /** @} */
+
+    /** @name Preserved segment boosts (id-addressed, override-proof)
+     *  @details A **second, independent** pool of hotspots, addressed by a stable
+     *  id instead of by array index. Its whole reason to exist: the index-based
+     *  segment API above makes the array index the identity, so a
+     *  @c el_effect_clear_segment_boosts, a shrinking @c el_effect_set_segment_boost_count,
+     *  or an index-based animation can wipe or overwrite an entry another caller
+     *  cared about. Preserved entries live outside that pool - none of those bulk
+     *  operations touch them.
+     *
+     *  Usage: @ref el_effect_acquire_preserved_segment once to reserve an entry
+     *  and get its id, then only ever mutate through that id. An id is stable
+     *  for its entry's lifetime and unique among the entries that are live at
+     *  any moment, so while you hold a live id a write/read by it can never land
+     *  on another owner's entry. Ids are not permanently unique, though:
+     *  @ref el_effect_release_preserved_segment can free an id for a later
+     *  acquire to reuse, so stop using an id the moment you release it. The
+     *  renderer composites the preserved and transient pools together (preserved
+     *  take shader-slot priority), capped at @c NeonConfig::MAX_SEGMENT_BOOSTS_CAP
+     *  total.
+     *  @{ */
+
+    /** @brief Reserve a preserved segment and return its id (stable for the
+     *         entry's lifetime; may be reused by a later acquire once released).
+     *  @param outId Receives the id (always >= 1) on success.
+     *  @return @ref EL_ERROR_INVALID_PARAMETER if the preserved pool is already
+     *          at @c NeonConfig::MAX_SEGMENT_BOOSTS_CAP. The new entry starts
+     *          with default params (boost 0) - set them via
+     *          @ref el_effect_set_preserved_segment. */
+    EL_API el_result_e el_effect_acquire_preserved_segment(el_effect_handle_t effect, uint32_t *outId);
+
+    /** @brief Write the scalar fields of the preserved entry owning @p id.
+     *  @return @ref EL_ERROR_INVALID_PARAMETER if no preserved entry has @p id. */
+    EL_API el_result_e el_effect_set_preserved_segment(el_effect_handle_t effect, uint32_t id,
+                                                       float position, float length, float boost);
+    /** @brief Read the scalar fields of the preserved entry owning @p id. */
+    EL_API el_result_e el_effect_get_preserved_segment(el_effect_handle_t effect, uint32_t id,
+                                                       float *outPosition, float *outLength, float *outBoost);
+
+    /** @brief Remove the preserved entry owning @p id; others keep their ids.
+     *  @return @ref EL_ERROR_INVALID_PARAMETER if no preserved entry has @p id. */
+    EL_API el_result_e el_effect_release_preserved_segment(el_effect_handle_t effect, uint32_t id);
+
+    /** @brief Number of live entries in the preserved pool. */
+    EL_API el_result_e el_effect_get_preserved_segment_count(el_effect_handle_t effect, int32_t *outCount);
+
+    /** @brief Drop every preserved entry (transient @c segmentBoosts untouched). */
+    EL_API el_result_e el_effect_clear_preserved_segments(el_effect_handle_t effect);
+
+    // Preserved segment gradient (blend space + colour stops), by id. By-id
+    // mirror of the transient el_effect_set_segment_blend_space /
+    // el_effect_set_segment_color_stop family above. A preserved entry with its
+    // own stops shows that gradient across its span; with no stops it inherits
+    // the base NeonConfig gradient. Every call resolves id to the owning entry
+    // (immune to reindexing); an id with no live entry returns
+    // EL_ERROR_INVALID_PARAMETER.
+
+    /** @brief Set the blend space used for the preserved entry's own stops.
+     *  @details Ignored at render time when the entry has no stops. */
+    EL_API el_result_e el_effect_set_preserved_segment_blend_space(el_effect_handle_t effect,
+                                                                   uint32_t id, el_blend_space_e blendSpace);
+    EL_API el_result_e el_effect_get_preserved_segment_blend_space(el_effect_handle_t effect,
+                                                                   uint32_t id, el_blend_space_e *outBlendSpace);
+
+    /** @brief Resize the preserved entry's own colour-stops list (0 = inherit
+     *         the base gradient). */
+    EL_API el_result_e el_effect_set_preserved_segment_color_stop_count(el_effect_handle_t effect,
+                                                                        uint32_t id, int32_t count);
+    EL_API el_result_e el_effect_get_preserved_segment_color_stop_count(el_effect_handle_t effect,
+                                                                        uint32_t id, int32_t *outCount);
+
+    /** @brief Write one colour stop inside a preserved entry's stops list. */
+    EL_API el_result_e el_effect_set_preserved_segment_color_stop(el_effect_handle_t effect,
+                                                                  uint32_t id, int32_t stopIndex,
+                                                                  float position, float r, float g, float b, float a);
+    EL_API el_result_e el_effect_get_preserved_segment_color_stop(el_effect_handle_t effect,
+                                                                  uint32_t id, int32_t stopIndex,
+                                                                  float *outPosition, float *outR, float *outG, float *outB, float *outA);
+
+    /** @brief Drop the preserved entry's own colour stops (revert to inherit-base). */
+    EL_API el_result_e el_effect_clear_preserved_segment_color_stops(el_effect_handle_t effect, uint32_t id);
+
+    /** @} */
+
+    /** @name Arcs (perimeter slices that are "on")
+     *  Multiple arcs can coexist. Overlap resolves winner-take-all in the
+     *  shader (largest mask*intensity owns the emission at each sample).
+     *  Each arc's intensity is independent of @ref el_effect_set_intensity.
+     *  See @c EdgeLighting::Arc for the full semantics.
+     *  @{ */
+
+    /** @brief Resize the arcs vector.
+     *  @details Cap is @c NeonConfig::MAX_ARCS_CAP; values above that
+     *           return @ref EL_ERROR_INVALID_PARAMETER. */
+    EL_API el_result_e el_effect_set_arc_count(el_effect_handle_t effect, int32_t count);
+    EL_API el_result_e el_effect_get_arc_count(el_effect_handle_t effect, int32_t *outCount);
+
+    /** @brief Write one arc's scalars and blend space.
+     *  @param start      Start of the arc on the perimeter, in [0, 1).
+     *  @param length     Perimeter fraction lit; wraps over 0/1.
+     *  @param intensity  Per-arc brightness multiplier.
+     *  @param blendSpace Blend space for the arc's own colour stops
+     *                    (ignored if the arc has none). */
+    EL_API el_result_e el_effect_set_arc(el_effect_handle_t effect, int32_t index,
+                                         float start, float length, float intensity, el_blend_space_e blendSpace);
+    EL_API el_result_e el_effect_get_arc(el_effect_handle_t effect, int32_t index,
+                                         float *outStart, float *outLength, float *outIntensity, el_blend_space_e *outBlendSpace);
+    /** @brief Drop every arc. The neon layer goes fully dark until at least
+     *         one arc is re-added or the effect's default @c {0, 1, 1} arc
+     *         is re-created via @ref el_effect_set_arc_count. */
+    EL_API el_result_e el_effect_clear_arcs(el_effect_handle_t effect);
+
+    /** @brief Resize an arc's own colour-stops vector (empty = inherit the
+     *         base gradient at each perimeter sample). */
+    EL_API el_result_e el_effect_set_arc_color_stop_count(el_effect_handle_t effect,
+                                                          int32_t arcIndex, int32_t count);
+    EL_API el_result_e el_effect_get_arc_color_stop_count(el_effect_handle_t effect,
+                                                          int32_t arcIndex, int32_t *outCount);
+
+    /** @brief Write one colour stop inside an arc's own stops list. */
+    EL_API el_result_e el_effect_set_arc_color_stop(el_effect_handle_t effect,
+                                                    int32_t arcIndex, int32_t stopIndex,
+                                                    float position, float r, float g, float b, float a);
+    EL_API el_result_e el_effect_get_arc_color_stop(el_effect_handle_t effect,
+                                                    int32_t arcIndex, int32_t stopIndex,
+                                                    float *outPosition, float *outR, float *outG, float *outB, float *outA);
+    /** @brief Drop the arc's own colour stops (revert to inherit-base). */
+    EL_API el_result_e el_effect_clear_arc_color_stops(el_effect_handle_t effect, int32_t arcIndex);
+
+    /** @} */
+
+    /** @name Neon performance knobs
+     *  Cost/quality controls on the neon layer. All three used to belong to a
+     *  separate half-res renderer; there is one renderer now, drawing at a
+     *  resolution scale.
+     *  @{ */
+
+    /** @brief Set the neon layer's resolution scale.
+     *  @details 1.0 is the full-resolution path - the gather draws straight
+     *           onto the target framebuffer, with no offscreen buffer and no
+     *           blit. Below 1.0 the gather renders into a buffer of that
+     *           fraction of the viewport and is bilinear-blitted back, which
+     *           costs @c scale^2 as many shaded fragments.
+     *
+     *           Clamped to (0, 1] at draw time: values above 1.0 do not
+     *           supersample, they are refused, because the point of the knob
+     *           is to shade fewer fragments. The opaque fill is always drawn
+     *           at full resolution regardless, since its analytic edge is the
+     *           whole reason it exists. */
+    EL_API el_result_e el_effect_set_neon_resolution_scale(el_effect_handle_t effect, float scale);
+    EL_API el_result_e el_effect_get_neon_resolution_scale(el_effect_handle_t effect, float *outScale);
+
+    /** @brief Set the per-fragment gather sample count.
+     *  @details Clamped to [1, the shader's compile-time maximum]. Lower is
+     *           faster and roughly linear in cost: halving this from the
+     *           default to 64 measures at about 0.5x the gather time, for a
+     *           difference of at most a few levels out of 255 in the picture.
+     *           A host migrating from the old half-res renderer should set 64
+     *           explicitly - that renderer defaulted to it, and this one does
+     *           not. */
+    EL_API el_result_e el_effect_set_neon_num_samples(el_effect_handle_t effect, int32_t samples);
+    EL_API el_result_e el_effect_get_neon_num_samples(el_effect_handle_t effect, int32_t *outSamples);
+
+    /** @brief Set the baked gradient LUT's width in texels (power-of-two,
+     *         32-256). Larger resolves closely-spaced colour stops more
+     *         finely; it does not affect per-fragment cost. */
+    EL_API el_result_e el_effect_set_neon_gradient_lut_size(el_effect_handle_t effect, int32_t size);
+    EL_API el_result_e el_effect_get_neon_gradient_lut_size(el_effect_handle_t effect, int32_t *outSize);
+
+    /** @} */
+
+    /** @name Rain-on-glass droplets
+     *  Fullscreen "wet window pane" that snapshots the framebuffer under it
+     *  each frame, then repaints it with a frost blur and grid-hashed
+     *  trickling droplets that refract the capture sharply. Register order in
+     *  @ref el_effect_init places droplets last, so the neon layers show
+     *  through the pane. Mirrors @c EdgeLighting::DropletsConfig.
+     *  @{ */
+
+
+    /* ====================================================================
+     * Spotlights (Config::spotlight)
+     * ====================================================================
+     *
+     * Freely placed and aimed cones of light. Unlike every other layer, this
+     * one is NOT a perimeter effect: a lamp sits at an absolute app-space
+     * position and points at an absolute angle, and @c Config::geometry is not
+     * consulted at all. Moving the rect therefore leaves the lamps where they
+     * are.
+     *
+     * Positions are APP COORDINATES - origin at the viewport's TOP-LEFT,
+     * +x right, +y DOWN - the same space @ref el_effect_set_position uses.
+     * Angles are degrees, 0 = +x (right), increasing CLOCKWISE, which is what
+     * a +y-down space makes natural: 90 = straight down.
+     *
+     * The setters are grouped by concern rather than one per scalar: placement
+     * (where and which way), beam (the cone's shape) and look (how it reads).
+     * All three address a lamp by index; size the list with
+     * @ref el_effect_set_spotlight_count first, exactly as the arc family
+     * requires.
+     */
+
+    /** @brief Enable or disable the spotlight layer as a whole. */
+    EL_API el_result_e el_effect_set_spotlight_renderer_enabled(el_effect_handle_t effect, el_bool_t enabled);
+    EL_API el_result_e el_effect_get_spotlight_renderer_enabled(el_effect_handle_t effect, el_bool_t *outEnabled);
+
+    /** @brief Resize the lamp list. New entries carry the C++ defaults.
+     *  @note  Entries past the renderer's SPOT_MAX_LAMPS ceiling are ignored
+     *         at draw time rather than rejected here. */
+    EL_API el_result_e el_effect_set_spotlight_count(el_effect_handle_t effect, int32_t count);
+    EL_API el_result_e el_effect_get_spotlight_count(el_effect_handle_t effect, int32_t *outCount);
+
+    /** @brief Where lamp @p index sits and which way it points.
+     *  @param x,y    App coordinates, top-left origin, +y down.
+     *  @param angle  Degrees, 0 = right, increasing clockwise. */
+    EL_API el_result_e el_effect_set_spotlight_placement(el_effect_handle_t effect, int32_t index,
+                                                         float x, float y, float angle);
+    EL_API el_result_e el_effect_get_spotlight_placement(el_effect_handle_t effect, int32_t index,
+                                                         float *outX, float *outY, float *outAngle);
+
+    /** @brief The shape of lamp @p index's cone.
+     *  @param beamAngle      Full field angle in degrees. The beam has no hard
+     *                        edge at this angle - it is the gaussian's width.
+     *  @param throwLength    Px along the axis to 1/e of peak, not where it ends.
+     *  @param apertureWidth  Half-width at the lamp itself, px.
+     *  @param softness       [0, 1]; 0 is the tightest cross-section, 1 the
+     *                        broadest. No value produces a visible beam EDGE. */
+    EL_API el_result_e el_effect_set_spotlight_beam(el_effect_handle_t effect, int32_t index,
+                                                    float beamAngle, float throwLength,
+                                                    float apertureWidth, float softness);
+    EL_API el_result_e el_effect_get_spotlight_beam(el_effect_handle_t effect, int32_t index,
+                                                    float *outBeamAngle, float *outThrowLength,
+                                                    float *outApertureWidth, float *outSoftness);
+
+    /** @brief How lamp @p index reads.
+     *  @param intensity    Master brightness for this lamp.
+     *  @param bloom        Aperture glow strength; 0 removes the term.
+     *  @param bloomRadius  Aperture glow size, px.
+     *  @param colorTemp    Kelvin, baked to linear RGB on the CPU. ~2700-3200
+     *                      is tungsten, 5600 daylight, above ~6500 goes blue. */
+    EL_API el_result_e el_effect_set_spotlight_look(el_effect_handle_t effect, int32_t index,
+                                                    float intensity, float bloom,
+                                                    float bloomRadius, float colorTemp);
+    EL_API el_result_e el_effect_get_spotlight_look(el_effect_handle_t effect, int32_t index,
+                                                    float *outIntensity, float *outBloom,
+                                                    float *outBloomRadius, float *outColorTemp);
+
+    /** @brief Exponent on lamp @p index's beam-spread loss, in [0, 2].
+     *  @details A separate call rather than a fifth parameter on
+     *           @ref el_effect_set_spotlight_beam, which is already published
+     *           with four.
+     *
+     *           The cone carries `(apertureWidth / halfW)` - the energy it
+     *           loses as it widens - and this is the power that term is raised
+     *           to. 1.0 is the physical falloff and the default; 0.0 removes
+     *           it, leaving the throw as the only thing that dims the beam
+     *           with distance; above 1 decays faster than physical.
+     *
+     *           This, not @c throwLength, is what limits a lamp's REACH at
+     *           long range: the spread term decays as 1/distance, so at the
+     *           default aperture and a 26 degree beam it is down to 5% by
+     *           1000 px while a 3000 px throw is still at 72%.
+     *
+     *           Clamped to [0, 2] by the renderer. Lowering it grows the
+     *           geometry the lamp draws, because the strip is solved from this
+     *           same falloff - the fill cost IS the extra reach. */
+    EL_API el_result_e el_effect_set_spotlight_spread_falloff(el_effect_handle_t effect, int32_t index,
+                                                              float spreadFalloff);
+    EL_API el_result_e el_effect_get_spotlight_spread_falloff(el_effect_handle_t effect, int32_t index,
+                                                              float *outSpreadFalloff);
+
+    /** @brief Linear RGB multiplied onto the blackbody colour @c colorTemp bakes.
+     *  @details A separate call rather than two more parameters on
+     *           @ref el_effect_set_spotlight_look, which is already published
+     *           with four. White (1, 1, 1) is the default and leaves the
+     *           colour-temperature result untouched.
+     *
+     *           This is the only way to reach a saturated lamp: blackbody
+     *           radiation runs amber to white to blue-white and cannot produce
+     *           green, cyan or magenta at any Kelvin value.
+     *
+     *           Not clamped. Values above 1 are legal and brighten the lamp -
+     *           the renderer folds the brightest channel into the bound it
+     *           solves its geometry against, so a boosted tint grows the lit
+     *           region rather than being clipped by it. An all-zero tint
+     *           switches the lamp off exactly as @c intensity 0 does. */
+    EL_API el_result_e el_effect_set_spotlight_tint(el_effect_handle_t effect, int32_t index,
+                                                    float r, float g, float b);
+    EL_API el_result_e el_effect_get_spotlight_tint(el_effect_handle_t effect, int32_t index,
+                                                    float *outR, float *outG, float *outB);
+
+    /** @brief Skip lamp @p index without removing it, so indices - and any
+     *         animation bound to them - stay stable. */
+    EL_API el_result_e el_effect_set_spotlight_enabled(el_effect_handle_t effect, int32_t index, el_bool_t enabled);
+    EL_API el_result_e el_effect_get_spotlight_enabled(el_effect_handle_t effect, int32_t index, el_bool_t *outEnabled);
+
+    /** @brief Whether lamp @p index is cut off by the clip area.
+     *  @details Per lamp rather than per layer, so one rig can have some lamps
+     *           stop at the area's edge and others cross it untouched. Default
+     *           off, so configuring a clip area changes nothing until a lamp
+     *           asks for it.
+     *
+     *           **This is the only gate** - the area has no enable of its own.
+     *           So set the rectangle BEFORE setting this: the area starts
+     *           0 x 0, and a zero-size EL_CLIP_KEEP_INSIDE area keeps nothing,
+     *           which blanks the lamp with nothing in the log. */
+    EL_API el_result_e el_effect_set_spotlight_clipped(el_effect_handle_t effect, int32_t index, el_bool_t clipped);
+    EL_API el_result_e el_effect_get_spotlight_clipped(el_effect_handle_t effect, int32_t index, el_bool_t *outClipped);
+
+    /** @brief Drop every lamp. Any index-bound animation becomes a no-op until
+     *         the list is re-created via @ref el_effect_set_spotlight_count. */
+    EL_API el_result_e el_effect_clear_spotlights(el_effect_handle_t effect);
+
+    /*
+     * Spotlight clip area (Config::spotlight.clipArea)
+     *
+     * ONE rounded-rectangle region for the whole layer that cuts light off,
+     * opted into per lamp by el_effect_set_spotlight_clipped. The cut is
+     * coverage applied to the finished shading, not a change to the falloff:
+     * a clipped lamp is the same lamp with part of it missing, so moving the
+     * area never makes the light that survives brighter or differently shaped.
+     *
+     * Its own rectangle, deliberately not the effect's geometry - the
+     * spotlight layer reads nothing but its own sub-config. A host that wants
+     * the two to line up copies the five numbers across.
+     *
+     * There is no enable for the area. Whether a lamp is cut is decided by
+     * el_effect_set_spotlight_clipped alone, so there is one place to look.
+     *
+     * NAMING, because two of these are one word apart and mean different
+     * scopes:
+     *   el_effect_*_spotlight_clip_<noun>  - the AREA. No index; one per layer.
+     *   el_effect_*_spotlight_clipped      - a LAMP's state. Takes an index.
+     * Same split as el_effect_set_spotlight_renderer_enabled (the layer)
+     * against el_effect_set_spotlight_enabled (one lamp): the indexed call is
+     * the bare one.
+     */
+
+    /** @brief The clip rectangle, in APP coordinates: TOP-LEFT corner plus
+     *         size, the same space as @ref el_effect_set_spotlight_placement.
+     *  @details **Same five parameters in the same order as
+     *           @ref el_effect_set_geometry**, deliberately, so a host that
+     *           wants the clip to line up with the rect can forward one
+     *           call's output straight into this one. There is no binding
+     *           between them - the spotlight layer reads nothing but its own
+     *           sub-config - so a later rect move does not follow.
+     *
+     *           cornerRadius is clamped at draw time to half the shorter side;
+     *           0 is a sharp rectangle.
+     *  @note  A zero-size rectangle under EL_CLIP_KEEP_INSIDE cuts every
+     *         clipped lamp to nothing, and that is the DEFAULT rectangle, so
+     *         call this before el_effect_set_spotlight_clipped. */
+    EL_API el_result_e el_effect_set_spotlight_clip_rect(el_effect_handle_t effect,
+                                                         float width, float height,
+                                                         float x, float y,
+                                                         float cornerRadius);
+    EL_API el_result_e el_effect_get_spotlight_clip_rect(el_effect_handle_t effect,
+                                                         float *outWidth, float *outHeight,
+                                                         float *outX, float *outY,
+                                                         float *outCornerRadius);
+
+    /** @brief Width of the fade across the cut, in px.
+     *  @note  0 is a hard edge, which on this layer reads as an aliased one -
+     *         the cut runs through a smooth gradient, so there is no contrast
+     *         to hide the staircase. 1.0 (the default) is a single pixel of
+     *         feather. Its own scalar setter rather than a sixth parameter on
+     *         the rectangle above: it is not part of the shape, and retuning
+     *         it should not re-send four numbers that did not change. */
+    EL_API el_result_e el_effect_set_spotlight_clip_softness(el_effect_handle_t effect, float softness);
+    EL_API el_result_e el_effect_get_spotlight_clip_softness(el_effect_handle_t effect, float *outSoftness);
+
+    /** @brief Whether a clipped lamp keeps the inside of the area or the
+     *         outside. Default EL_CLIP_KEEP_INSIDE. */
+    EL_API el_result_e el_effect_set_spotlight_clip_mode(el_effect_handle_t effect, el_clip_mode_e mode);
+    EL_API el_result_e el_effect_get_spotlight_clip_mode(el_effect_handle_t effect, el_clip_mode_e *outMode);
+
+    /** @brief Fraction of the viewport the lamps render at before being
+     *         bilinear-blitted back. 1.0 (default) draws direct - no offscreen
+     *         buffer, no blit. Clamped to [0.125, 1.0] at draw time.
+     *  @note  Lossless in shape: not one uniform differs between the paths.
+     *         But unlike the neon and flare scales this one is NOT
+     *         automatically a saving - this layer already bounds its geometry
+     *         to what the lamps light, so the blit's full viewport of
+     *         fragments is a fixed cost. Measured at 1280x720 it only wins
+     *         above roughly six lamps. Leave it at 1.0 unless a profile says
+     *         otherwise. */
+    EL_API el_result_e el_effect_set_spotlight_resolution_scale(el_effect_handle_t effect, float scale);
+    EL_API el_result_e el_effect_get_spotlight_resolution_scale(el_effect_handle_t effect, float *outScale);
+
+    EL_API el_result_e el_effect_set_droplets_renderer_enabled(el_effect_handle_t effect, el_bool_t enabled);
+    EL_API el_result_e el_effect_get_droplets_renderer_enabled(el_effect_handle_t effect, el_bool_t *outEnabled);
+
+    /** @brief Rain amount [0, 1] - density of all droplet layers. */
+    EL_API el_result_e el_effect_set_droplets_amount(el_effect_handle_t effect, float amount);
+    EL_API el_result_e el_effect_get_droplets_amount(el_effect_handle_t effect, float *outAmount);
+
+    /** @brief Trickle speed multiplier (1 = reference pace; 0 freezes rain). */
+    EL_API el_result_e el_effect_set_droplets_speed(el_effect_handle_t effect, float speed);
+    EL_API el_result_e el_effect_get_droplets_speed(el_effect_handle_t effect, float *outSpeed);
+
+    /** @brief Number of droplet lanes across the band (clamped to >= 1).
+     *  @details 1 = drops as wide as the band, 2 = two lanes of half-width
+     *           drops. Droplet size follows @ref el_effect_set_droplets_band_width,
+     *           so drops fit the band at any thickness. */
+    EL_API el_result_e el_effect_set_droplets_lanes(el_effect_handle_t effect, int lanes);
+    EL_API el_result_e el_effect_get_droplets_lanes(el_effect_handle_t effect, int *outLanes);
+
+    /** @brief Band thickness in pixels - the droplets' entire world.
+     *  @details The side of the rect edge the band occupies comes from the
+     *           neon glow side, not from here. */
+    EL_API el_result_e el_effect_set_droplets_band_width(el_effect_handle_t effect, float bandWidth);
+    EL_API el_result_e el_effect_get_droplets_band_width(el_effect_handle_t effect, float *outBandWidth);
+
+    /** @brief Gap in pixels between the rect edge and the band's inner boundary. */
+    EL_API el_result_e el_effect_set_droplets_band_offset(el_effect_handle_t effect, float bandOffset);
+    EL_API el_result_e el_effect_get_droplets_band_offset(el_effect_handle_t effect, float *outBandOffset);
+
+    /** @brief Drop colour multiplier (linear RGBA in [0, 1]; only @c rgb is
+     *         read today, @c a is reserved). Tints the faint drop body only -
+     *         the rim and specular highlights stay white. */
+    EL_API el_result_e el_effect_set_droplets_tint(el_effect_handle_t effect,
+                                                   float r, float g, float b, float a);
+    EL_API el_result_e el_effect_get_droplets_tint(el_effect_handle_t effect,
+                                                   float *outR, float *outG, float *outB, float *outA);
+
+    /** @} */
+
+    /** @name Lens flare
+     *  Sun + hex-aperture lens flare drawn as a single fullscreen pass. The
+     *  sun rides the rect perimeter (same parameter space as segments / arcs)
+     *  so it moves with the geometry.
+     *  @{ */
+
+    EL_API el_result_e el_effect_set_lens_flare_renderer_enabled(el_effect_handle_t effect, el_bool_t enabled);
+    EL_API el_result_e el_effect_get_lens_flare_renderer_enabled(el_effect_handle_t effect, el_bool_t *outEnabled);
+
+    /** @brief Sun position as a perimeter progress in [0, 1).
+     *  @details 0 = top-left corner; winding follows the geometry's winding. */
+    EL_API el_result_e el_effect_set_lens_flare_perimeter_position(el_effect_handle_t effect, float position);
+    EL_API el_result_e el_effect_get_lens_flare_perimeter_position(el_effect_handle_t effect, float *outPosition);
+
+    /** @brief Signed offset in pixels along the edge normal at the sun's
+     *         perimeter position. Positive = outward (away from rect centre),
+     *         negative = inward. */
+    EL_API el_result_e el_effect_set_lens_flare_perimeter_offset(el_effect_handle_t effect, float offset);
+    EL_API el_result_e el_effect_get_lens_flare_perimeter_offset(el_effect_handle_t effect, float *outOffset);
+
+    /** @brief Size scale for the sun core + rays (1.0 = reference look). */
+    EL_API el_result_e el_effect_set_lens_flare_size(el_effect_handle_t effect, float size);
+    EL_API el_result_e el_effect_get_lens_flare_size(el_effect_handle_t effect, float *outSize);
+
+    /** @brief Sun tint (linear RGBA, HDR allowed - the reference uses (1.4, 1.2, 1.0)). */
+    EL_API el_result_e el_effect_set_lens_flare_color(el_effect_handle_t effect,
+                                                      float r, float g, float b, float a);
+    EL_API el_result_e el_effect_get_lens_flare_color(el_effect_handle_t effect,
+                                                      float *outR, float *outG, float *outB, float *outA);
+
+    /** @brief Master brightness multiplier. */
+    EL_API el_result_e el_effect_set_lens_flare_intensity(el_effect_handle_t effect, float intensity);
+    EL_API el_result_e el_effect_get_lens_flare_intensity(el_effect_handle_t effect, float *outIntensity);
+
+    /** @brief Ghost / hex-aperture strength (0 = disc only, 1 = reference look). */
+    EL_API el_result_e el_effect_set_lens_flare_spread(el_effect_handle_t effect, float spread);
+    EL_API el_result_e el_effect_get_lens_flare_spread(el_effect_handle_t effect, float *outSpread);
+
+    /** @brief Stretch of the ghost placement along the sun-to-centre axis
+     *         (1.0 = reference spacing).
+     *  @details Reference spacing scales with the sun-to-centre distance, so
+     *           ghosts crowd together when the sun sits near a screen edge
+     *           (e.g. top-centre) and spread out at a corner. Raise this to
+     *           push them apart. Placement only - colour and size are
+     *           unchanged. */
+    EL_API el_result_e el_effect_set_lens_flare_ghost_spacing(el_effect_handle_t effect, float ghostSpacing);
+    EL_API el_result_e el_effect_get_lens_flare_ghost_spacing(el_effect_handle_t effect, float *outGhostSpacing);
+
+    /** @brief Uniform ghost size / falloff exponent shared by every ghost
+     *         (default 2.2 = reference average).
+     *  @details The reference gave each ghost a random size; this fixes them
+     *           all to one value so they read as the same size. Larger =
+     *           bigger, softer ghosts. */
+    EL_API el_result_e el_effect_set_lens_flare_ghost_size(el_effect_handle_t effect, float ghostSize);
+    EL_API el_result_e el_effect_get_lens_flare_ghost_size(el_effect_handle_t effect, float *outGhostSize);
+
+    /** @brief Signed shift of the ghost cluster along the sun-to-centre axis
+     *         (0.0 = reference, negative pulls toward the sun / border).
+     *  @details dist 0 is the screen centre and dist ~ -1 sits on the sun, so
+     *           negative values move the ghosts off centre and up against the
+     *           border edge where the sun rides. Default is -1.5. */
+    EL_API el_result_e el_effect_set_lens_flare_ghost_offset(el_effect_handle_t effect, float ghostOffset);
+    EL_API el_result_e el_effect_get_lens_flare_ghost_offset(el_effect_handle_t effect, float *outGhostOffset);
+
+    /** @brief Colour the ghosts lean toward when the tint amount > 0 (linear RGB). */
+    EL_API el_result_e el_effect_set_lens_flare_ghost_color(el_effect_handle_t effect,
+                                                            float r, float g, float b);
+    EL_API el_result_e el_effect_get_lens_flare_ghost_color(el_effect_handle_t effect,
+                                                            float *outR, float *outG, float *outB);
+
+    /** @brief Blend from the procedural ghost rainbow (0.0) to a single ghost
+     *         colour for every ghost (1.0). Hue only - brightness unaffected. */
+    EL_API el_result_e el_effect_set_lens_flare_ghost_tint(el_effect_handle_t effect, float ghostTint);
+    EL_API el_result_e el_effect_get_lens_flare_ghost_tint(el_effect_handle_t effect, float *outGhostTint);
+
+    /** @brief Ghost convergence / reference point in normalised screen coords
+     *         (0..1, origin top-left, y-down); (0.5, 0.5) = screen centre.
+     *  @details The ghosts pivot about this point and their sun-to-centre axis
+     *           runs through it instead of the screen centre. The sun's own
+     *           rays and vignette are unaffected. */
+    EL_API el_result_e el_effect_set_lens_flare_flare_center(el_effect_handle_t effect, float x, float y);
+    EL_API el_result_e el_effect_get_lens_flare_flare_center(el_effect_handle_t effect, float *outX, float *outY);
+
+    /** @brief Angular density of the ray pattern in [0, 1].
+     *  @details 0 = a single broad ray, 1 = the densest sunburst. The value
+     *           is quantised to an integer slot count internally so the
+     *           pattern closes cleanly at the 2 PI wrap. NOT a literal count
+     *           of visible rays - per-ray length randomisation hides some
+     *           slots as short stubs. */
+    EL_API el_result_e el_effect_set_lens_flare_ray_density(el_effect_handle_t effect, float rayDensity);
+    EL_API el_result_e el_effect_get_lens_flare_ray_density(el_effect_handle_t effect, float *outRayDensity);
+
+    /** @brief Sun / ray rotation rate in revolutions per second (0 = static).
+     *  @details Ghost groups stay anchored on the sun-to-centre axis; only
+     *           the sun disc and rays spin. */
+    EL_API el_result_e el_effect_set_lens_flare_rotation_rate(el_effect_handle_t effect, float rate);
+    EL_API el_result_e el_effect_get_lens_flare_rotation_rate(el_effect_handle_t effect, float *outRate);
+
+    /** @} */
+
+    /** @name Lens flare performance knob
+     *  @{ */
+
+    /** @brief Set the flare's resolution scale.
+     *  @details 1.0 draws straight onto the target framebuffer with no
+     *           offscreen buffer and no blit. Below 1.0 the flare renders into
+     *           a buffer of that fraction of the viewport and is
+     *           bilinear-blitted back, costing @c scale^2 as many shaded
+     *           fragments - 4x fewer at half, 16x fewer at quarter.
+     *
+     *           Nearly lossless, more so than the neon's equivalent: the flare
+     *           is all smooth low-frequency light and its shader normalises
+     *           every term by the resolution, so it is scale invariant.
+     *           Clamped to (0, 1] at draw time; values above 1.0 do not
+     *           supersample. */
+    EL_API el_result_e el_effect_set_lens_flare_resolution_scale(el_effect_handle_t effect, float scale);
+    EL_API el_result_e el_effect_get_lens_flare_resolution_scale(el_effect_handle_t effect, float *outScale);
+
+    /** @} */
+
+    /** @name Debug overlays and diagnostics
+     *
+     *  Everything backed by the debug config, in one place. The three overlays
+     *  are drawn by a layer of their own, so they need @ref EL_RENDERER_DEBUG
+     *  in the mask handed to @ref el_effect_init_with_renderers
+     *  (@ref EL_RENDERER_ALL includes it). Without that layer these flags are
+     *  still stored and read back, but nothing is drawn. The layer is
+     *  registered after the neon and draws OVER it.
+     *
+     *  @ref el_effect_set_debug_opaque_only is the odd one out: it is stored
+     *  here with the overlay flags but is a mode of the NEON layer, so it
+     *  works whether or not the debug layer was registered, and
+     *  @ref el_effect_set_debug_enabled does not gate it.
+     *  @{ */
+
+    /** @brief Master switch for the debug overlay layer.
+     *  @details Gates all three overlays at once - the gradient-LUT strip, the
+     *           colour-stop markers and the bounding box - without disturbing
+     *           which of them are individually selected. Defaults to enabled,
+     *           as does the box, so a registered debug layer draws the box out
+     *           of the box.
+     *
+     *           This is the layer's mute, not its registration: the layer must
+     *           still be in the mask handed to
+     *           @ref el_effect_init_with_renderers. */
+    EL_API el_result_e el_effect_set_debug_enabled(el_effect_handle_t effect, el_bool_t enabled);
+    EL_API el_result_e el_effect_get_debug_enabled(el_effect_handle_t effect, el_bool_t *outEnabled);
+
+    /** @brief Draw the baked gradient LUT as a strip across the rectangle, so
+     *         the colour ring actually going to the shader can be eyeballed.
+     *  @note Annotates the glow, so it is suppressed when there is none - neon
+     *        off, or @ref el_effect_set_debug_opaque_only set. */
+    EL_API el_result_e el_effect_set_debug_show_gradient_lut(el_effect_handle_t effect, el_bool_t show);
+    EL_API el_result_e el_effect_get_debug_show_gradient_lut(el_effect_handle_t effect, el_bool_t *outShow);
+
+    /** @brief Draw a coloured dot at each colour-stop position on the
+     *         perimeter, so the mapping from position to colour can be checked
+     *         against the strip and the on-screen glow.
+     *  @note Suppressed on the same terms as
+     *        @ref el_effect_set_debug_show_gradient_lut. */
+    EL_API el_result_e el_effect_set_debug_show_color_stops(el_effect_handle_t effect, el_bool_t show);
+    EL_API el_result_e el_effect_get_debug_show_color_stops(el_effect_handle_t effect, el_bool_t *outShow);
+
+    /** @brief Show or hide the 1 px bounding box around the rectangle.
+     *  @details Defaults to shown. Deliberately SHARP even when the geometry
+     *           has a corner radius: it shows the extent the config asked for,
+     *           not the rounded outline the neon traces, so the two can be
+     *           compared. Unlike the two overlays above it survives
+     *           @ref el_effect_set_debug_opaque_only, because it annotates the
+     *           geometry - which is there whether or not anything is lit -
+     *           rather than the glow. */
+    EL_API el_result_e el_effect_set_debug_show_wireframe(el_effect_handle_t effect, el_bool_t show);
+    EL_API el_result_e el_effect_get_debug_show_wireframe(el_effect_handle_t effect, el_bool_t *outShow);
+
+    /** @brief Set the bounding box's line colour (linear RGBA in [0, 1]).
+     *  @details Opaque green by default: it reads against a dark backdrop and
+     *           against most glow colours, and is obviously not part of the
+     *           effect. */
+    EL_API el_result_e el_effect_set_debug_wireframe_color(el_effect_handle_t effect,
+                                                           float r, float g, float b, float a);
+    EL_API el_result_e el_effect_get_debug_wireframe_color(el_effect_handle_t effect,
+                                                           float *outR, float *outG, float *outB, float *outA);
+
+    /** @brief Draw ONLY the opaque fill and skip the neon emission entirely -
+     *         no filament, no halo, no bloom.
+     *  @details A diagnostic: it isolates the fill's silhouette so it can be
+     *           compared against where the light actually reaches. The two
+     *           disagree at a sharp corner, where the fill's outer boundary is
+     *           square and the emission's is round.
+     *
+     *           Has no visible effect while @ref el_effect_set_opaque_mode is
+     *           @c EL_OPAQUE_MODE_NONE, since then there is no fill to isolate
+     *           and the frame comes out empty.
+     *
+     *           Two of the three overlays suppress themselves while this is
+     *           set - the strip and the markers annotate the glow, and here
+     *           there is no glow to annotate. The bounding box does NOT, so a
+     *           fill-only frame still carries it unless you clear
+     *           @ref el_effect_set_debug_show_wireframe or mute the layer with
+     *           @ref el_effect_set_debug_enabled. */
+    EL_API el_result_e el_effect_set_debug_opaque_only(el_effect_handle_t effect, el_bool_t opaqueOnly);
+    EL_API el_result_e el_effect_get_debug_opaque_only(el_effect_handle_t effect, el_bool_t *outOpaqueOnly);
+
+    /** @} */
+
+    /** @name Lifecycle
+     *  Create, initialise, tick, render, and destroy an effect. Every call
+     *  in this section must run on the thread that owns the GL context.
+     *  @{ */
+
+    /** @brief Allocate a new effect handle with default staging config.
+     *  @returns A fresh handle on success, @c NULL on allocation failure.
+     *  @note The effect has no GL resources yet - call @ref el_effect_init
+     *        once a GL context is current before calling render/update. */
+    EL_API el_effect_handle_t el_effect_create(void);
+
+    /** @brief Destroy an effect handle.
+     *  @details Releases GL resources allocated by @ref el_effect_init and
+     *           any C++ owned state. Passing @c NULL returns
+     *           @ref EL_ERROR_INVALID_HANDLE. */
+    EL_API el_result_e el_effect_destroy(el_effect_handle_t effect);
+
+    /** @brief Initialise every renderer layer under the current GL context.
+     *  @details Convenience wrapper for @ref el_effect_init_with_renderers with
+     *           @ref EL_RENDERER_ALL - registers the full stack (neon, debug,
+     *           droplets, lens flare).
+     *  @returns @ref EL_ERROR_INIT_FAILED if a renderer fails to initialise
+     *           (usually a shader compile / link error - see native log). */
+    EL_API el_result_e el_effect_init(el_effect_handle_t effect);
+
+    /** @brief Initialise a selected subset of renderer layers under the current GL context.
+     *  @param effect       Effect handle.
+     *  @param rendererMask OR of @ref el_renderer_flags_e bits naming the
+     *                      layers to register. @ref EL_RENDERER_NONE registers
+     *                      nothing (render becomes a no-op until layers are
+     *                      added C++-side); @ref EL_RENDERER_ALL is the full
+     *                      stack.
+     *  @details Layers are always registered in the fixed compositing order
+     *           regardless of the mask, so droplets still refract the neon
+     *           beneath them, the lens flare still sits over both, and the
+     *           debug overlays still land on top of everything. An omitted
+     *           layer is never constructed and pays no GL cost. Prefer this
+     *           over @ref el_effect_init when a host only needs some layers
+     *           (e.g. neon alone) and wants to skip the others' shader compiles.
+     *
+     *           Each layer has exactly one bit, and any bit outside
+     *           @ref el_renderer_flags_e registers nothing - so a mask gets the
+     *           layers its known bits name and no more. Note those values were
+     *           renumbered when the deprecated aliases were removed: pass the
+     *           named constants, not numbers carried over from the old ABI.
+     *  @returns @ref EL_ERROR_INIT_FAILED if an included renderer fails to
+     *           initialise (usually a shader compile / link error - see native
+     *           log). */
+    EL_API el_result_e el_effect_init_with_renderers(el_effect_handle_t effect, uint32_t rendererMask);
+
+    /** @brief Pull the effect's base config back into the effect's staging config.
+     *  @details Snapshots the last-authored values (what @c SetConfig
+     *           received) - does NOT include animation overlays. Use this
+     *           to re-sync the staging config after external mutation
+     *           (e.g. presets applied inside the effect). */
+    EL_API el_result_e el_effect_capture(el_effect_handle_t effect);
+
+    /** @brief Apply staging config then tick clock, animations, and renderers.
+     *  @param deltaTime Seconds since the last @c update call. Values <= 0
+     *                   still process animations but advance no time. */
+    EL_API el_result_e el_effect_update(el_effect_handle_t effect, float deltaTime);
+
+    /** @brief Draw every enabled renderer at the given viewport size. */
+    EL_API el_result_e el_effect_render(el_effect_handle_t effect,
+                                        int32_t viewportWidth, int32_t viewportHeight);
+
+    /** @} */
+
+    /** @name Clock control
+     *  The effect's shared clock feeds all attached animations. Pausing it
+     *  freezes every animation simultaneously without changing their
+     *  individual states.
+     *  @{ */
+
+    /** @brief Start the effect's clock (default state after init).
+     *  @details Attached animations advance in lockstep with
+     *           @ref el_effect_update while the clock is playing. */
+    EL_API el_result_e el_effect_clock_play(el_effect_handle_t effect);
+
+    /** @brief Freeze the effect's clock.
+     *  @details @ref el_effect_update still runs but the reported deltaTime
+     *           to animations is 0 - the shader also stops advancing its
+     *           internal time (hue rotation, etc.). */
+    EL_API el_result_e el_effect_clock_pause(el_effect_handle_t effect);
+
+    /** @brief Report whether the effect's clock is currently playing. */
+    EL_API el_result_e el_effect_clock_is_playing(el_effect_handle_t effect,
+                                                  el_bool_t *outPlaying);
+
+    /** @} */
+
+    /** @name Animation management
+     *  Attach animation handles to the effect. Attach does NOT transfer
+     *  ownership - the caller still owns the handle and must destroy it.
+     *  Order of attach is the order of Apply per frame (later writes win).
+     *  @{ */
+
+    /** @brief Attach an animation. Duplicates and null handles are ignored. */
+    EL_API el_result_e el_effect_attach_animation(el_effect_handle_t effect, el_animation_handle_t anim);
+    /** @brief Detach an animation by identity. */
+    EL_API el_result_e el_effect_detach_animation(el_effect_handle_t effect, el_animation_handle_t anim);
+    /** @brief Detach every animation currently attached to the effect. */
+    EL_API el_result_e el_effect_detach_all_animations(el_effect_handle_t effect);
+    /** @brief Number of animations currently attached. */
+    EL_API el_result_e el_effect_get_animation_count(el_effect_handle_t effect, int32_t *outCount);
+    /** @brief Whether @p anim is currently attached to @p effect. */
+    EL_API el_result_e el_effect_contains_animation(el_effect_handle_t effect,
+                                                    el_animation_handle_t anim, el_bool_t *outContains);
+
+    /** @} */
+
+#ifdef __cplusplus
+} // extern "C"
+#endif
+
+#endif // _EL_EFFECT_H_

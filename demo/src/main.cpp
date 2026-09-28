@@ -1,17 +1,21 @@
 #include "gl/gl-header.h"
 #include <GLFW/glfw3.h>
 #include "core/edge-lighting.h"
-#include "renderer/wireframe-renderer.h"
 #include "renderer/neon-renderer.h"
-#include "renderer/neon-multi-pass-renderer.h"
-#include "renderer/neon-optimized-renderer.h"
+#include "renderer/debug-renderer.h"
+#include "renderer/droplets-renderer.h"
+#include "renderer/lens-flare-renderer.h"
+#include "renderer/spotlight-renderer.h"
 #include "renderer/particle-renderer.h"
 #include "animation/neon-animations.h"
 #include "debug-ui.h"
 #include "background-quad.h"
+#include "image-quad.h"
 #include "ui-controls.h"
+#include "util/capture-util.h"
 #include "util/log-util.h"
 #include <memory>
+#include <string>
 
 std::unique_ptr<EdgeLighting::EdgeLightingEffect> gEffect;
 
@@ -26,7 +30,7 @@ int main()
         return -1;
     }
 
-    // Context hints — Core 3.3 on macOS, OpenGL ES 3.0 on Windows / Linux.
+    // Context hints - Core 3.3 on macOS, OpenGL ES 3.0 on Windows / Linux.
     // The PLATFORM_* defines come from lib/CMakeLists.txt.
 #if defined(PLATFORM_MACOS)
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
@@ -39,7 +43,7 @@ int main()
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
 #endif
 
-    int mainW = 900, mainH = 700;
+    int mainW = 1920, mainH = 1080;
     GLFWwindow *window = glfwCreateWindow(mainW, mainH, "Edge Lighting Effect", nullptr, nullptr);
     if (!window)
     {
@@ -50,7 +54,7 @@ int main()
 
     glfwMakeContextCurrent(window);
 
-    // GL function loader — only desktop GL and ANGLE-on-Windows need GLAD.
+    // GL function loader - only desktop GL and ANGLE-on-Windows need GLAD.
     // Linux uses native <GLES3/gl3.h> whose symbols are already linked.
 #if defined(PLATFORM_MACOS)
     if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress))
@@ -73,6 +77,16 @@ int main()
     int displayW, displayH;
     glfwGetFramebufferSize(window, &displayW, &displayH);
     glViewport(0, 0, displayW, displayH);
+
+    // Requested size vs what the window manager granted vs the backing-store
+    // framebuffer. Geometry below is derived from the framebuffer size, so
+    // this is the number that decides where the rect lands - and the one an
+    // offscreen capture at a fixed size will NOT match on a HiDPI display.
+    int winW = 0, winH = 0;
+    glfwGetWindowSize(window, &winW, &winH);
+    LOG_I("Main window: requested %dx%d, window %dx%d, framebuffer %dx%d (scale %.2fx)",
+          mainW, mainH, winW, winH, displayW, displayH,
+          winW > 0 ? static_cast<double>(displayW) / winW : 0.0);
     glfwSetFramebufferSizeCallback(window, OnResize);
     glfwSetKeyCallback(window, OnKey);
 
@@ -90,18 +104,29 @@ int main()
     // --- Effect setup ---
     gEffect = std::make_unique<EdgeLighting::EdgeLightingEffect>();
 
-    auto wireframeRenderer = std::make_shared<EdgeLighting::WireframeRenderer>();
+    auto lensFlareRenderer = std::make_shared<EdgeLighting::LensFlareRenderer>();
+    auto spotlightRenderer = std::make_shared<EdgeLighting::SpotlightRenderer>();
     auto neonRenderer = std::make_shared<EdgeLighting::NeonRenderer>();
-    auto neonMultiPassRenderer = std::make_shared<EdgeLighting::NeonMultiPassRenderer>();
-    auto neonOptimizedRenderer = std::make_shared<EdgeLighting::NeonOptimizedRenderer>();
+    auto debugRenderer = std::make_shared<EdgeLighting::DebugRenderer>();
+    auto dropletsRenderer = std::make_shared<EdgeLighting::DropletsRenderer>();
     auto particleRenderer = std::make_shared<EdgeLighting::ParticleRenderer>();
+    // Newborn particles copy the neon's drawn glow at their spawn point when
+    // Neon > Res Scale is below 1 (the CPU colour ring otherwise) - which is
+    // why the particles are registered after the neon below.
+    particleRenderer->SetNeonSource(neonRenderer);
 
-    gEffect->AddRenderer(wireframeRenderer);
     gEffect->AddRenderer(neonRenderer);
-    gEffect->AddRenderer(neonMultiPassRenderer);
-    gEffect->AddRenderer(neonOptimizedRenderer);
-    // Particles render LAST so their sparks lay on top of the neon glow.
+    gEffect->AddRenderer(dropletsRenderer);
+    gEffect->AddRenderer(lensFlareRenderer);
+    // After the neon, whose opaque fill would paint over the cones, and
+    // before the debug overlays, which annotate every layer under them.
+    gEffect->AddRenderer(spotlightRenderer);
+    // Sparks sit on top of every light layer, still under the debug overlays.
     gEffect->AddRenderer(particleRenderer);
+    gEffect->AddRenderer(debugRenderer);
+
+    // The Particles section reads the live count back for its readout.
+    debugUI.SetParticleRenderer(particleRenderer);
 
     EdgeLighting::Config config;
     config.geometry.width = displayW / 2;
@@ -109,8 +134,8 @@ int main()
     config.geometry.position = glm::vec2(displayW / 4, displayH / 4);
     config.geometry.cornerRadius = 0.0f;
     config.neon.enable = true;
-    config.wireframe.enable = true;
-    config.wireframe.color = glm::vec4(0.0f, 1.0f, 0.0f, 1.0f);
+    config.debug.showWireframe = true;
+    config.debug.wireframeColor = glm::vec4(0.0f, 1.0f, 0.0f, 1.0f);
 
     gEffect->SetConfig(config);
 
@@ -131,6 +156,16 @@ int main()
         LOG_W("Background debug quad failed to initialise; continuing without it.");
     }
 
+    // Textured quad used by the border color picker to render its source
+    // image inside the rect (behind the neon) for visual verification.
+    EdgeLightingDemo::ImageQuad imageQuad;
+    if (!imageQuad.Init())
+    {
+        LOG_W("Image backdrop quad failed to initialise; continuing without it.");
+    }
+
+    EdgeLighting::OffscreenCapture capture;
+
     EdgeLightingDemo::PrintControls();
     EdgeLightingDemo::PrintCurrentConfig(gEffect->GetConfig(), gEffect->GetClock().IsPlaying());
 
@@ -142,35 +177,82 @@ int main()
         lastFrameTime = currentFrameTime;
 
         // --- Debug UI (ImGui widgets + render to debug window) ---
-        // Build the UI (mutates cfg from slider drags / preset picks), then
-        // overlay the currently-active animation preset, then push back.
+        // Sliders / preset picks edit the effect's BASE config. gEffect->Update
+        // (in the render block below) advances the attached animations and
+        // composites them onto the base to produce the active config.
         {
-            EdgeLighting::Config cfg = gEffect->GetConfig();
-            debugUI.Build(cfg, *gEffect);
-            debugUI.ApplyActiveAnimation(cfg, gEffect->GetClock().GetTime());
-            gEffect->SetConfig(cfg);
+            EdgeLighting::Config base = gEffect->GetConfig();
+            debugUI.Build(base, *gEffect);
+            gEffect->SetConfig(base);
         }
         debugUI.Render();
 
         // --- Render main window (no ImGui overlay) ---
         glfwMakeContextCurrent(window);
         {
-            glClearColor(0.03f, 0.03f, 0.05f, 1.0f);
-            glClear(GL_COLOR_BUFFER_BIT);
-
             int fbW, fbH;
             glfwGetFramebufferSize(window, &fbW, &fbH);
 
-            // Debug checker background, drawn first so the effect composites
-            // over it. Toggling Neon > Opaque shows blend vs occlude.
-            if (debugUI.IsBackgroundEnabled())
+            // Everything behind the effect, at an explicit size so it can be
+            // drawn either into the window or into the capture framebuffer.
+            auto drawBackdrop = [&](int w, int h)
             {
-                background.Draw(debugUI.GetBackgroundCheckerSize(),
-                                debugUI.GetBackgroundColorA(),
-                                debugUI.GetBackgroundColorB());
-            }
+                glViewport(0, 0, w, h);
+                glClearColor(0.03f, 0.03f, 0.05f, 1.0f);
+                glClear(GL_COLOR_BUFFER_BIT);
+
+                // Debug checker background, drawn first so the effect composites
+                // over it. Toggling Neon > Opaque shows blend vs occlude.
+                if (debugUI.IsBackgroundEnabled())
+                {
+                    background.Draw(debugUI.GetBackgroundCheckerSize(),
+                                    debugUI.GetBackgroundColorA(),
+                                    debugUI.GetBackgroundColorB());
+                }
+
+                // Border color picker backdrop: draw the source image inside the
+                // rect so the sampled colours can be verified against it. Neon
+                // composites on top so the glow appears to trace the image edge.
+                if (debugUI.IsImageBackdropEnabled())
+                {
+                    const auto &g = gEffect->GetConfig().geometry;
+                    imageQuad.Draw(w, h, g.position.x, g.position.y,
+                                   g.width, g.height,
+                                   debugUI.GetImageBackdropTextureId());
+                }
+            };
 
             gEffect->Update(deltaTime);
+
+            // Offscreen capture, before the window draw so the timing below
+            // still measures a plain window frame. Rendering the scene twice
+            // at two sizes makes the *Optimized renderers reallocate their
+            // half-res FBOs, which is why this only runs on an explicit click.
+            int capW = 0;
+            int capH = 0;
+            if (debugUI.ConsumeCaptureRequest(capW, capH))
+            {
+                if (capture.Begin(capW, capH))
+                {
+                    drawBackdrop(capW, capH);
+                    gEffect->Render(capW, capH);
+
+                    std::string path = EdgeLighting::CaptureUtil::TimestampedPath(RES_DIR, "capture_", "png");
+                    bool saved = capture.Save(path);
+                    capture.End();
+
+                    if (saved)
+                    {
+                        LOG_I("Capture saved: %s (%dx%d)", path.c_str(), capW, capH);
+                    }
+                    else
+                    {
+                        LOG_E("Capture failed: %s", path.c_str());
+                    }
+                }
+            }
+
+            drawBackdrop(fbW, fbH);
 
             double t0 = glfwGetTime();
             gEffect->Render(fbW, fbH);
@@ -277,26 +359,32 @@ void OnKey(GLFWwindow *window, int key, int scancode, int action, int mods)
     }
     case GLFW_KEY_N:
     {
-        if (mods & GLFW_MOD_SHIFT)
-        {
-            config.multipassNeon.enable = !config.multipassNeon.enable;
-        }
-        else
-        {
-            config.neon.enable = !config.neon.enable;
-        }
+        config.neon.enable = !config.neon.enable;
         break;
     }
     case GLFW_KEY_G:
     {
-        config.wireframe.enable = !config.wireframe.enable;
+        config.debug.showWireframe = !config.debug.showWireframe;
+        break;
+    }
+    case GLFW_KEY_D:
+    {
+        config.droplets.enable = !config.droplets.enable;
+        break;
+    }
+    case GLFW_KEY_K:
+    {
+        config.particle.enable = !config.particle.enable;
         break;
     }
     case GLFW_KEY_O:
     {
         if (mods & GLFW_MOD_SHIFT)
         {
-            config.optimizedNeon.enable = !config.optimizedNeon.enable;
+            // Toggle the neon layer between full resolution and half. There is
+            // no second renderer to switch to any more - this IS the old
+            // "optimized on/off", expressed as the scale it always was.
+            config.neon.resolutionScale = (config.neon.resolutionScale < 1.0f) ? 1.0f : 0.5f;
         }
         else
         {
