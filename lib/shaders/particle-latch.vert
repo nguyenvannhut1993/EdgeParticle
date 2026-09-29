@@ -8,13 +8,15 @@ precision highp float;
 
 layout(location = 0) in float aSlot;     // latch slot, an exact integer
 layout(location = 1) in vec2  aSpawnPos; // spawn point on the line, rect-local px (y up)
-layout(location = 2) in vec3  aFallback; // CPU ring colour, used when there is no drawn glow
+layout(location = 2) in vec4  aColor;    // CPU colour, straight rgba: the ring's, or the arc's custom colour
+layout(location = 3) in float aFromNeon; // 1: copy the neon's drawn glow instead of aColor
 
 uniform int uLatchWidth;
 uniform int uLatchHeight;
 
-flat out vec2 vSpawnPos;
-flat out vec3 vFallback;
+flat out vec2  vSpawnPos;
+flat out vec4  vColor;
+flat out float vFromNeon;
 
 void main() {
     int  slot  = int(aSlot + 0.5);
@@ -22,5 +24,6 @@ void main() {
     gl_Position  = vec4(texel / vec2(float(uLatchWidth), float(uLatchHeight)) * 2.0 - 1.0, 0.0, 1.0);
     gl_PointSize = 1.0;
     vSpawnPos    = aSpawnPos;
-    vFallback    = aFallback;
+    vColor       = aColor;
+    vFromNeon    = aFromNeon;
 }

@@ -21,9 +21,9 @@ void main() {
 
     // The latched colour is already premultiplied by its own coverage - the
     // neon pixel's alpha when the particle copied the drawn glow, 1 for the
-    // CPU ring - so the particle's shape and fade scale both halves
-    // alike. Where the neon drew nothing, coverage 0 makes the particle
-    // invisible rather than a dark dot.
+    // CPU ring, the arc's own alpha for a custom colour - so the particle's
+    // shape and fade scale both halves alike. Where the neon drew nothing,
+    // coverage 0 makes the particle invisible rather than a dark dot.
     float coverage = alpha * vColor.a;
     if (coverage <= 0.0) { discard; }
 

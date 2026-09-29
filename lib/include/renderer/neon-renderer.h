@@ -87,7 +87,7 @@ namespace EdgeLighting
         //
         // Not the emission table the gather reads, but what the gather wrote:
         // premultiplied colour + coverage alpha, after gain, halo, bloom and
-        // the tone map. @ref ParticleRenderer copies it at each spawn point.
+        // the tone map. @ref ParticleManager copies it at each spawn point.
         // It exists only on the scaled path - at resolutionScale 1.0 the glow
         // goes straight onto the caller's framebuffer and there is no buffer
         // to read.

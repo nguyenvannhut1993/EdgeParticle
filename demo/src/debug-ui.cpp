@@ -1109,36 +1109,149 @@ void DebugUI::buildParticleSection(EdgeLighting::Config &cfg)
         return;
     }
 
-    ImGui::Checkbox("Enable##Particle", &cfg.particle.enable);
-    // Live count against the cap - the cap silently pauses emission, so this
-    // is the one place a "why did the sparks thin out" question is answered.
-    if (mParticleRenderer)
+    auto &pc = cfg.particle;
+    ImGui::Checkbox("Enable##Particle", &pc.enable);
+    if (ImGui::IsItemHovered())
     {
-        const size_t alive = mParticleRenderer->GetParticleCount();
-        ImGui::SameLine();
-        ImGui::Text("alive %zu / %d", alive, cfg.particle.maxParticles);
-        if (cfg.particle.enable && static_cast<int>(alive) >= cfg.particle.maxParticles)
-        {
-            ImGui::SameLine();
-            ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "[cap reached]");
-        }
+        ImGui::SetTooltip("Off clears every particle and frees the layer's memory;\n"
+                          "on starts again from nothing.");
     }
-    if (!cfg.particle.enable)
+    // Live count against the ring - one block of MAX_PARTICLES_CAP slots per
+    // arc. Each arc clamps its own spawn RATE to its Max Alive / Lifetime, so
+    // a thinning trail is the clamp at work rather than a full block. Reads
+    // 0 / 0 while the layer is off: it holds no ring then.
+    if (mParticleManager)
+    {
+        ImGui::SameLine();
+        ImGui::Text("alive %zu / %zu", mParticleManager->GetParticleCount(),
+                    mParticleManager->GetCapacity());
+    }
+    if (!pc.enable)
     {
         return;
     }
 
-    // Which source the newborns took their colour from last frame. It moves
-    // with settings that live in OTHER sections - the drawn glow needs
-    // Neon > Res Scale below 1 and the neon drawing (not off, not
-    // Debug > Opaque only) - so it is worth seeing here.
-    if (mParticleRenderer)
+    // --- Where the arcs come from: ONE switch for the whole layer. ---
+    ImGui::Checkbox("Use Neon Arcs##Particle", &pc.useNeonArc);
+    if (ImGui::IsItemHovered())
     {
-        switch (mParticleRenderer->GetColorSource())
+        ImGui::SetTooltip("On: one emitter per Neon > Arcs entry, moving with it.\n"
+                          "Off: one emitter per arc below, each at its own Start / Length.");
+    }
+
+    auto &arcs = pc.arcs;
+    const int maxArcs = EdgeLighting::ParticleConfig::MAX_ARCS_CAP;
+    int listed = 0; // arcs shown - and editable - below
+    if (pc.useNeonArc)
+    {
+        // One entry per neon arc, so each has settings of its own to edit.
+        // The library already gives a neon arc past the end of the list the
+        // LAST entry's settings, so growing the list with copies of that entry
+        // changes nothing on screen - it only makes them editable one by one.
+        listed = std::min(static_cast<int>(cfg.neon.arcs.size()), maxArcs);
+        if (static_cast<int>(arcs.size()) < listed)
+        {
+            const EdgeLighting::ParticleArcConfig last =
+                arcs.empty() ? EdgeLighting::ParticleArcConfig{} : arcs.back();
+            arcs.resize(static_cast<size_t>(listed), last);
+        }
+        ImGui::TextDisabled("%d arc(s) - one per Neon > Arcs entry", listed);
+    }
+    else
+    {
+        ImGui::Text("%d / %d arcs", static_cast<int>(arcs.size()), maxArcs);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("+ Add##Particle") && static_cast<int>(arcs.size()) < maxArcs)
+        {
+            // A copy of the arc being edited, moved on past its end so the
+            // two do not start out on top of each other.
+            EdgeLighting::ParticleArcConfig added;
+            if (!arcs.empty())
+            {
+                const int from = std::clamp(mParticleSelected, 0, static_cast<int>(arcs.size()) - 1);
+                added = arcs[static_cast<size_t>(from)];
+                added.arcStart = std::fmod(added.arcStart + added.arcLength, 1.0f);
+            }
+            arcs.push_back(added);
+            mParticleSelected = static_cast<int>(arcs.size()) - 1;
+        }
+        listed = std::min(static_cast<int>(arcs.size()), maxArcs);
+    }
+
+    if (listed == 0)
+    {
+        ImGui::TextDisabled(pc.useNeonArc ? "No neon arcs. Add one under Neon > Arcs."
+                                          : "No arcs. Add one to emit.");
+        return;
+    }
+    mParticleSelected = std::clamp(mParticleSelected, 0, listed - 1);
+
+    // Order matches EdgeLighting::ParticleMode.
+    const char *modeItems[] = {"Movement (trail)", "Head Sparks"};
+
+    // Arc picker: one row each, so the arc an entry drives - neon arc i, or
+    // the i-th own arc - is always visible.
+    for (int i = 0; i < listed; i++)
+    {
+        const auto &a = arcs[static_cast<size_t>(i)];
+        char label[64];
+        std::snprintf(label, sizeof(label), "arc %d  %s%s##ParticlePick%d", i,
+                      modeItems[static_cast<int>(a.mode)], a.enable ? "" : "  (off)", i);
+        if (ImGui::RadioButton(label, mParticleSelected == i))
+        {
+            mParticleSelected = i;
+        }
+        // Own arcs only: with neon arcs the list follows Neon > Arcs.
+        if (!pc.useNeonArc)
+        {
+            ImGui::SameLine();
+            char killLabel[32];
+            std::snprintf(killLabel, sizeof(killLabel), "x##ParticleKill%d", i);
+            if (ImGui::SmallButton(killLabel))
+            {
+                arcs.erase(arcs.begin() + i);
+                mParticleSelected = std::max(0, std::min(mParticleSelected, static_cast<int>(arcs.size()) - 1));
+                return;
+            }
+        }
+    }
+
+    EdgeLighting::ParticleArcConfig &p = arcs[static_cast<size_t>(mParticleSelected)];
+
+    ImGui::Separator();
+    ImGui::Checkbox("Arc Enabled##Particle", &p.enable);
+    if (ImGui::IsItemHovered())
+    {
+        ImGui::SetTooltip("Off clears this arc's particles at once;\n"
+                          "on starts its emitter again from nothing.");
+    }
+    if (!pc.useNeonArc)
+    {
+        // Perimeter space, as in Neon > Arcs: 0 is the rect's top-left corner.
+        SliderWithInput("Arc Start##Particle", p.arcStart, 0.0f, 1.0f, "%.3f");
+        SliderWithInput("Arc Length##Particle", p.arcLength, 0.0f, 1.0f, "%.3f");
+    }
+
+    ImGui::Checkbox("Custom Colour##Particle", &p.useCustomColor);
+    if (p.useCustomColor)
+    {
+        ImGui::SameLine();
+        ImGui::ColorEdit4("##ParticleCustomColour", &p.customColor.x,
+                          ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_AlphaBar);
+    }
+    else if (mParticleManager)
+    {
+        // Where this arc's newborns took the neon's colour from last frame.
+        // It moves with settings that live in OTHER sections - the drawn glow
+        // needs Neon > Res Scale below 1 and the neon drawing (not off, not
+        // Debug > Opaque only) - so it is worth seeing here.
+        switch (mParticleManager->GetColorSource())
         {
         case EdgeLighting::ParticleColorSource::NEON_OUTPUT:
         {
-            ImGui::TextDisabled("Colour: neon as drawn (latched at spawn)");
+            ImGui::TextDisabled(pc.useNeonArc ? "Colour: neon as drawn (latched at spawn)"
+                                              : "Colour: neon as drawn (latched at spawn) -\n"
+                                                "invisible where the neon draws nothing");
             break;
         }
         case EdgeLighting::ParticleColorSource::COLOR_RING:
@@ -1150,26 +1263,99 @@ void DebugUI::buildParticleSection(EdgeLighting::Config &cfg)
         }
     }
 
-    // A density here, not a rate: emitAlongArc spawns
-    // arcPixelLength * 2 * emissionRate / 100 motes per second.
-    SliderWithInput("Density##Particle", cfg.particle.emissionRate, 0.0f, 200.0f, "%.1f");
-    if (ImGui::IsItemHovered())
+    int modeIdx = static_cast<int>(p.mode);
+    if (ImGui::Combo("Mode##Particle", &modeIdx, modeItems, IM_ARRAYSIZE(modeItems)))
     {
-        ImGui::SetTooltip("Motes/s = lit arc length (px) x 2 x Density / 100");
+        p.mode = static_cast<EdgeLighting::ParticleMode>(modeIdx);
     }
-    SliderWithInput("Lifetime##Particle", cfg.particle.lifetime, 0.05f, 3.0f, "%.2f s");
-    // A drift multiplier, not px/s - see ParticleConfig::speed.
-    SliderWithInput("Speed##Particle", cfg.particle.speed, 0.0f, 400.0f, "%.0f");
-    SliderWithInput("Drag##Particle", cfg.particle.drag, 0.0f, 10.0f);
-    SliderWithInput("Size##Particle", cfg.particle.sizeStart, 1.0f, 30.0f, "%.1f px");
-    SliderIntWithInput("Max Alive##Particle", cfg.particle.maxParticles, 32,
-                       EdgeLighting::ParticleConfig::MAX_PARTICLES_CAP);
-    SliderWithInput("Head Bias##Particle", cfg.particle.headBias, 0.05f, 4.0f);
-    SliderWithInput("Scatter Radius##Particle", cfg.particle.scatterRadius, 0.0f, 40.0f, "%.1f px");
-    SliderWithInput("Tail Size##Particle", cfg.particle.tailSizeFraction, 0.0f, 1.0f);
+    const EdgeLighting::ParticleMode mode = p.mode;
 
-    ImGui::TextDisabled("Emits along Neon > Arcs[0]. A static arc keeps the trail in\n"
-                        "place - add an Outline Tracer or Arc Wipe animation to move it.");
+    // HEAD_SPARKS spawns from one point, so its emissionRate is a plain rate;
+    // MOVEMENT reads it as a density along the arc.
+    if (mode == EdgeLighting::ParticleMode::HEAD_SPARKS)
+    {
+        SliderWithInput("Rate##Particle", p.emissionRate, 0.0f, 1000.0f, "%.0f sparks/s");
+        if (ImGui::IsItemHovered())
+        {
+            ImGui::SetTooltip("Sparks/s, clamped to Max Alive / Lifetime");
+        }
+    }
+    else
+    {
+        SliderWithInput("Density##Particle", p.emissionRate, 0.0f, 200.0f, "%.1f");
+        if (ImGui::IsItemHovered())
+        {
+            ImGui::SetTooltip("Motes/s = arc length (px) x 2 x Density / 100,\n"
+                              "clamped to Max Alive / Lifetime");
+        }
+    }
+    SliderWithInput("Lifetime##Particle", p.lifetime, 0.05f, 3.0f, "%.2f s");
+    // Speed means something different per mode - see ParticleArcConfig::speed.
+    switch (mode)
+    {
+    case EdgeLighting::ParticleMode::MOVEMENT:
+    {
+        SliderWithInput("Drift##Particle", p.speed, 0.0f, 400.0f, "%.0f");
+        break;
+    }
+    case EdgeLighting::ParticleMode::HEAD_SPARKS:
+    {
+        SliderWithInput("Speed##Particle", p.speed, 0.0f, 400.0f, "%.0f px/s");
+        break;
+    }
+    }
+    SliderWithInput("Drag##Particle", p.drag, 0.0f, 10.0f);
+    SliderWithInput("Size##Particle", p.sizeStart, 1.0f, 30.0f, "%.1f px");
+    SliderIntWithInput("Max Alive##Particle", p.maxParticles, 32,
+                       EdgeLighting::ParticleArcConfig::MAX_PARTICLES_CAP);
+    SliderWithInput("Scatter Radius##Particle", p.scatterRadius, 0.0f, 40.0f, "%.1f px");
+
+    // The knobs only one mode reads.
+    switch (mode)
+    {
+    case EdgeLighting::ParticleMode::MOVEMENT:
+    {
+        SliderWithInput("Head Bias##Particle", p.headBias, 0.05f, 4.0f);
+        SliderWithInput("Tail Size##Particle", p.tailSizeFraction, 0.0f, 1.0f);
+        break;
+    }
+    case EdgeLighting::ParticleMode::HEAD_SPARKS:
+    {
+        SliderWithInput("Spread##Particle", p.spreadDeg, 0.0f, 360.0f, "%.0f deg");
+        SliderWithInput("Outward Bias##Particle", p.outwardBias, 0.0f, 1.0f);
+        if (ImGui::IsItemHovered())
+        {
+            ImGui::SetTooltip("0 = along the sweep, 1 = straight out of the rect");
+        }
+        break;
+    }
+    }
+
+    if (listed > 1)
+    {
+        if (ImGui::SmallButton("Copy To Every Arc##Particle"))
+        {
+            // Everything but WHERE: each own arc keeps its Start / Length.
+            const EdgeLighting::ParticleArcConfig source = p;
+            for (auto &a : arcs)
+            {
+                const float start = a.arcStart;
+                const float length = a.arcLength;
+                a = source;
+                a.arcStart = start;
+                a.arcLength = length;
+            }
+        }
+        if (ImGui::IsItemHovered())
+        {
+            ImGui::SetTooltip("This arc's settings onto every other arc, all but Start / Length");
+        }
+    }
+
+    ImGui::TextDisabled(pc.useNeonArc ? "A static neon arc keeps its emission in place -\n"
+                                        "add an Outline Tracer or Arc Wipe to move it."
+                                      : "Own arcs stay where Start / Length put them;\n"
+                                        "they do not follow the neon's arcs.");
 }
 
 void DebugUI::buildSpotlightSection(EdgeLighting::Config &cfg)

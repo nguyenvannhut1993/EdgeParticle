@@ -451,38 +451,94 @@ namespace EdgeLightingDemo
         }
 
         // -------------------------------------------------------------------
-        // Particles. WHERE they spawn is read from neon.arcs, not from this
-        // sub-config, so the arc it will actually use is spelled out.
+        // Particles. One emitter per arc - the neon's or the layer's own, per
+        // useNeonArc - each with its own settings, so every arc is spelled
+        // out, rate and all.
         // -------------------------------------------------------------------
         const auto &pt = config.particle;
+        const size_t arcCount = pt.useNeonArc ? config.neon.arcs.size() : pt.arcs.size();
+        const size_t emitters = pt.arcs.empty()
+                                    ? 0
+                                    : std::min(arcCount, static_cast<size_t>(ParticleConfig::MAX_ARCS_CAP));
+        const char *modeItems[] = {"MOVEMENT", "HEAD_SPARKS"};
 
         std::cout << "\nParticles  " << (pt.enable ? "ON" : "OFF")
-                  << "   mode MOVEMENT   (emits along neon.arcs[0])\n";
-        if (config.neon.arcs.empty())
+                  << "   arcs from " << (pt.useNeonArc ? "the NEON (useNeonArc)" : "their OWN arcStart / arcLength")
+                  << "   (" << emitters << " emitter(s), ring "
+                  << emitters * ParticleArcConfig::MAX_PARTICLES_CAP << " motes)\n";
+        for (size_t i = 0; i < emitters; ++i)
         {
-            std::cout << "                   [no arcs[0]: emits nothing]\n";
+            // Mirrors ParticleManager::Render: a neon arc past the end of the
+            // list takes the last entry.
+            const size_t entry = std::min(i, pt.arcs.size() - 1);
+            const auto &p = pt.arcs[entry];
+            float start = p.arcStart;
+            float length = p.arcLength;
+            bool lit = length > 0.001f;
+            if (pt.useNeonArc)
+            {
+                const auto &a = config.neon.arcs[i];
+                start = a.start;
+                length = a.length;
+                lit = a.length > 0.001f && a.intensity > 0.0f;
+            }
+
+            std::cout << "  arc [" << i << "]";
+            if (entry != i)
+            {
+                std::cout << " (settings of [" << entry << "])";
+            }
+            std::cout << "  " << modeItems[static_cast<int>(p.mode)]
+                      << "  start " << std::setprecision(3) << start << ", length " << length;
+            if (!p.enable || !lit)
+            {
+                std::cout << "   " << (p.enable ? "dark" : "disabled") << ": emits nothing\n";
+                continue;
+            }
+
+            // Mirrors ParticleEmitter::Emit, clamp included.
+            const bool pointSource = p.mode == ParticleMode::HEAD_SPARKS;
+            const int cap = std::clamp(p.maxParticles, 0, ParticleArcConfig::MAX_PARTICLES_CAP);
+            const float rateCap = p.lifetime > 0.0f ? static_cast<float>(cap) / p.lifetime : 0.0f;
+            const float arcPx = length * peri;
+            const float rate = pointSource ? p.emissionRate : arcPx * 2.0f * p.emissionRate / 100.0f;
+            std::cout << "   " << std::setprecision(1) << arcPx << " px -> "
+                      << std::min(rate, rateCap) << " motes/s"
+                      << (rate > rateCap ? "   [clamped by maxParticles]" : "") << "\n";
+
+            std::cout << "    emissionRate     " << std::setprecision(1) << p.emissionRate
+                      << (pointSource ? "   (sparks/s)\n" : "   (arc px x 2 x this / 100 motes/s)\n");
+            std::cout << "    lifetime         " << std::setprecision(2) << p.lifetime << " s"
+                      << "   (the longest any mote lives)\n";
+            std::cout << "    speed            " << std::setprecision(1) << p.speed
+                      << (pointSource ? "   (px/s)" : "   (drift multiplier, not px/s)")
+                      << ", drag " << std::setprecision(2) << p.drag << " /s\n";
+            std::cout << "    sizeStart        " << std::setprecision(1) << p.sizeStart << " px"
+                      << ", maxParticles " << p.maxParticles << "\n";
+            std::cout << "    scatterRadius    " << std::setprecision(1) << p.scatterRadius << " px\n";
+            if (pointSource)
+            {
+                std::cout << "    spreadDeg        " << std::setprecision(1) << p.spreadDeg << " deg"
+                          << ", outwardBias " << std::setprecision(2) << p.outwardBias
+                          << "   (0 = along the sweep, 1 = straight out)\n";
+            }
+            else
+            {
+                std::cout << "    headBias         " << std::setprecision(2) << p.headBias
+                          << "   (<1 crowds the head, >1 the tail)\n";
+                std::cout << "    tailSizeFraction " << std::setprecision(2) << p.tailSizeFraction << "\n";
+            }
+            std::cout << "    colour           ";
+            if (p.useCustomColor)
+            {
+                std::cout << "custom (" << std::setprecision(2) << p.customColor.r << ", " << p.customColor.g
+                          << ", " << p.customColor.b << ", " << p.customColor.a << ")\n";
+            }
+            else
+            {
+                std::cout << "the neon's (drawn glow below Res Scale 1, else the colour ring)\n";
+            }
         }
-        else if (config.neon.arcs[0].length <= 0.001f || config.neon.arcs[0].intensity <= 0.0f)
-        {
-            std::cout << "                   [arcs[0] is dark: emits nothing]\n";
-        }
-        // Mirrors emitAlongArc: the rate scales with the lit arc's px length.
-        float arcPx = config.neon.arcs.empty() ? 0.0f : config.neon.arcs[0].length * peri;
-        std::cout << "  emissionRate     " << std::setprecision(1) << pt.emissionRate
-                  << "   (x arc " << arcPx << " px x 2 / 100 = "
-                  << arcPx * 2.0f * pt.emissionRate / 100.0f << " /s)\n";
-        std::cout << "  lifetime         " << std::setprecision(2) << pt.lifetime << " s"
-                  << "   (each mote 0.1 - 1.0 x this)\n";
-        std::cout << "  speed            " << std::setprecision(1) << pt.speed
-                  << "   (drift multiplier, not px/s)"
-                  << ", drag " << std::setprecision(2) << pt.drag << " /s\n";
-        std::cout << "  sizeStart        " << std::setprecision(1) << pt.sizeStart << " px"
-                  << ", maxParticles " << pt.maxParticles << "\n";
-        std::cout << "  headBias         " << std::setprecision(2) << pt.headBias
-                  << "   (<1 crowds the head, >1 the tail)\n";
-        std::cout << "  scatterRadius    " << std::setprecision(1) << pt.scatterRadius << " px"
-                  << "   (3x along the line; also scales the drift)\n";
-        std::cout << "  tailSizeFraction " << std::setprecision(2) << pt.tailSizeFraction << "\n";
 
         const auto &d = config.debug;
         std::cout << "\nDebug      " << (d.enable ? "ON " : "OFF")

@@ -19,7 +19,7 @@ namespace EdgeLighting
     struct Config;
     class EdgeLightingEffect;
     class AnimationManager;
-    class ParticleRenderer;
+    class ParticleManager;
 }
 
 class DebugUI
@@ -41,9 +41,9 @@ public:
 
     /// The registered particle layer, read back for the live-count readout.
     /// Optional: without it the Particles section just omits the count.
-    void SetParticleRenderer(std::shared_ptr<const EdgeLighting::ParticleRenderer> renderer)
+    void SetParticleManager(std::shared_ptr<const EdgeLighting::ParticleManager> manager)
     {
-        mParticleRenderer = std::move(renderer);
+        mParticleManager = std::move(manager);
     }
 
     /// Render the ImGui frame into the debug window. Must be called after Build() each frame.
@@ -125,7 +125,10 @@ private:
     int mSpotlightSelected = 0;
 
     // --- Particles ---
-    std::shared_ptr<const EdgeLighting::ParticleRenderer> mParticleRenderer;
+    std::shared_ptr<const EdgeLighting::ParticleManager> mParticleManager;
+    /// Which arc the Particles section is editing. Clamped to the listed arcs
+    /// every frame, so removing one cannot leave it dangling.
+    int mParticleSelected = 0;
 
     // --- Animation state ---
     // Animations are owned by the effect's AnimationManager (via

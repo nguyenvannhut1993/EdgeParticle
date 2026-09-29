@@ -1127,90 +1127,134 @@ namespace EdgeLighting
         bool operator!=(const SpotlightConfig &o) const { return !(*this == o); }
     } SpotlightConfig;
 
-    /// Where @ref ParticleRenderer spawns its particles. Reads
-    /// @c NeonConfig::arcs[0] only - the arc the tracer / wipe animations
-    /// drive - and emits nothing while it is missing or dark.
+    /// How one arc's emitter spawns its particles - set per arc, in
+    /// @c ParticleArcConfig::mode.
+    ///
+    /// Every mode launches its motes with an initial velocity and lets drag
+    /// slow them - the motion the GPU evaluates in closed form - so a mode
+    /// differs in WHERE motes are born, which way and how fast they leave,
+    /// and how long they live, never in what moves them afterwards.
     typedef enum class ParticleMode
     {
-        /// Motes scattered along the whole of @c NeonConfig::arcs[0], dense
-        /// at its head and thinning toward its tail, drifting the way the
-        /// arc is sweeping.
-        MOVEMENT
+        /// Motes scattered along the whole of the arc, dense at its head and
+        /// thinning toward its tail, drifting the way the arc is sweeping and
+        /// settling back onto the line.
+        MOVEMENT,
+        /// Sparks shot from the arc's LEADING edge - the end moving into new
+        /// ground as it sweeps - between the sweep direction and straight out
+        /// (@c ParticleArcConfig::outwardBias), inside a cone of
+        /// @c ParticleArcConfig::spreadDeg. A point source: @c emissionRate is
+        /// sparks per second.
+        HEAD_SPARKS
     } ParticleMode;
 
-    /// Point-sprite particle configuration.
+    /// One arc's particle settings. Each arc has its own - see
+    /// @c ParticleConfig::arcs for which arc an entry drives.
     ///
-    /// The simulation is CPU-side (position += vel * dt, vel *= exp(-drag * dt))
-    /// and advances on the effect CLOCK, not wall time: pausing the clock
-    /// freezes the particles, and @c Clock::Stop clears them. Particles live in
-    /// the same rect-local space as the neon quad and are drawn as GL_POINTS
-    /// with premultiplied-alpha "over" blending.
-    ///
-    /// Emission reads @c NeonConfig::arcs[0] for WHERE to spawn, so an arc
-    /// animation (Outline Tracer, Arc Wipe, ...) is what makes this layer
-    /// move. It does not read @c NeonConfig::enable - the sparks still fly
-    /// with the glow switched off.
-    ///
-    /// WHAT COLOUR is taken ONCE, at spawn, and kept for the particle's whole
-    /// life:
-    ///   - the glow of the @ref NeonRenderer attached with
-    ///     @c ParticleRenderer::SetNeonSource, as DRAWN at the spawn point -
-    ///     colour and coverage, so a particle copies the neon pixel it was
-    ///     born on and vanishes where the neon drew nothing. Only while
-    ///     @c NeonConfig::resolutionScale is below 1: at 1.0 the neon draws
-    ///     straight to the target and keeps no buffer to read.
-    ///   - otherwise (scale 1.0, neon off, @c DebugConfig::opaqueOnly, no
-    ///     source attached), the hue-rotated @c NeonConfig::colorStops ring.
-    typedef struct ParticleConfig
+    /// Read at SPAWN and captured into each mote (launch velocity, lifetime,
+    /// size, drag, colour), so a change leaves the motes already in flight
+    /// as they were born.
+    typedef struct ParticleArcConfig
     {
-        bool enable = false; ///< Enable or disable the particle renderer
+        /// This arc's emitter. Off stops the arc outright: its motes are
+        /// cleared at once, and its emitter starts fresh when switched back
+        /// on. Not the same as a DARK arc (zero length or intensity), whose
+        /// motes live out their lives - which is what lets a trail fade
+        /// behind an arc an animation winds down.
+        bool enable = true;
+
+        // --- Own arc: read only while ParticleConfig::useNeonArc is false ---
+
+        /// Tail of the arc, as a perimeter position in [0, 1) - the space of
+        /// @c Arc::start, so 0 is the rect's top-left corner and
+        /// @c RectGeometry::winding sets the direction round.
+        float arcStart = 0.0f;
+        /// Fraction of the perimeter the arc covers, from @c arcStart toward
+        /// increasing position. At or below 0.001 the arc emits nothing.
+        float arcLength = 0.25f;
+
+        // --- Colour ---
+
+        /// Paint every mote of this arc @c customColor, whatever the neon is
+        /// doing. Off, the colour comes from the neon as described on
+        /// @ref ParticleConfig - for an own arc too, so without this an own
+        /// arc's motes vanish where the neon draws nothing (while
+        /// @c NeonConfig::resolutionScale is below 1).
+        bool useCustomColor = false;
+        /// Straight (not premultiplied) RGBA; alpha is the motes' opacity.
+        /// Read only with @c useCustomColor.
+        glm::vec4 customColor = glm::vec4(1.0f);
+
+        // --- Emission ---
 
         /// Emission strategy. See @ref ParticleMode.
         ParticleMode mode = ParticleMode::MOVEMENT;
 
-        /// Spawn DENSITY, not a rate: the renderer spawns
+        /// MOVEMENT: spawn DENSITY along the arc - the arc spawns
         /// arcPixelLength * 2 * emissionRate / 100 motes per second, so a
-        /// longer lit arc spawns proportionally more and the trail stays
-        /// equally dense per px.
+        /// longer arc spawns proportionally more and the trail stays equally
+        /// dense per px. HEAD_SPARKS spawns from one point, so there it is a
+        /// plain rate - sparks per second. Clamped by @c maxParticles in both
+        /// modes.
         float emissionRate = 400.0f;
-        /// Lifetime in seconds. Each mote's lifetime is randomised into
-        /// [0.1, 1.0] x this.
+        /// Lifetime in seconds - the longest any mote of this arc lives. Each
+        /// mode randomises its motes' lifetimes below this (MOVEMENT into
+        /// [0.1, 1.0] x this), and never above it: the arc's cap and its
+        /// block of the manager's ring are both sized on this being the
+        /// maximum. Arcs may differ - each has a ring block of its own.
         float lifetime = 0.7f;
-        /// A multiplier on the slow drift, not a speed in px/s: the
+        /// MOVEMENT: a multiplier on the slow drift, not a speed in px/s - the
         /// along-line speed is [1.0, 1.5] x this x @c scatterRadius x
-        /// 1.5 / 1000 px/s.
+        /// 1.5 / 1000 px/s. HEAD_SPARKS: launch speed in px/s, randomised
+        /// into [0.5, 1.0] x this.
         float speed = 90.0f;
         /// Exponential drag coefficient (1/s). Larger = slows down faster.
+        /// Captured per mote at spawn, so changing it leaves the motes
+        /// already in flight on the paths they started.
         float drag = 2.5f;
         /// Point size in px at spawn. The vertex shader shrinks it with the
         /// remaining life, floored at 1 px.
         float sizeStart = 7.0f;
-        /// Ceiling on @c maxParticles. The renderer sizes its per-particle
-        /// colour store to this once, so values above it are clamped.
-        static constexpr int MAX_PARTICLES_CAP = 8192;
-        /// Upper bound on live particles, clamped to @c MAX_PARTICLES_CAP.
-        /// Emission pauses at the cap and resumes as particles die.
+        /// Ceiling on @c maxParticles. The manager gives every arc a ring
+        /// block and colour-latch rows of exactly this many motes.
+        static constexpr int MAX_PARTICLES_CAP = 4096;
+        /// Upper bound on this arc's live particles, clamped to
+        /// @c MAX_PARTICLES_CAP. Held as a rate: the arc spawns at most
+        /// maxParticles / @c lifetime motes per second, so it can never have
+        /// more alive - and because lifetimes are randomised into
+        /// [0.1, 1] x @c lifetime, a clamped arc typically carries about 55%
+        /// of it. The trail thins evenly at the clamp rather than in bursts.
         int maxParticles = 4096;
 
-        /// Spawn distribution along the arc, as an exponent: t = u^headBias
-        /// with t = 0 the tail and 1 the head. Below 1 crowds motes toward
-        /// the head, 1 is uniform, above 1 crowds them toward the tail.
+        /// MOVEMENT: spawn distribution along the arc, as an exponent:
+        /// t = u^headBias with t = 0 the tail and 1 the head. Below 1 crowds
+        /// motes toward the head, 1 is uniform, above 1 crowds them toward
+        /// the tail. HEAD_SPARKS: unused.
         float headBias = 1.0f;
-        /// Radius in px of the disc each mote is scattered over at spawn,
-        /// stretched 3x along the line (so the reach is 3x this along it and
-        /// 1x across it). Also scales the along-line drift speed.
+        /// How far from the line a mote may be born, in px. MOVEMENT: a disc
+        /// stretched 3x along the line, whose radius also scales the drift
+        /// speed. HEAD_SPARKS: a disc around the leading edge.
         float scatterRadius = 20.0f;
-        /// NOT READ by the renderer at present - the trail-mote spawn pulls
-        /// motes back toward the line instead of drifting them away from it.
-        /// Kept so existing configs still compile.
-        float scatterSpeed = 20.0f;
-        /// Size at the tail as a fraction of @c sizeStart (the head is 1.0),
-        /// before each mote's own random [0.5, 1.0] size factor.
+        /// MOVEMENT: size at the tail as a fraction of @c sizeStart (the head
+        /// is 1.0), before each mote's own random size factor.
         float tailSizeFraction = 1.0f;
 
-        bool operator==(const ParticleConfig &o) const
+        // --- HEAD_SPARKS ---
+
+        /// Full cone angle in degrees around the launch direction. 0 = every
+        /// spark flies the same way; 360 = any direction.
+        float spreadDeg = 50.0f;
+        /// Launch direction between the arc's sweep direction (0) and
+        /// straight out of the rect along the edge normal (1).
+        float outwardBias = 0.6f;
+
+        bool operator==(const ParticleArcConfig &o) const
         {
             return enable == o.enable &&
+                   arcStart == o.arcStart &&
+                   arcLength == o.arcLength &&
+                   useCustomColor == o.useCustomColor &&
+                   customColor == o.customColor &&
                    mode == o.mode &&
                    emissionRate == o.emissionRate &&
                    lifetime == o.lifetime &&
@@ -1220,8 +1264,70 @@ namespace EdgeLighting
                    maxParticles == o.maxParticles &&
                    headBias == o.headBias &&
                    scatterRadius == o.scatterRadius &&
-                   scatterSpeed == o.scatterSpeed &&
-                   tailSizeFraction == o.tailSizeFraction;
+                   tailSizeFraction == o.tailSizeFraction &&
+                   spreadDeg == o.spreadDeg &&
+                   outwardBias == o.outwardBias;
+        }
+        bool operator!=(const ParticleArcConfig &o) const { return !(*this == o); }
+    } ParticleArcConfig;
+
+    /// Point-sprite particle configuration: one switch for where the arcs
+    /// come from, and one @ref ParticleArcConfig per arc.
+    ///
+    /// Motion is an initial velocity under exponential drag, evaluated in
+    /// closed form on the GPU from each mote's age, and ages on the effect
+    /// CLOCK, not wall time: pausing the clock freezes the particles, while
+    /// @c Clock::Stop and switching the layer off clear them. Particles live
+    /// in the same rect-local space as the neon quad and are drawn as
+    /// GL_POINTS with premultiplied-alpha "over" blending. The layer does not
+    /// read @c NeonConfig::enable - the sparks still fly with the glow
+    /// switched off.
+    ///
+    /// WHAT COLOUR is taken ONCE, at spawn, and kept for the particle's whole
+    /// life. An arc with @c ParticleArcConfig::useCustomColor takes its own
+    /// colour; every other arc takes the neon's:
+    ///   - the glow of the @ref NeonRenderer attached with
+    ///     @c ParticleManager::SetNeonSource, as DRAWN at the spawn point -
+    ///     colour and coverage, so a particle copies the neon pixel it was
+    ///     born on and vanishes where the neon drew nothing. Only while
+    ///     @c NeonConfig::resolutionScale is below 1: at 1.0 the neon draws
+    ///     straight to the target and keeps no buffer to read.
+    ///   - otherwise (scale 1.0, neon off, @c DebugConfig::opaqueOnly, no
+    ///     source attached), the hue-rotated @c NeonConfig::colorStops ring.
+    typedef struct ParticleConfig
+    {
+        /// Enable or disable the particle renderer. Off stops it outright:
+        /// every mote is cleared at once and the layer gives back its ring,
+        /// colour latch and scratch memory, so switching it on again starts
+        /// from nothing, exactly as the first time.
+        bool enable = false;
+
+        /// Where the arcs come from - one switch for the whole layer.
+        ///   - true: the neon's. One emitter per @c NeonConfig::arcs entry,
+        ///     emitting from that arc, so an arc animation (Outline Tracer,
+        ///     Arc Wipe, ...) is what moves the emission and a dark neon arc
+        ///     emits nothing. Entry i of @c arcs configures neon arc i; a neon
+        ///     arc past the end of the list takes the LAST entry, so a single
+        ///     entry configures every neon arc alike. @c arcStart and
+        ///     @c arcLength are not read.
+        ///   - false: the layer's own. One emitter per @c arcs entry, each on
+        ///     its own @c arcStart / @c arcLength, whatever the neon's arcs
+        ///     are doing.
+        bool useNeonArc = true;
+
+        /// One entry per arc - see @c useNeonArc for how they pair up. Empty
+        /// emits nothing either way.
+        std::vector<ParticleArcConfig> arcs = {ParticleArcConfig{}};
+
+        /// Ceiling on the emitter count, whichever way the arcs come; entries
+        /// and neon arcs past it are ignored rather than rejected.
+        static constexpr int MAX_ARCS_CAP = MAX_ARCS;
+
+        bool operator==(const ParticleConfig &o) const
+        {
+            return enable == o.enable &&
+                   useNeonArc == o.useNeonArc &&
+                   arcs == o.arcs;
         }
         bool operator!=(const ParticleConfig &o) const { return !(*this == o); }
     } ParticleConfig;
@@ -1238,7 +1344,7 @@ namespace EdgeLighting
         DropletsConfig droplets;   ///< Rain-on-glass droplets settings
         LensFlareConfig lensFlare; ///< Sun + lens flare (rays, chromatic ghosts)
         SpotlightConfig spotlight; ///< Freely placed and aimed cones of light
-        ParticleConfig particle;   ///< Point-sprite sparks / motes emitted from the neon arcs
+        ParticleConfig particle;   ///< Point-sprite sparks / motes, from the neon's arcs or the layer's own
 
         bool operator==(const Config &o) const
         {
