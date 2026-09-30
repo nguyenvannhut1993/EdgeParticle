@@ -1,23 +1,33 @@
 precision highp float;
 
 in vec4  vColor; // premultiplied colour + coverage, latched at spawn
-in float vLife;
+in float vLife;  // fraction of life remaining: 1 at birth, 0 at death
 
 out vec4 fragColor;
 
-void main() {
-    // gl_PointCoord in [0, 1] across the point sprite. Recentre to [-0.5, 0.5]
-    // and use radial distance to shape a soft round mote.
-    vec2  uv = gl_PointCoord - vec2(0.5);
-    float d  = length(uv) * 2.0;         // 0 at centre, 1 at edge.
+// ---- Animation hook ---------------------------------------------------------
 
-    // Soft edge: full brightness inside 60% radius, smoothly fades to 0 at rim.
+// How opaque the sprite is at `pointCoord` (gl_PointCoord, [0, 1] across the
+// point) with `life` left. A twinkle, another sprite shape or another fade
+// over life goes here - see "Adding a particle animation" in
+// particle-renderer.h.
+float moteAlpha(vec2 pointCoord, float life) {
+    // Recentre to [-0.5, 0.5] and use radial distance to shape a soft round
+    // mote: full inside 60% of the radius, smoothly to 0 at the rim.
+    vec2  uv    = pointCoord - vec2(0.5);
+    float d     = length(uv) * 2.0; // 0 at centre, 1 at edge
     float shape = 1.0 - smoothstep(0.6, 1.0, d);
 
-    // Life fade in on the last 30% of the particle's life so newborns pop in
-    // softly rather than appearing at full size.
-    float birthFade = smoothstep(0.0, 0.15, vLife);
-    float alpha     = shape * vLife * birthFade;
+    // Fades out with the life that remains, and faster over its last 15%, so
+    // a mote thins away rather than blinking out at its end.
+    float endFade = smoothstep(0.0, 0.15, life);
+    return shape * life * endFade;
+}
+
+// -----------------------------------------------------------------------------
+
+void main() {
+    float alpha = moteAlpha(gl_PointCoord, vLife);
 
     // The latched colour is already premultiplied by its own coverage - the
     // neon pixel's alpha when the particle copied the drawn glow, 1 for the

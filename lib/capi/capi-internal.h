@@ -10,6 +10,7 @@
 #include "renderer/droplets-renderer.h"
 #include "renderer/lens-flare-renderer.h"
 #include "renderer/spotlight-renderer.h"
+#include "renderer/particle-renderer.h"
 #include "animation/neon-animations.h"
 #include "animation/field-bound-animation.h"
 #include "animation/modulator.h"
@@ -93,6 +94,9 @@ static_assert(static_cast<int>(EdgeLighting::SpotlightField::SPREAD_FALLOFF) == 
 
 static_assert(static_cast<int>(EdgeLighting::ClipMode::KEEP_INSIDE) == EL_CLIP_KEEP_INSIDE);
 static_assert(static_cast<int>(EdgeLighting::ClipMode::KEEP_OUTSIDE) == EL_CLIP_KEEP_OUTSIDE);
+
+static_assert(static_cast<int>(EdgeLighting::ParticleMode::MOVEMENT) == EL_PARTICLE_MODE_MOVEMENT);
+static_assert(static_cast<int>(EdgeLighting::ParticleMode::HEAD_SPARKS) == EL_PARTICLE_MODE_HEAD_SPARKS);
 
 static_assert(static_cast<int>(EdgeLighting::ColorStopField::POSITION) == EL_STOP_FIELD_POSITION);
 static_assert(static_cast<int>(EdgeLighting::ColorStopField::R) == EL_STOP_FIELD_R);

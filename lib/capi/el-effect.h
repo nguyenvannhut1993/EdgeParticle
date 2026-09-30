@@ -925,8 +925,8 @@ extern "C"
 
     /** @brief Initialise every renderer layer under the current GL context.
      *  @details Convenience wrapper for @ref el_effect_init_with_renderers with
-     *           @ref EL_RENDERER_ALL - registers the full stack (neon, debug,
-     *           droplets, lens flare).
+     *           @ref EL_RENDERER_ALL - registers the full stack (neon,
+     *           droplets, lens flare, spotlight, particles, debug).
      *  @returns @ref EL_ERROR_INIT_FAILED if a renderer fails to initialise
      *           (usually a shader compile / link error - see native log). */
     EL_API el_result_e el_effect_init(el_effect_handle_t effect);

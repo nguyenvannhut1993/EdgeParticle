@@ -2215,10 +2215,13 @@ el_result_e el_effect_init_with_renderers(el_effect_handle_t effect, uint32_t re
         // Compositing order is THIS sequence of ifs, and it matches the bit
         // order: content layers first on the low bits, the debug layer
         // last on the highest.
+        // Kept for the particles below, which copy the neon's drawn glow.
+        std::shared_ptr<EdgeLighting::NeonRenderer> neon;
         if (rendererMask & EL_RENDERER_NEON)
         {
             LOG_I("registering NeonRenderer");
-            effect->impl->AddRenderer(std::make_shared<EdgeLighting::NeonRenderer>());
+            neon = std::make_shared<EdgeLighting::NeonRenderer>();
+            effect->impl->AddRenderer(neon);
         }
         if (rendererMask & EL_RENDERER_DROPLETS)
         {
@@ -2234,6 +2237,17 @@ el_result_e el_effect_init_with_renderers(el_effect_handle_t effect, uint32_t re
         {
             LOG_I("registering SpotlightRenderer");
             effect->impl->AddRenderer(std::make_shared<EdgeLighting::SpotlightRenderer>());
+        }
+        // After every light layer, as in the C++ demo: newborn particles copy
+        // the neon's glow as drawn THIS frame, so they have to follow it. With
+        // no neon registered the source stays empty and they take the colour
+        // ring instead.
+        if (rendererMask & EL_RENDERER_PARTICLES)
+        {
+            LOG_I("registering ParticleManager");
+            auto particles = std::make_shared<EdgeLighting::ParticleManager>();
+            particles->SetNeonSource(neon);
+            effect->impl->AddRenderer(particles);
         }
         // LAST, so the annotations sit above every layer they describe -
         // after the neon whose glow the strip and markers measure, and

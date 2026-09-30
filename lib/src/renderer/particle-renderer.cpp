@@ -608,9 +608,9 @@ namespace EdgeLighting
                                      ShaderSource::PARTICLE_LATCH_FRAG_SRC,
                                      "ParticleManager.Latch");
 
-        // Ring records, one ParticleRecord (8 floats) per mote.
+        // Ring records, one ParticleRecord (9 floats) per mote.
         constexpr GLsizei stride = static_cast<GLsizei>(sizeof(ParticleRecord));
-        static_assert(sizeof(ParticleRecord) == 8 * sizeof(float), "ParticleRecord must stay tightly packed");
+        static_assert(sizeof(ParticleRecord) == 9 * sizeof(float), "ParticleRecord must stay tightly packed");
         // aPos0 (loc 0) and aVel0 (loc 1): 2 floats each.
         mRingArray.SetAttribPointer(0, 2, GL_FLOAT, stride, 0);
         mRingArray.SetAttribPointer(1, 2, GL_FLOAT, stride, 2 * sizeof(float));
@@ -619,6 +619,9 @@ namespace EdgeLighting
         mRingArray.SetAttribPointer(3, 1, GL_FLOAT, stride, 5 * sizeof(float));
         mRingArray.SetAttribPointer(4, 1, GL_FLOAT, stride, 6 * sizeof(float));
         mRingArray.SetAttribPointer(5, 1, GL_FLOAT, stride, 7 * sizeof(float));
+        // aSlot (loc 6): the record's own ring slot, so particle.vert finds
+        // its latch texel without gl_VertexID - see ParticleRecord::slot.
+        mRingArray.SetAttribPointer(6, 1, GL_FLOAT, stride, 8 * sizeof(float));
 
         // Latch points: aSlot (loc 0), aSpawnPos (loc 1), aColor (loc 2),
         // aFromNeon (loc 3).
@@ -782,7 +785,8 @@ namespace EdgeLighting
             }
             const size_t slot = blockStart + static_cast<size_t>(block.written % BLOCK_SLOTS);
             mRecordScratch.push_back({s.pos.x, s.pos.y, s.vel.x, s.vel.y,
-                                      s.spawnTime, s.lifetime, s.size, s.drag});
+                                      s.spawnTime, s.lifetime, s.size, s.drag,
+                                      static_cast<float>(slot)});
             mDeathTime[slot] = s.spawnTime + s.lifetime;
 
             const glm::vec4 color = p.useCustomColor ? p.customColor : glm::vec4(s.fallback, 1.0f);
@@ -860,9 +864,11 @@ namespace EdgeLighting
 
     void ParticleManager::drawWindows()
     {
-        // gl_VertexID of a glDrawArrays is `first` plus the index into the
-        // call, i.e. the ring slot - which is also the mote's latch texel.
-        // One bind for every block: the calls below share the vertex array.
+        // Each window is drawn from the slot it starts at, so `first` is
+        // rarely 0. The shader does not care: every record carries its own
+        // slot (aSlot) to find its latch texel, rather than inferring it from
+        // gl_VertexID - see ParticleRecord::slot. One bind for every block:
+        // the calls below share the vertex array.
         mRingArray.Bind();
         for (size_t k = 0; k < mBlocks.size(); ++k)
         {

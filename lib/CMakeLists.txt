@@ -139,6 +139,7 @@ add_library(edge-lighting-c SHARED
     capi/el-effect.cpp
     capi/el-animation.cpp
     capi/el-modulator.cpp
+    capi/el-particle.cpp
     capi/el-deprecated.cpp
 )
 

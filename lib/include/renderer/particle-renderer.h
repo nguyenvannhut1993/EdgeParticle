@@ -87,11 +87,37 @@ namespace EdgeLighting
     /// Append it to @ref ParticleMode, give it a spawn function here, and a
     /// case in @ref Emit that works out its rate and calls that function once
     /// per newborn. Two rules, because the manager is built on them:
-    ///   - motion is a launch velocity under drag, nothing else - the GPU
-    ///     evaluates that in closed form and cannot evaluate anything more;
+    ///   - a mote's whole life is a CLOSED FORM of its age, evaluated by the
+    ///     GPU from the record written at spawn - nothing is integrated or
+    ///     re-uploaded per frame. Today that is a launch velocity under drag;
+    ///     anything more is a particle animation, below;
     ///   - no mote may live longer than @c ParticleArcConfig::lifetime: the
     ///     arc's cap and its ring block are both sized on it being the
     ///     maximum.
+    ///
+    /// --- Adding a particle animation -----------------------------------------
+    ///
+    /// Anything a mote does over its life beyond flying under drag - gravity,
+    /// a wobble, a spiral, a size curve, a colour that changes with age, a
+    /// twinkle - goes in the hook functions particle.vert and particle.frag
+    /// set aside for it: motePosition, moteSize, moteColor and moteAlpha. Each
+    /// is a pure function of the mote's record and its age or remaining life.
+    /// The rest of those shaders - culling the dead, reading the colour latch
+    /// at aSlot - is not a hook, and an animation must leave it alone.
+    ///   - Data that differs per mote (an acceleration, a spin rate) is a new
+    ///     ParticleRecord field: written by the spawn function, declared as
+    ///     an attribute in ParticleManager's setupShaders, read as an `in` in
+    ///     particle.vert. ParticleRecord::slot is the pattern to copy.
+    ///   - Data shared by a whole arc is a uniform set just before that arc's
+    ///     draw in drawWindows, which draws each arc on its own - so it costs
+    ///     no memory per mote.
+    ///   - A random value per mote (a twinkle phase) is a hash of aSlot and
+    ///     aSpawnTime, computed in the shader - nothing to store.
+    ///   - A colour that changes with age starts from the latched colour
+    ///     moteColor is handed. The neon is never read again after spawn.
+    ///   - Both rules above still hold: position must follow from age alone
+    ///     (gravity under drag, a sine wobble and an orbit all have closed
+    ///     forms), and nothing outlives its arc's lifetime.
     class ParticleEmitter
     {
     public:
@@ -174,7 +200,8 @@ namespace EdgeLighting
     ///
     /// A mote's motion is an initial velocity under exponential drag, which
     /// has a closed form, so each one is written ONCE, at spawn - start
-    /// position and velocity, birth time, lifetime, size, drag, 32 bytes - and
+    /// position and velocity, birth time, lifetime, size, drag and its own
+    /// ring slot, 36 bytes - and
     /// particle.vert works out where it is, how big and how faded, from its
     /// age. Per frame the CPU spawns the newborns, uploads just their records
     /// and advances one index per arc past the dead; it never iterates, moves,
@@ -212,7 +239,8 @@ namespace EdgeLighting
     /// Each mote takes ONE colour, when it spawns, and keeps it until it dies:
     /// a texel of premultiplied colour + coverage in @c mColorLatch, at the
     /// mote's ring index, written by @ref renderLatchPass for the newborns of
-    /// the frame and read back by particle.vert through gl_VertexID. An arc
+    /// the frame and read back by particle.vert at the slot the mote's own
+    /// record carries (@c ParticleRecord::slot, not gl_VertexID). An arc
     /// with @c ParticleArcConfig::useCustomColor latches its own colour. Every
     /// other arc takes the neon's, from the source (@ref ParticleColorSource)
     /// picked per frame:
@@ -256,7 +284,10 @@ namespace EdgeLighting
         ParticleColorSource GetColorSource() const { return mColorSource; }
 
     private:
-        /// One mote in the GPU ring, written once at spawn: 8 floats, 32 bytes.
+        /// One mote in the GPU ring, written once at spawn: 9 floats, 36 bytes.
+        /// Every field reaches particle.vert as an attribute of the same
+        /// name - see "Adding a particle animation" on ParticleEmitter for
+        /// adding one.
         typedef struct ParticleRecord
         {
             float posX, posY;   ///< Position at spawnTime, rect-local px.
@@ -265,6 +296,16 @@ namespace EdgeLighting
             float lifetime;     ///< Seconds.
             float size;         ///< Point size at birth, px.
             float drag;         ///< Exponential drag, 1/s.
+            /// The record's own ring slot, which is also its colour-latch
+            /// texel - an exact integer. Carried here rather than taken from
+            /// gl_VertexID: the draws start mid-ring (a block's window, so
+            /// `first` != 0), and while the spec makes gl_VertexID first + k
+            /// there, it is a value the driver generates, and this would be
+            /// the only draw in the library leaning on it. An attribute is
+            /// fetched at first + k by the definition of glDrawArrays itself -
+            /// the path every mesh drawn from an offset depends on. 4 bytes a
+            /// slot.
+            float slot;
         } ParticleRecord;
 
         /// One arc's block of the ring: slots [k x MAX_PARTICLES_CAP,
