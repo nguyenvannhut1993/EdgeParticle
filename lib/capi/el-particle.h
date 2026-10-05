@@ -20,25 +20,39 @@ extern "C"
      * @ref el_effect_init_with_renderers when the mask carries
      * @ref EL_RENDERER_PARTICLES) and starts switched off.
      *
-     * It keeps a LIST of @ref el_particle_config_t, one per arc, written two
-     * ways:
-     *   - @ref el_effect_set_particle_config, no index: ONE config for the
-     *     whole layer - the list becomes exactly that config. With neon arcs
-     *     it drives every neon arc.
-     *   - @ref el_effect_set_particle_arc_config, by index: one arc's own
-     *     config.
+     * Every arc has settings of its own (@c EdgeLighting::ParticleArcConfig),
+     * written and read one field at a time: el_particle_set_<field>(effect,
+     * index, value) / el_particle_get_<field>(effect, index, &value). No
+     * struct crosses the ABI.
      *
-     * How many arcs the layer emits from, and where they are, depends on one
-     * switch, @ref el_effect_set_particle_use_neon_arc:
-     *   - on (the default): the NEON's arcs. The arc count is the neon's own,
+     * Which indices exist depends on one switch,
+     * @ref el_particle_set_use_neon_arc:
+     *   - on (the default): one arc per NEON arc. The count is the neon's own,
      *     set with @ref el_effect_set_arc_count, and each arc is where
-     *     @ref el_effect_set_arc puts it. Config i drives neon arc i; a neon
-     *     arc past the end of the list takes the LAST config - which is why a
-     *     single config drives every neon arc.
-     *   - off: the layer's OWN arcs. The arc count is the length of the list,
-     *     set with @ref el_effect_set_particle_arc_count - or grown by writing
-     *     a config at a new index - and each arc sits at its own config's
-     *     arcStart / arcLength.
+     *     @ref el_effect_set_arc puts it. @ref el_particle_set_arc_count is
+     *     refused - the count is not the layer's to set.
+     *   - off: the layer's OWN arcs. The count is set with
+     *     @ref el_particle_set_arc_count, and each arc sits at its own
+     *     arc_start / arc_length.
+     * Either way @ref el_particle_get_arc_count returns it, capped at 8, and
+     * an index from 0 to that count minus 1 is valid; any other is refused
+     * with @ref EL_ERROR_INVALID_PARAMETER. The range is checked against the
+     * staging config at the time of the call, so set the neon's arc count and
+     * the switch BEFORE writing the arcs' fields.
+     *
+     * Each index is one arc: writing a field on arc i changes arc i alone. A
+     * new effect has one arc either way (the neon starts with one arc, the
+     * layer with one), on the library's defaults, so index 0 is writable at
+     * once.
+     *
+     * With neon arcs, the layer holds settings for as many arcs as it has
+     * been written for, and a neon arc past them - one the neon has just
+     * gained - shows the LAST one's; the getters return exactly that. The
+     * first write after the neon gains arcs gives each of them a copy of
+     * those settings, so nothing changes on screen but the field written. The
+     * one exception is a layer whose own arc count was set to 0 before
+     * switching to neon arcs: it emits nothing, and reads as the defaults,
+     * until a field is written.
      *
      * Like every other setter, these write the effect's staging config: the
      * next @ref el_effect_update hands it to the renderer. A setter handed the
@@ -54,94 +68,144 @@ extern "C"
         EL_PARTICLE_MODE_HEAD_SPARKS = 1 /**< Sparks shot from the arc's leading edge. */
     } el_particle_mode_e;
 
-    /** @brief One arc's particle settings - @c EdgeLighting::ParticleArcConfig
-     *         across the ABI.
-     *  @details 20 fields of 4 bytes each, 80 bytes, no padding: a C# host
-     *           declares the same fields in the same order with
-     *           [StructLayout(LayoutKind.Sequential)] - see
-     *           lib/capi/csharp/ElParticle.cs. Start from
-     *           @ref el_particle_config_init rather than from zeros: an
-     *           all-zero struct is lifetime 0, which emits nothing. */
-    typedef struct el_particle_config_t
-    {
-        el_bool_t enable;         /**<  0: this arc's emitter. Off clears the arc's motes at once. */
-        float arcStart;           /**<  4: own arc's tail, perimeter position in [0, 1). Read only while useNeonArc is off. */
-        float arcLength;          /**<  8: own arc's length, perimeter fraction. Read only while useNeonArc is off. */
-        el_bool_t useCustomColor; /**< 12: paint every mote customColor instead of taking the neon's colour. */
-        float customColorR;       /**< 16: straight (not premultiplied) RGBA, read only with useCustomColor. */
-        float customColorG;       /**< 20 */
-        float customColorB;       /**< 24 */
-        float customColorA;       /**< 28: the motes' opacity. */
-        int32_t mode;             /**< 32: an el_particle_mode_e, as a fixed-width int. */
-        float emissionRate;       /**< 36: MOVEMENT: density, arc px x 2 x this / 100 motes/s. HEAD_SPARKS: sparks/s. */
-        float lifetime;           /**< 40: seconds - the longest any mote of this arc lives. */
-        float speed;              /**< 44: MOVEMENT: drift multiplier. HEAD_SPARKS: launch speed, px/s. */
-        float drag;               /**< 48: exponential drag, 1/s. */
-        float sizeStart;          /**< 52: point size at birth, px. */
-        int32_t maxParticles;     /**< 56: live motes this arc may hold; the renderer clamps it to 4096. */
-        float headBias;           /**< 60: MOVEMENT: spawn skew, below 1 toward the head, above 1 toward the tail. */
-        float scatterRadius;      /**< 64: how far from the line a mote may be born, px. */
-        float tailSizeFraction;   /**< 68: MOVEMENT: size at the tail as a fraction of sizeStart. */
-        float spreadDeg;          /**< 72: HEAD_SPARKS: full cone angle, degrees. */
-        float outwardBias;        /**< 76: HEAD_SPARKS: 0 = along the sweep, 1 = straight out of the rect. */
-    } el_particle_config_t;
-
-    /** @name Particles
+    /** @name Particles - the layer
      *  @{ */
-
-    /** @brief Fill @p config with the library's defaults
-     *         (@c EdgeLighting::ParticleArcConfig{}), to edit from. */
-    EL_API el_result_e el_particle_config_init(el_particle_config_t *config);
 
     /** @brief Switch the particle layer on or off.
      *  @details Off stops it outright: every mote is cleared and the layer
      *           gives its memory back; switched on again it starts from
      *           nothing. Default off. */
-    EL_API el_result_e el_effect_set_particle_renderer_enabled(el_effect_handle_t effect, el_bool_t enabled);
-    EL_API el_result_e el_effect_get_particle_renderer_enabled(el_effect_handle_t effect, el_bool_t *outEnabled);
+    EL_API el_result_e el_particle_set_renderer_enabled(el_effect_handle_t effect, el_bool_t enabled);
+    EL_API el_result_e el_particle_get_renderer_enabled(el_effect_handle_t effect, el_bool_t *outEnabled);
 
     /** @brief Emit from the neon's arcs (non-zero, the default) or from the
-     *         layer's own (zero) - see the section note for where the arc
-     *         count comes from in each case. */
-    EL_API el_result_e el_effect_set_particle_use_neon_arc(el_effect_handle_t effect, el_bool_t useNeonArc);
-    EL_API el_result_e el_effect_get_particle_use_neon_arc(el_effect_handle_t effect, el_bool_t *outUseNeonArc);
+     *         layer's own (zero) - see the section note for what that does to
+     *         the arc count. */
+    EL_API el_result_e el_particle_set_use_neon_arc(el_effect_handle_t effect, el_bool_t useNeonArc);
+    EL_API el_result_e el_particle_get_use_neon_arc(el_effect_handle_t effect, el_bool_t *outUseNeonArc);
 
-    /** @brief ONE config for the whole layer: the list becomes exactly
-     *         @p config, dropping any per-arc configs.
-     *  @details With neon arcs it drives every neon arc, however many there
-     *           are. With own arcs the layer has one arc, at the config's
-     *           arcStart / arcLength. A mode outside @ref el_particle_mode_e is
-     *           refused. */
-    EL_API el_result_e el_effect_set_particle_config(el_effect_handle_t effect,
-                                                     const el_particle_config_t *config);
-
-    /** @brief Read the first config back - the one
-     *         @ref el_effect_set_particle_config wrote. */
-    EL_API el_result_e el_effect_get_particle_config(el_effect_handle_t effect, el_particle_config_t *outConfig);
-
-    /** @brief Write arc @p index's own config, 0 to 7.
-     *  @details An index past the end grows the list to it, the new configs
-     *           being copies of the last one - with neon arcs the picture does
-     *           not change until that index is written; with own arcs that is
-     *           how an arc is added. Any other index, or a mode outside
-     *           @ref el_particle_mode_e, is refused. */
-    EL_API el_result_e el_effect_set_particle_arc_config(el_effect_handle_t effect, int32_t index,
-                                                         const el_particle_config_t *config);
-
-    /** @brief Read arc @p index's config back from the staging config. */
-    EL_API el_result_e el_effect_get_particle_arc_config(el_effect_handle_t effect, int32_t index,
-                                                         el_particle_config_t *outConfig);
-
-    /** @brief Set how many arc configs the layer holds, 0 to 8.
-     *  @details With own arcs (useNeonArc off) this IS the number of arcs the
-     *           layer emits from. With neon arcs the arc count is the neon's
-     *           (@ref el_effect_set_arc_count) and this is only how many of
-     *           them have a config of their own.
+    /** @brief Set how many OWN arcs the layer emits from, 0 to 8.
+     *  @details Own arcs only (use_neon_arc off): with neon arcs the count is
+     *           the neon's (@ref el_effect_set_arc_count) and this is refused.
      *
-     *           Growing copies the last config (the defaults when the list is
-     *           empty); shrinking drops configs from the end. */
-    EL_API el_result_e el_effect_set_particle_arc_count(el_effect_handle_t effect, int32_t count);
-    EL_API el_result_e el_effect_get_particle_arc_count(el_effect_handle_t effect, int32_t *outCount);
+     *           Growing adds copies of the last arc (the defaults when there
+     *           is none), so a new arc starts on top of it - move it with
+     *           @ref el_particle_set_arc_start. Shrinking drops arcs from the
+     *           end. */
+    EL_API el_result_e el_particle_set_arc_count(el_effect_handle_t effect, int32_t count);
+
+    /** @brief How many arcs the layer emits from - the number of valid
+     *         indices: the neon's arc count with neon arcs, the own arc count
+     *         without, capped at 8 either way. */
+    EL_API el_result_e el_particle_get_arc_count(el_effect_handle_t effect, int32_t *outCount);
+
+    /** @brief Put arc @p index back on the library's defaults
+     *         (@c EdgeLighting::ParticleArcConfig{}), every field at once. */
+    EL_API el_result_e el_particle_reset_arc(el_effect_handle_t effect, int32_t index);
+
+    /** @} */
+
+    /** @name Particles - one arc's fields
+     *  Every call takes the arc's @p index, 0 to
+     *  @ref el_particle_get_arc_count minus 1.
+     *  @{ */
+
+    /** @brief This arc's emitter. Off clears the arc's motes at once.
+     *         Default on. */
+    EL_API el_result_e el_particle_set_enabled(el_effect_handle_t effect, int32_t index, el_bool_t enabled);
+    EL_API el_result_e el_particle_get_enabled(el_effect_handle_t effect, int32_t index, el_bool_t *outEnabled);
+
+    /** @brief Own arc's tail, a perimeter position in [0, 1). Default 0.
+     *  @details Read only while use_neon_arc is off. */
+    EL_API el_result_e el_particle_set_arc_start(el_effect_handle_t effect, int32_t index, float arcStart);
+    EL_API el_result_e el_particle_get_arc_start(el_effect_handle_t effect, int32_t index, float *outArcStart);
+
+    /** @brief Own arc's length, a perimeter fraction. Default 0.25.
+     *  @details Read only while use_neon_arc is off. At or below 0.001 the
+     *           arc emits nothing. */
+    EL_API el_result_e el_particle_set_arc_length(el_effect_handle_t effect, int32_t index, float arcLength);
+    EL_API el_result_e el_particle_get_arc_length(el_effect_handle_t effect, int32_t index, float *outArcLength);
+
+    /** @brief Paint every mote of this arc the custom colour instead of
+     *         taking the neon's. Default off. */
+    EL_API el_result_e el_particle_set_use_custom_color(el_effect_handle_t effect, int32_t index,
+                                                        el_bool_t useCustomColor);
+    EL_API el_result_e el_particle_get_use_custom_color(el_effect_handle_t effect, int32_t index,
+                                                        el_bool_t *outUseCustomColor);
+
+    /** @brief The custom colour, straight (not premultiplied) RGBA; @p a is
+     *         the motes' opacity. Default (1, 1, 1, 1).
+     *  @details Read only with use_custom_color on. */
+    EL_API el_result_e el_particle_set_custom_color(el_effect_handle_t effect, int32_t index,
+                                                    float r, float g, float b, float a);
+    EL_API el_result_e el_particle_get_custom_color(el_effect_handle_t effect, int32_t index,
+                                                    float *outR, float *outG, float *outB, float *outA);
+
+    /** @brief How this arc's emitter spawns. Default
+     *         @ref EL_PARTICLE_MODE_MOVEMENT.
+     *  @details A value outside @ref el_particle_mode_e is refused. */
+    EL_API el_result_e el_particle_set_mode(el_effect_handle_t effect, int32_t index, el_particle_mode_e mode);
+    EL_API el_result_e el_particle_get_mode(el_effect_handle_t effect, int32_t index, el_particle_mode_e *outMode);
+
+    /** @brief MOVEMENT: spawn density - the arc spawns arc px x 2 x this / 100
+     *         motes per second. HEAD_SPARKS: sparks per second. Default 400. */
+    EL_API el_result_e el_particle_set_emission_rate(el_effect_handle_t effect, int32_t index, float emissionRate);
+    EL_API el_result_e el_particle_get_emission_rate(el_effect_handle_t effect, int32_t index,
+                                                     float *outEmissionRate);
+
+    /** @brief Seconds - the longest any mote of this arc lives. Default 0.7. */
+    EL_API el_result_e el_particle_set_lifetime(el_effect_handle_t effect, int32_t index, float lifetime);
+    EL_API el_result_e el_particle_get_lifetime(el_effect_handle_t effect, int32_t index, float *outLifetime);
+
+    /** @brief MOVEMENT: drift multiplier. HEAD_SPARKS: launch speed, px/s.
+     *         Default 90. */
+    EL_API el_result_e el_particle_set_speed(el_effect_handle_t effect, int32_t index, float speed);
+    EL_API el_result_e el_particle_get_speed(el_effect_handle_t effect, int32_t index, float *outSpeed);
+
+    /** @brief Exponential drag, 1/s - larger slows the motes down faster.
+     *         Default 2.5. */
+    EL_API el_result_e el_particle_set_drag(el_effect_handle_t effect, int32_t index, float drag);
+    EL_API el_result_e el_particle_get_drag(el_effect_handle_t effect, int32_t index, float *outDrag);
+
+    /** @brief Point size at birth, px; shrinks with the remaining life.
+     *         Default 7. */
+    EL_API el_result_e el_particle_set_size_start(el_effect_handle_t effect, int32_t index, float sizeStart);
+    EL_API el_result_e el_particle_get_size_start(el_effect_handle_t effect, int32_t index, float *outSizeStart);
+
+    /** @brief Live motes this arc may hold; the renderer clamps it to 4096.
+     *         Default 4096. */
+    EL_API el_result_e el_particle_set_max_particles(el_effect_handle_t effect, int32_t index,
+                                                     int32_t maxParticles);
+    EL_API el_result_e el_particle_get_max_particles(el_effect_handle_t effect, int32_t index,
+                                                     int32_t *outMaxParticles);
+
+    /** @brief MOVEMENT: spawn skew along the arc - below 1 toward the head,
+     *         above 1 toward the tail. Default 1. */
+    EL_API el_result_e el_particle_set_head_bias(el_effect_handle_t effect, int32_t index, float headBias);
+    EL_API el_result_e el_particle_get_head_bias(el_effect_handle_t effect, int32_t index, float *outHeadBias);
+
+    /** @brief How far from the line a mote may be born, px. Default 20. */
+    EL_API el_result_e el_particle_set_scatter_radius(el_effect_handle_t effect, int32_t index,
+                                                      float scatterRadius);
+    EL_API el_result_e el_particle_get_scatter_radius(el_effect_handle_t effect, int32_t index,
+                                                      float *outScatterRadius);
+
+    /** @brief MOVEMENT: size at the tail as a fraction of size_start.
+     *         Default 1. */
+    EL_API el_result_e el_particle_set_tail_size_fraction(el_effect_handle_t effect, int32_t index,
+                                                          float tailSizeFraction);
+    EL_API el_result_e el_particle_get_tail_size_fraction(el_effect_handle_t effect, int32_t index,
+                                                          float *outTailSizeFraction);
+
+    /** @brief HEAD_SPARKS: full cone angle, degrees. Default 50. */
+    EL_API el_result_e el_particle_set_spread_deg(el_effect_handle_t effect, int32_t index, float spreadDeg);
+    EL_API el_result_e el_particle_get_spread_deg(el_effect_handle_t effect, int32_t index, float *outSpreadDeg);
+
+    /** @brief HEAD_SPARKS: launch direction, 0 = along the sweep, 1 = straight
+     *         out of the rect. Default 0.6. */
+    EL_API el_result_e el_particle_set_outward_bias(el_effect_handle_t effect, int32_t index, float outwardBias);
+    EL_API el_result_e el_particle_get_outward_bias(el_effect_handle_t effect, int32_t index,
+                                                    float *outOutwardBias);
 
     /** @} */
 

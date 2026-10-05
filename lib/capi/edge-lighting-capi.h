@@ -6,8 +6,7 @@
  *
  * This header is the only interop surface between native EdgeLighting and
  * managed callers (P/Invoke, ctypes, cgo, ...). Every symbol has C linkage,
- * uses only fixed-width scalar types + opaque pointers - plus one plain struct
- * of them, @ref el_particle_config_t - and never leaks a
+ * uses only fixed-width scalar types + opaque pointers, and never leaks a
  * C++ exception - anything thrown at the boundary is caught and mapped to
  * @ref EL_ERROR_OUT_OF_MEMORY (on @c std::bad_alloc) or @ref EL_ERROR_INVALID_PARAMETER (on other C++ exceptions). Higher-level C++ features (RAII wrappers,
  * @c std::vector, @c glm) are hidden behind opaque handles.
