@@ -27,7 +27,6 @@ namespace EdgeLightingDemo
         std::cout << "  [SHIFT+O]      - Toggle Neon Resolution (full / half)\n";
         std::cout << "  [G]            - Toggle Wireframe Bounding Box\n";
         std::cout << "  [D]            - Toggle Water Droplets Pane\n";
-        std::cout << "  [K]            - Toggle Particles\n";
         std::cout << "  [W]            - Toggle Winding (CW / CCW)\n";
         std::cout << "  [SPACE]        - Pause / Resume Animation\n";
         std::cout << "  [ESC]          - Exit\n";
@@ -122,7 +121,7 @@ namespace EdgeLightingDemo
     /// reporting, and print the fields that actually decide the pixels.
     ///
     /// Covers every registered renderer - neon, droplets, lens flare,
-    /// spotlight, particles, debug - in registration order, enabled or not. A disabled
+    /// spotlight, debug - in registration order, enabled or not. A disabled
     /// layer still prints in full: the dump's job is to let someone rebuild
     /// the whole state, and "what was the flare set to before I turned it off"
     /// is exactly the question it gets asked.
@@ -137,11 +136,13 @@ namespace EdgeLightingDemo
     /// because none of them is visible in the sub-config a reader would go
     /// looking in: the droplet band takes its SIDE from NeonConfig::glowSide,
     /// the flare's perimeter fraction runs along the OFFSET rect rather than
-    /// the perimeter printed at the top, and an enabled clipped lamp holds
-    /// SpotlightConfig::resolutionScale at 1.0 whatever the field says.
+    /// the perimeter printed at the top, and an enabled clipped or
+    /// shadow-casting lamp holds SpotlightConfig::resolutionScale at 1.0
+    /// whatever the field says.
     ///
     /// Every position printed here is in APP coordinates (origin top-left, +y
-    /// down) - the rect, the sun, the lamps and the clip area alike.
+    /// down) - the rect, the sun, the lamps, the clip area and the shadow
+    /// caster alike.
     inline void PrintFullConfig(const EdgeLighting::Config &config, bool isPlaying)
     {
         using namespace EdgeLighting;
@@ -207,14 +208,25 @@ namespace EdgeLightingDemo
         if (n.opaqueMode != OpaqueMode::NONE)
         {
             std::cout << ", colour (" << n.opaqueColor.r << ", " << n.opaqueColor.g
-                      << ", " << n.opaqueColor.b << ", " << n.opaqueColor.a << ")"
-                      << ", softness " << n.opaqueSoftness << " px";
+                      << ", " << n.opaqueColor.b << ", " << n.opaqueColor.a << ")";
             if (config.debug.opaqueOnly)
             {
                 std::cout << ", OPAQUE ONLY (neon emission suppressed)";
             }
         }
         std::cout << "\n";
+        // The fill's own pair, printed only for the sides the mode fills - the
+        // other side is not read, so listing it would describe nothing.
+        if (n.opaqueMode == OpaqueMode::INSIDE || n.opaqueMode == OpaqueMode::BOTH)
+        {
+            std::cout << "  opaqueInsideCut  " << Detail::CutoffStr(n.opaqueInsideCutoff, buf, sizeof buf)
+                      << "\n";
+        }
+        if (n.opaqueMode == OpaqueMode::OUTSIDE || n.opaqueMode == OpaqueMode::BOTH)
+        {
+            std::cout << "  opaqueOutsideCut " << Detail::CutoffStr(n.opaqueOutsideCutoff, buf, sizeof buf)
+                      << "\n";
+        }
 
         std::cout << "\n  colorStops (" << n.colorStops.size() << ")\n";
         for (size_t i = 0; i < n.colorStops.size(); ++i)
@@ -345,16 +357,17 @@ namespace EdgeLightingDemo
         const char *clipItems[] = {"KEEP_INSIDE", "KEEP_OUTSIDE"};
         size_t drawnLamps = std::min(sp.lamps.size(), static_cast<size_t>(SPOT_MAX_LAMPS));
 
-        // Mirrors SpotlightRenderer's HasClippedLamp: the lamps that DRAW,
-        // within the ceiling. One of these holds resolutionScale at 1.0.
+        // Mirrors SpotlightRenderer's HasMaskedLamp: the lamps that DRAW,
+        // within the ceiling. Either kind holds resolutionScale at 1.0.
         bool anyClippedLamp = false;
+        bool anyShadowLamp = false;
         for (size_t i = 0; i < drawnLamps; ++i)
         {
             const auto &l = sp.lamps[i];
-            if (l.clipped && l.enable && l.intensity > 0.0f)
+            if (l.enable && l.intensity > 0.0f)
             {
-                anyClippedLamp = true;
-                break;
+                anyClippedLamp = anyClippedLamp || l.clipped;
+                anyShadowLamp = anyShadowLamp || l.castsShadow;
             }
         }
         // A zero-size KEEP_INSIDE area keeps nothing, and ClipArea has no
@@ -375,9 +388,9 @@ namespace EdgeLightingDemo
         std::cout << "  resolutionScale  " << std::setprecision(2) << sp.resolutionScale
                   << (sp.resolutionScale < 1.0f ? "   (scaled buffer + blit)"
                                                 : "   (full res, direct)");
-        if (sp.resolutionScale < 1.0f && anyClippedLamp)
+        if (sp.resolutionScale < 1.0f && (anyClippedLamp || anyShadowLamp))
         {
-            std::cout << "   [HELD AT 1.0: a clipped lamp is enabled]";
+            std::cout << "   [HELD AT 1.0: a clipped or shadow-casting lamp is enabled]";
         }
         std::cout << "\n";
 
@@ -394,6 +407,30 @@ namespace EdgeLightingDemo
         else if (clipBlanks)
         {
             std::cout << "                   [ZERO-SIZE KEEP_INSIDE: every clipped lamp draws nothing]\n";
+        }
+
+        const auto &sc = sp.shadowCaster;
+        std::cout << "  shadowCaster     " << std::setprecision(0)
+                  << sc.width << " x " << sc.height
+                  << " at (" << sc.position.x << ", " << sc.position.y << ")"
+                  << ", corner " << sc.cornerRadius
+                  << ", off wall " << sc.wallDistance << " px"
+                  << ", soft " << std::setprecision(1) << sc.softness << " px"
+                  << ", opacity " << std::setprecision(2) << sc.opacity
+                  << ", fill " << sc.fill
+                  << (sc.fill > 0.0f ? " (washed out by other lamps - two passes)" : " (physical)") << "\n";
+        std::cout << "                   " << (sc.solid ? "SOLID block" : "panel")
+                  << ", frame " << std::setprecision(0) << sc.frameWidth << " px wide, picture "
+                  << sc.frameDepth << " px behind the rails"
+                  << ((sc.frameWidth > 0.0f && sc.frameDepth > 0.0f) ? " (rails shade the picture)" : " (no rail shadow)")
+                  << "\n";
+        if (!anyShadowLamp)
+        {
+            std::cout << "                   [inert: no drawn lamp has castsShadow set]\n";
+        }
+        else if (sc.width <= 0.0f || sc.height <= 0.0f || sc.wallDistance <= 0.0f || sc.opacity <= 0.0f)
+        {
+            std::cout << "                   [casts nothing: zero size, flush with the wall, or transparent]\n";
         }
 
         std::cout << "\n  lamps (" << sp.lamps.size() << ")\n";
@@ -447,97 +484,16 @@ namespace EdgeLightingDemo
             {
                 std::cout << "   [zero-size KEEP_INSIDE: draws nothing]";
             }
+            std::cout << "  shadow " << (l.castsShadow ? "ON" : "OFF")
+                      << "  off wall " << std::setprecision(0) << l.wallDistance << " px";
+            if (l.castsShadow && l.wallDistance <= sc.wallDistance)
+            {
+                // A panel drops such a lamp; a solid block makes it the
+                // grazing case, whose shadow never ends.
+                std::cout << (sc.solid ? "   [grazing a solid caster: its shadow never ends]"
+                                       : "   [not in front of the caster: casts nothing]");
+            }
             std::cout << "\n";
-        }
-
-        // -------------------------------------------------------------------
-        // Particles. One emitter per arc - the neon's or the layer's own, per
-        // useNeonArc - each with its own settings, so every arc is spelled
-        // out, rate and all.
-        // -------------------------------------------------------------------
-        const auto &pt = config.particle;
-        const size_t arcCount = pt.useNeonArc ? config.neon.arcs.size() : pt.arcs.size();
-        const size_t emitters = pt.arcs.empty()
-                                    ? 0
-                                    : std::min(arcCount, static_cast<size_t>(ParticleConfig::MAX_ARCS_CAP));
-        const char *modeItems[] = {"MOVEMENT", "HEAD_SPARKS"};
-
-        std::cout << "\nParticles  " << (pt.enable ? "ON" : "OFF")
-                  << "   arcs from " << (pt.useNeonArc ? "the NEON (useNeonArc)" : "their OWN arcStart / arcLength")
-                  << "   (" << emitters << " emitter(s), ring "
-                  << emitters * ParticleArcConfig::MAX_PARTICLES_CAP << " motes)\n";
-        for (size_t i = 0; i < emitters; ++i)
-        {
-            // Mirrors ParticleManager::Render: a neon arc past the end of the
-            // list takes the last entry.
-            const size_t entry = std::min(i, pt.arcs.size() - 1);
-            const auto &p = pt.arcs[entry];
-            float start = p.arcStart;
-            float length = p.arcLength;
-            bool lit = length > 0.001f;
-            if (pt.useNeonArc)
-            {
-                const auto &a = config.neon.arcs[i];
-                start = a.start;
-                length = a.length;
-                lit = a.length > 0.001f && a.intensity > 0.0f;
-            }
-
-            std::cout << "  arc [" << i << "]";
-            if (entry != i)
-            {
-                std::cout << " (settings of [" << entry << "])";
-            }
-            std::cout << "  " << modeItems[static_cast<int>(p.mode)]
-                      << "  start " << std::setprecision(3) << start << ", length " << length;
-            if (!p.enable || !lit)
-            {
-                std::cout << "   " << (p.enable ? "dark" : "disabled") << ": emits nothing\n";
-                continue;
-            }
-
-            // Mirrors ParticleEmitter::Emit, clamp included.
-            const bool pointSource = p.mode == ParticleMode::HEAD_SPARKS;
-            const int cap = std::clamp(p.maxParticles, 0, ParticleArcConfig::MAX_PARTICLES_CAP);
-            const float rateCap = p.lifetime > 0.0f ? static_cast<float>(cap) / p.lifetime : 0.0f;
-            const float arcPx = length * peri;
-            const float rate = pointSource ? p.emissionRate : arcPx * 2.0f * p.emissionRate / 100.0f;
-            std::cout << "   " << std::setprecision(1) << arcPx << " px -> "
-                      << std::min(rate, rateCap) << " motes/s"
-                      << (rate > rateCap ? "   [clamped by maxParticles]" : "") << "\n";
-
-            std::cout << "    emissionRate     " << std::setprecision(1) << p.emissionRate
-                      << (pointSource ? "   (sparks/s)\n" : "   (arc px x 2 x this / 100 motes/s)\n");
-            std::cout << "    lifetime         " << std::setprecision(2) << p.lifetime << " s"
-                      << "   (the longest any mote lives)\n";
-            std::cout << "    speed            " << std::setprecision(1) << p.speed
-                      << (pointSource ? "   (px/s)" : "   (drift multiplier, not px/s)")
-                      << ", drag " << std::setprecision(2) << p.drag << " /s\n";
-            std::cout << "    sizeStart        " << std::setprecision(1) << p.sizeStart << " px"
-                      << ", maxParticles " << p.maxParticles << "\n";
-            std::cout << "    scatterRadius    " << std::setprecision(1) << p.scatterRadius << " px\n";
-            if (pointSource)
-            {
-                std::cout << "    spreadDeg        " << std::setprecision(1) << p.spreadDeg << " deg"
-                          << ", outwardBias " << std::setprecision(2) << p.outwardBias
-                          << "   (0 = along the sweep, 1 = straight out)\n";
-            }
-            else
-            {
-                std::cout << "    headBias         " << std::setprecision(2) << p.headBias
-                          << "   (<1 crowds the head, >1 the tail)\n";
-                std::cout << "    tailSizeFraction " << std::setprecision(2) << p.tailSizeFraction << "\n";
-            }
-            std::cout << "    colour           ";
-            if (p.useCustomColor)
-            {
-                std::cout << "custom (" << std::setprecision(2) << p.customColor.r << ", " << p.customColor.g
-                          << ", " << p.customColor.b << ", " << p.customColor.a << ")\n";
-            }
-            else
-            {
-                std::cout << "the neon's (drawn glow below Res Scale 1, else the colour ring)\n";
-            }
         }
 
         const auto &d = config.debug;

@@ -47,6 +47,16 @@ layout(location = 5) in float aClipWeight; ///< 1 where this lamp honours the cl
 /// Exponent on the cone's spread term - SpotLight::spreadFalloff, clamped.
 /// Its own attribute because aP0 and aP1 are full; see StripVertex.
 layout(location = 6) in float aSpreadFalloff;
+/// The shadow, per lamp: lamp position in app px (xy), the caster-to-lamp
+/// wall-distance ratio t (z), and the penumbra's half width on the caster's
+/// plane (w). See spotShadowMask in spotlight.frag.
+layout(location = 7) in vec4 aShadow;
+/// A WEIGHT, like aClipWeight: ShadowCaster::opacity for a lamp that casts a
+/// shadow, 0 for one that does not.
+layout(location = 8) in float aShadowWeight;
+/// The frame's rails over the recessed picture, per lamp: t_in and the
+/// penumbra half width at the rails' front. See spotShadowMask.
+layout(location = 9) in vec2 aRecess;
 
 out vec2 vLocal;
 out vec2 vApp;
@@ -55,6 +65,9 @@ flat out vec4 vP1;
 flat out vec3 vColor;
 flat out float vClipWeight;
 flat out float vSpreadFalloff;
+flat out vec4 vShadow;
+flat out float vShadowWeight;
+flat out vec2 vRecess;
 
 uniform mat4 uMVP;
 
@@ -66,5 +79,8 @@ void main() {
     vColor = aColor;
     vClipWeight = aClipWeight;
     vSpreadFalloff = aSpreadFalloff;
+    vShadow = aShadow;
+    vShadowWeight = aShadowWeight;
+    vRecess = aRecess;
     gl_Position = uMVP * vec4(aPos, 0.0, 1.0);
 }

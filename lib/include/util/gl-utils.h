@@ -45,6 +45,23 @@ namespace EdgeLighting
             return false;
         }
 
+        /// @p src with `#define @p define` spliced in after its first line.
+        ///
+        /// How one shader file yields several programs. Every embedded source
+        /// starts with the @GLSL_VERSION@ line, which must stay first, so the
+        /// define goes immediately after it - ahead of everything else, any
+        /// injected tuning header or shared chunk included. Used for neon.frag's
+        /// NEON_READS_GATHER variant (NeonRenderer::ensurePathPrograms) and
+        /// spotlight.frag's SPOT_FILL variant.
+        inline std::string WithDefine(const char *src, const char *define)
+        {
+            std::string out(src);
+            const size_t eol = out.find('\n');
+            out.insert(eol == std::string::npos ? out.size() : eol + 1,
+                       std::string("#define ") + define + "\n");
+            return out;
+        }
+
         /// Log all available extensions (optionally filtered by substring match).
         /// Pass an empty string to log every extension.
         inline void LogExtensions(const char *filter = "")

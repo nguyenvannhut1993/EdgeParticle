@@ -17,6 +17,13 @@
 //     SPOT_NEAR_FADE, SPOT_BLOOM_WINDOW_INNER   shader only - they shape terms
 //                                               the CPU only has to bound, and
 //                                               it bounds them conservatively.
+//     SPOT_SOLID_SEARCH_STEPS                   shader only - a solid caster
+//                                               only removes light, like the
+//                                               panel.
+//     SPOT_FILL_FULL_RATIO                      shader only - the fill only
+//                                               ever restores light the lamp
+//                                               had before its shadow, so it
+//                                               moves nothing the CPU bounds.
 //     SPOT_DITHER_STEPS                         shader only - it perturbs the
 //                                               output by less than one
 //                                               destination step, which is
@@ -145,7 +152,7 @@
 /// attributes rather than in a uniform block. Entries past it are ignored.
 ///
 /// Raising it costs one recompile and a larger (still small) buffer:
-/// SPOT_MAX_LAMPS * SPOT_STRIP_SEGMENTS * 6 * 68 bytes.
+/// SPOT_MAX_LAMPS * SPOT_STRIP_SEGMENTS * 6 * 88 bytes.
 #define SPOT_MAX_LAMPS            8
 
 /// Quads per lamp along the beam. The strip approximates a curved support with
@@ -245,8 +252,54 @@
 /// 0.15 flattens the emitter completely but starts eating the near beam (100 px
 /// out moves for the first time), which is why the value stops here.
 ///
-/// 1.0 disables the shoulder and restores per-channel clipping.
+/// PER LAMP. The shoulder sees one lamp's light and cannot see the others, so
+/// it bounds each lamp, not their sum: two crossing beams each held near 0.6
+/// would still add past full scale. What stops that is the renderer's blend,
+/// which SCREENS the lamps rather than adding them - see
+/// SpotlightRenderer::Render, and V12a in docs/review-findings.md for why the
+/// shoulder was not moved onto the sum instead.
+///
+/// 1.0 disables the shoulder and restores per-channel clipping of a lone lamp.
 #define SPOT_HIGHLIGHT_KNEE       0.30
+
+/// Where ShadowCaster::fill finishes washing a shadow out, as a ratio: the
+/// light the OTHER lamps put on a point in lamp A's shadow, over the light A
+/// itself would have put there. The fill's coverage lift is
+/// `fill * smoothstep(0, SPOT_FILL_FULL_RATIO, ratio)`, so at fill 1 the shadow
+/// is completely gone once the others reach this fraction of A.
+///
+/// 0.5, not 1.0, which is where it started. At 1.0 the shadow only vanished
+/// where the other lamps matched A, and that is not what "no shadow where the
+/// second lamp shines" means to a viewer: on the two-lamp scene this was
+/// tuned against, a point where lamp 2 gave ~45% of lamp 0's light kept more
+/// than half its shadow at fill 1 (34 -> 48 of an unshadowed 77). At 0.5 that
+/// point is filled (see docs/spotlight-renderer.md section 4.7). Lower still
+/// and a soft beam's gaussian tail - which reaches a long way - washes out
+/// shadows far outside where the beam reads as lit.
+///
+/// Shader only: the fill changes nothing the strip bound depends on, since it
+/// never raises a lamp above its own unshadowed light.
+#define SPOT_FILL_FULL_RATIO      0.5
+
+/// Golden-section iterations of the SOLID caster's search, each one a single
+/// rounded-box SDF evaluation (plus three outside the loop).
+///
+/// A solid caster shadows a wall point when the line to the lamp passes
+/// through the block anywhere along its depth, so the shader needs the
+/// minimum, along that line, of the caster's SDF over a penumbra window that
+/// grows with the distance travelled. That ratio is QUASICONVEX in the line
+/// parameter - the SDF of a convex shape is convex along any line, divided by
+/// a positive linear function - so it has one minimum and a golden-section
+/// search converges on it without false minima, in a fixed number of steps.
+///
+/// Each step shrinks the bracket to 0.618 of itself: 12 leave 0.3% of the
+/// segment, a few px on a long shadow, and the minimum is flat there, so the
+/// value read is far closer than that. Raise it if a long, soft solid shadow
+/// shows steps along its edge; every step is one more SDF for every fragment
+/// of every casting lamp.
+///
+/// Shader only.
+#define SPOT_SOLID_SEARCH_STEPS   12
 
 /// HALF an 8-bit step - the level below which a value quantises to zero,
 /// and therefore the budget the strip bound is solved against.

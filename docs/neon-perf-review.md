@@ -252,6 +252,26 @@ left to cut. It only becomes worth doing for rects much larger than twice the
 glow reach, and it would need an inner fade mirroring the existing
 `uQuadMargin` one or the hole's edge would show.
 
+**Since built, without the fade** (`GetGlowInnerReach` in
+`neon-renderer.cpp`; the full write-up, with figures, is
+[`glow-inner-reach.md`](glow-inner-reach.md)). Reported as "the neon is slow
+without cutoffs, even when a cutoff far past the visible glow makes it fast": on
+a screen-sized rect the interior is most of the frame, and an inside cutoff was
+the only thing that cut it. The fade turned out not to be needed: the hole is
+cut where an upper bound on everything the glow can still write there is under
+half an 8-bit level, so it changes no pixel. Glow-only frame, 1920 x 1080, a
+1840 x 1000 rect, AMD Radeon Pro 5300M, best of 2 interleaved rounds:
+
+| config | before | after | |
+| --- | ---: | ---: | ---: |
+| defaults (glowRadius 5) | 5.98 ms | 5.25 ms | 1.14x |
+| glowRadius 2 | 5.97 ms | 3.01 ms | 1.98x |
+| glowRadius 2, sharp corners | 5.04 ms | 2.29 ms | 2.20x |
+| glowRadius 2, `GlowSide::INSIDE` | 5.34 ms | 2.33 ms | 2.29x |
+| glowRadius 0 (filament only) | 5.41 ms | 0.49 ms | 11.04x |
+| glowRadius 2, scale 0.5 | 1.20 ms | 0.86 ms | 1.40x |
+| defaults on the 960 x 540 demo rect | 4.94 ms | 4.96 ms | 1.00x |
+
 ## 7. Method, and what not to trust
 
 The harness from `lens-flare-perf-review.md` section 8: a throwaway binary
@@ -309,11 +329,23 @@ three surprise:
   by then. Trimming a glow from 20 to 10 buys nothing at all; trimming 5 to 2
   buys 2x. Worth knowing before anyone tunes it for speed rather than for looks.
 
+**The `resolutionScale` row predates two changes, and its shape no longer
+holds.** The edge ring (`neon-resolution-scale-plan.md` step 5) added a fixed
+cost below 1.0. Then section 13 of that plan split the gather out: below 1.0
+the loop runs once, alone, at its own coarse scale (about 2 texels per colour
+kernel, typically an eighth of the viewport), and the reduced pass only shades.
+So below 1.0 the cost is no longer close to quadratic in the scale - 0.5 is
+nearly as cheap as 0.25 (llvmpipe, default scene: 13.5x and 19x faster than
+1.0) - and `numSamples` is paid only on the gather's few thousand texels, so it
+barely moves the scaled path. Both rows describe 1.0 as they stand.
+
 ## 9. What is left open
 
-- **The gather loop is still 95% of the layer.** Change 1 removed a fetch from
-  it; it did not change its shape. The two-level gather in section 6 is the next
-  real move, and it is unbuilt.
+- **The gather loop is still 95% of the layer at 1.0.** Change 1 removed a
+  fetch from it; it did not change its shape. The two-level gather in section 6
+  is the next real move there, and it is unbuilt. Below 1.0 the loop is no
+  longer per texel: `neon-resolution-scale-plan.md` section 13 runs it once on
+  a coarse grid, and the reduced pass's shading is now the largest pass.
 - **Gating the lens flare's hex sprite**, worth about 1.7x on that layer, is
   still open exactly as `lens-flare-perf-review.md` section 7 left it. It was
   written when the flare was the expensive layer; it is now second, so the item

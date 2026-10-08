@@ -1,11 +1,9 @@
 #include "debug-ui.h"
 #include "renderer/spotlight-tuning.h"
-#include <cstdio>
 #include "animation/animation-manager.h"
 #include "core/config.h"
 #include "core/edge-lighting.h"
 #include "renderer/neon-tuning.h"
-#include "renderer/particle-renderer.h"
 #include "ui-controls.h"
 #include "util/log-util.h"
 
@@ -120,6 +118,18 @@ namespace
         return changed;
     }
 
+    /// Slider whose knob follows the currently-animated (active) value each
+    /// frame so the user sees what the shader is actually drawing. Dragging
+    /// still edits the BASE (authored) value: while the user is actively
+    /// dragging THIS slider, the display is pinned to the base to avoid a
+    /// tug-of-war between the drag and the per-frame animation overlay.
+    ///
+    /// Whether this slider is being dragged is the previous frame's
+    /// @c ImGui::IsItemActive(), kept in ImGui's state storage under the
+    /// slider's ID, since nothing can be asked about the item before it is
+    /// drawn. The base is written whenever the widget reports a change; the
+    /// animation on the next @c EdgeLightingEffect::Update then overlays on
+    /// top of the new base.
     inline bool AnimatedSlider(const char *label, float &baseVal, float activeVal,
                                float minVal, float maxVal, const char *fmt = "%.2f")
     {
@@ -154,17 +164,6 @@ namespace
         return changed;
     }
 
-    /// Slider whose knob follows the currently-animated (active) value each
-    /// frame so the user sees what the shader is actually drawing. Dragging
-    /// still edits the BASE (authored) value: while the user is actively
-    /// dragging THIS slider, the display is pinned to the base to avoid a
-    /// tug-of-war between the drag and the per-frame animation overlay.
-    ///
-    /// Detected via @c ImGui::GetActiveID() - we compute the slider's ID
-    /// before drawing so we know whether to seed the shown value from base
-    /// (dragging) or active (idle / animating). The base is written whenever
-    /// the widget reports a change; the animation on the next @c
-    /// EdgeLightingEffect::Update then overlays on top of the new base.
     /// Draw one segment-lights row (Pos/Len/Boost + collapsible per-segment
     /// stops editor). Caller wraps in @c PushID so repeated rows can share the
     /// same widget IDs without colliding.
@@ -325,22 +324,22 @@ namespace
 
     /// One row per Cutoff struct: enable checkbox on the left, size + softness
     /// sliders indented on the right. Grays out the sliders when enable is off
-    /// so the "unbounded on this side" state reads at a glance.
+    /// so the "unbounded on this side" state reads at a glance. Serves both
+    /// the glow's pair and the opaque fill's own pair.
     /// @p subsumed - glowSide already culls this side, so the renderer ignores
-    ///               this cutoff for the GLOW (see neon.frag's band-distance
-    ///               block). @p fillUses - the current opaqueMode still bounds
-    ///               its fill with it, which is a separate layer with no notion
-    ///               of a glow side.
+    ///               this GLOW cutoff (see neon.frag's band-distance block).
+    ///               Always false for a fill cutoff, which has no notion of a
+    ///               glow side.
     ///
     /// Without the note the sliders look live and move nothing, which is
     /// exactly the confusion that produced the report behind
-    /// docs/glow-side-comparison.md section 4.3. Deliberately a note and not a
-    /// BeginDisabled: a subsumed cutoff is still doing real work whenever the
-    /// fill uses it, and greying it out would be a lie in that case.
+    /// docs/glow-side-comparison.md section 4.3. A note rather than a
+    /// BeginDisabled so the value can still be staged ahead of switching the
+    /// glow side back.
     inline void CutoffRow(const char *label, const char *idSuffix,
                           EdgeLighting::Cutoff &cutoff,
                           const EdgeLighting::Cutoff &activeCutoff,
-                          bool subsumed, bool fillUses)
+                          bool subsumed)
     {
         ImGui::PushID(idSuffix);
         char enableLabel[64];
@@ -363,397 +362,43 @@ namespace
         }
         if (cutoff.enable && subsumed)
         {
-            if (fillUses)
-            {
-                ImGui::TextDisabled("subsumed by Glow Side - bounds the fill only");
-            }
-            else
-            {
-                ImGui::TextDisabled("subsumed by Glow Side - no effect");
-            }
+            ImGui::TextDisabled("subsumed by Glow Side - no effect");
         }
         ImGui::Unindent();
         ImGui::PopID();
     }
-}
 
-// ---------------------------------------------------------------------------
-// Lifecycle
-// ---------------------------------------------------------------------------
-
-DebugUI::~DebugUI()
-{
-    Shutdown();
-}
-
-bool DebugUI::Init(GLFWwindow *mainWindow, int mainW, int mainH)
-{
-    int dbgW = 420, dbgH = 700;
-    glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
-    glfwWindowHint(GLFW_FOCUSED, GLFW_FALSE);
-    mWindow = glfwCreateWindow(dbgW, dbgH, "Debug Controls", nullptr, mainWindow);
-    if (!mWindow)
+    const char *LayerName(EdgeLighting::RendererLayer layer)
     {
-        LOG_E("Failed to create debug window");
-        return false;
-    }
-    glfwSetWindowPos(mWindow, mainW + 20, 40);
-    glfwSetWindowAttrib(mWindow, GLFW_FLOATING, GLFW_TRUE);
-
-    mMainWindow = mainWindow;
-
-    // Seed the capture size from the main window's FRAMEBUFFER size, not its
-    // logical size: Config::geometry is in framebuffer pixels, so a capture
-    // that is half the framebuffer (as it would be on a 2x display) shows only
-    // the top-left quadrant of the scene. This is a starting value the user can
-    // edit, not a live binding - the capture itself never reads the drawable,
-    // which is what keeps it reproducible on a machine with a different scale.
-    int mainFbW = mainW, mainFbH = mainH;
-    glfwGetFramebufferSize(mainWindow, &mainFbW, &mainFbH);
-    mCaptureSize[0] = mainFbW;
-    mCaptureSize[1] = mainFbH;
-
-    // Keep main context current after window creation (shared context)
-    glfwMakeContextCurrent(mainWindow);
-
-    // Second ImGui context for the debug window
-    IMGUI_CHECKVERSION();
-    mContext = ImGui::CreateContext();
-    ImGui::SetCurrentContext(mContext);
-    ImGuiIO &io = ImGui::GetIO();
-    io.IniFilename = nullptr;
-    ImGui::StyleColorsDark();
-    ImGui_ImplGlfw_InitForOpenGL(mWindow, true);
-    ImGui_ImplOpenGL3_Init(GLSL_VERSION);
-
-    return true;
-}
-
-void DebugUI::Shutdown()
-{
-    if (mContext)
-    {
-        ImGui::SetCurrentContext(mContext);
-        ImGui_ImplOpenGL3_Shutdown();
-        ImGui_ImplGlfw_Shutdown();
-        ImGui::DestroyContext(mContext);
-        mContext = nullptr;
-    }
-    if (mWindow)
-    {
-        glfwDestroyWindow(mWindow);
-        mWindow = nullptr;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Per-frame
-// ---------------------------------------------------------------------------
-
-void DebugUI::Build(EdgeLighting::Config &cfg, EdgeLighting::EdgeLightingEffect &effect)
-{
-    ImGui::SetCurrentContext(mContext);
-    ImGui_ImplOpenGL3_NewFrame();
-    ImGui_ImplGlfw_NewFrame();
-    ImGui::NewFrame();
-
-    bool playing = effect.GetClock().IsPlaying();
-
-    ImGui::Begin("Debug Controls");
-
-    // --- Perf readout (always visible, sticky at the top) ---
-    const ImGuiIO &io = ImGui::GetIO();
-    ImGui::Text("FPS: %.1f  |  %.2f ms (frame)  |  %.2f ms (render)",
-                io.Framerate, 1000.0f / io.Framerate, mLastRenderTimeMs);
-    ImGui::Separator();
-
-    // The active config carries every animation's current overlay values
-    const EdgeLighting::Config &active = effect.GetActiveConfig();
-    buildGeometrySection(cfg);
-    buildNeonSection(cfg, active);
-    buildDebugSection(cfg);
-    buildDropletsSection(cfg);
-    buildLensFlareSection(cfg);
-    buildSpotlightSection(cfg);
-    buildParticleSection(cfg);
-    buildColorPickerSection(cfg);
-    buildAnimationSection(cfg, effect.GetAnimationManager());
-    buildBackgroundSection();
-
-    ImGui::Separator();
-    ImGui::Text("Animation: %s", playing ? "PLAYING" : "PAUSED");
-    if (ImGui::Button(playing ? "Pause" : "Play"))
-    {
-        if (playing)
+        switch (layer)
         {
-            effect.GetClock().Pause();
+        case EdgeLighting::RendererLayer::NEON:
+        {
+            return "Neon";
         }
-        else
+        case EdgeLighting::RendererLayer::DROPLETS:
         {
-            effect.GetClock().Play();
+            return "Droplets";
         }
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Stop"))
-    {
-        effect.GetClock().Stop();
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Capture"))
-    {
-        // Deferred to the render loop - see ConsumeCaptureRequest.
-        mCaptureRequested = true;
-    }
-    if (ImGui::IsItemHovered())
-    {
-        ImGui::SetTooltip("Renders one frame into an offscreen RGBA8 framebuffer at the size below\n"
-                          "and writes it to RES_DIR as a PNG. Independent of the window and of the\n"
-                          "display's DPI scale, so the same config gives the same pixels anywhere.\n"
-                          "Geometry is in framebuffer pixels, so the capture size also decides\n"
-                          "the framing - shrink it and you crop rather than zoom out.");
-    }
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(120.0f);
-    ImGui::InputInt2("Capture size", mCaptureSize);
-    ImGui::SameLine();
-    if (ImGui::Button("Dump Config"))
-    {
-        EdgeLightingDemo::PrintFullConfig(effect.GetConfig(), effect.GetClock().IsPlaying());
-    }
-    ImGui::End();
-}
-
-bool DebugUI::ConsumeCaptureRequest(int &outWidth, int &outHeight)
-{
-    if (!mCaptureRequested)
-    {
-        return false;
-    }
-    mCaptureRequested = false;
-
-    if (mCaptureSize[0] <= 0 || mCaptureSize[1] <= 0)
-    {
-        LOG_W("Capture size %dx%d is invalid; ignoring the request.", mCaptureSize[0], mCaptureSize[1]);
-        return false;
-    }
-
-    outWidth = mCaptureSize[0];
-    outHeight = mCaptureSize[1];
-    return true;
-}
-
-void DebugUI::Render()
-{
-    ImGui::Render();
-
-    glfwMakeContextCurrent(mWindow);
-    int fbDW, fbDH;
-    glfwGetFramebufferSize(mWindow, &fbDW, &fbDH);
-    glViewport(0, 0, fbDW, fbDH);
-    glClearColor(0.12f, 0.12f, 0.14f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
-    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-    glfwSwapBuffers(mWindow);
-}
-
-// ---------------------------------------------------------------------------
-// Sections
-// ---------------------------------------------------------------------------
-
-void DebugUI::buildGeometrySection(EdgeLighting::Config &cfg)
-{
-    if (!ImGui::CollapsingHeader("Geometry", ImGuiTreeNodeFlags_DefaultOpen))
-    {
-        return;
-    }
-
-    SliderWithInput("Width", cfg.geometry.width, 100.0f, 1920.0f * 2, "%.0f");
-    SliderWithInput("Height", cfg.geometry.height, 100.0f, 1080.0f * 2, "%.0f");
-    SliderWithInput("Pos X", cfg.geometry.position.x, 0.0f, 1600.0f, "%.0f");
-    SliderWithInput("Pos Y", cfg.geometry.position.y, 0.0f, 1200.0f, "%.0f");
-    SliderWithInput("Corner Radius", cfg.geometry.cornerRadius, 0.0f, 1080.0f, "%.0f");
-
-    const char *windingItems[] = {"CW", "CCW"};
-    int windingIdx = static_cast<int>(cfg.geometry.winding);
-    if (ImGui::Combo("Winding", &windingIdx, windingItems, IM_ARRAYSIZE(windingItems)))
-    {
-        cfg.geometry.winding = static_cast<EdgeLighting::Winding>(windingIdx);
-    }
-}
-
-void DebugUI::buildNeonSection(EdgeLighting::Config &cfg,
-                               const EdgeLighting::Config &active)
-{
-    if (!ImGui::CollapsingHeader("Neon", ImGuiTreeNodeFlags_DefaultOpen))
-    {
-        return;
-    }
-
-    ImGui::Checkbox("Enable##Neon", &cfg.neon.enable);
-    if (!cfg.neon.enable)
-    {
-        return;
-    }
-
-    // --- Performance ------------------------------------------------------
-    // Was its own "Optimized Neon" section back when the half-res path was a
-    // second renderer. It is one renderer now, so these are just knobs on it:
-    // Res Scale 1.0 is the full-resolution path (no offscreen buffer, no
-    // blit), anything lower renders scaled and composites back.
-    if (ImGui::TreeNodeEx("Performance##Neon", ImGuiTreeNodeFlags_DefaultOpen))
-    {
-        SliderWithInput("Res Scale##Neon", cfg.neon.resolutionScale, 0.125f, 1.0f, "%.3f");
-        if (ImGui::IsItemHovered())
+        case EdgeLighting::RendererLayer::LENS_FLARE:
         {
-            ImGui::SetTooltip("1.0 draws straight onto the target at full resolution.\n"
-                              "Below that the glow renders into a scaled buffer and is\n"
-                              "bilinear-blitted back - fewer fragments, softer edges.");
+            return "Lens flare";
         }
-        SliderIntWithInput("Samples##Neon", cfg.neon.numSamples, 8, NEON_MAX_LOOP_SAMPLES);
-        SliderIntWithInput("LUT Size##Neon", cfg.neon.gradientLutSize, 32, MAX_GRADIENT_LUT_SIZE);
-        ImGui::TreePop();
-    }
-
-    const char *opaqueItems[] = {"None", "Outside", "Inside", "Both", "All"};
-    int opaqueIdx = static_cast<int>(cfg.neon.opaqueMode);
-    if (ImGui::Combo("Opaque##Neon", &opaqueIdx, opaqueItems, IM_ARRAYSIZE(opaqueItems)))
-    {
-        cfg.neon.opaqueMode = static_cast<EdgeLighting::OpaqueMode>(opaqueIdx);
-    }
-    if (cfg.neon.opaqueMode != EdgeLighting::OpaqueMode::NONE)
-    {
-        ImGui::SameLine();
-        ImGui::ColorEdit4("Opaque Color##Neon", &cfg.neon.opaqueColor.x,
-                          ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_AlphaPreview);
-        SliderWithInput("Opaque Softness##Neon", cfg.neon.opaqueSoftness, 0.0f, 20.0f, "%.1f");
-    }
-    AnimatedSlider("Line Width##Neon", cfg.neon.lineWidth, active.neon.lineWidth, 0.0f, 20.0f, "%.0f");
-    AnimatedSlider("Filament Falloff##Neon", cfg.neon.filamentFalloff, active.neon.filamentFalloff, 0.0f, 5.0f);
-    AnimatedSlider("Intensity##Neon", cfg.neon.intensity, active.neon.intensity, 0.0f, 3.0f);
-    AnimatedSlider("Glow Radius##Neon", cfg.neon.glowRadius, active.neon.glowRadius, 0.0f, 80.0f, "%.0f");
-    AnimatedSlider("Bloom Strength##Neon", cfg.neon.bloomStrength, active.neon.bloomStrength, 0.0f, 2.0f);
-    AnimatedSlider("Hue Rotation Rate##Neon", cfg.neon.hueRotationRate, active.neon.hueRotationRate, 0.0f, 2.0f);
-
-    const char *sideItems[] = {"Both", "Inside", "Outside"};
-    int sideIdx = static_cast<int>(cfg.neon.glowSide);
-    if (ImGui::Combo("Glow Side##Neon", &sideIdx, sideItems, IM_ARRAYSIZE(sideItems)))
-    {
-        cfg.neon.glowSide = static_cast<EdgeLighting::GlowSide>(sideIdx);
-    }
-    if (cfg.neon.glowSide != EdgeLighting::GlowSide::BOTH)
-    {
-        SliderWithInput("Side Softness##Neon", cfg.neon.glowSideSoftness, 0.0f, 20.0f, "%.1f");
-    }
-
-    // A cutoff on the side glowSide culls is ignored for the glow, but still
-    // bounds an opaque fill on that same side - insideCutoff caps INSIDE / BOTH
-    // fills, outsideCutoff caps OUTSIDE / BOTH.
-    const EdgeLighting::OpaqueMode om = cfg.neon.opaqueMode;
-    const bool fillUsesInside = (om == EdgeLighting::OpaqueMode::INSIDE ||
-                                 om == EdgeLighting::OpaqueMode::BOTH);
-    const bool fillUsesOutside = (om == EdgeLighting::OpaqueMode::OUTSIDE ||
-                                  om == EdgeLighting::OpaqueMode::BOTH);
-    CutoffRow("Inside Cutoff", "NeonInside", cfg.neon.insideCutoff, active.neon.insideCutoff,
-              cfg.neon.glowSide == EdgeLighting::GlowSide::OUTSIDE, fillUsesInside);
-    CutoffRow("Outside Cutoff", "NeonOutside", cfg.neon.outsideCutoff, active.neon.outsideCutoff,
-              cfg.neon.glowSide == EdgeLighting::GlowSide::INSIDE, fillUsesOutside);
-
-    // --- Travelling segments (independent additive lights on the perimeter) ---
-    ImGui::TextDisabled("Segment Lights (%zu / %d) - additive, independent of intensity",
-                        cfg.neon.segmentBoosts.size(),
-                        EdgeLighting::NeonConfig::MAX_SEGMENT_BOOSTS_CAP);
-    for (size_t i = 0; i < cfg.neon.segmentBoosts.size(); ++i)
-    {
-        ImGui::PushID(static_cast<int>(300 + i));
-        bool remove = DrawSegmentRow(cfg.neon.segmentBoosts[i], i);
-        ImGui::PopID();
-        if (remove)
+        case EdgeLighting::RendererLayer::SPOTLIGHT:
         {
-            cfg.neon.segmentBoosts.erase(cfg.neon.segmentBoosts.begin() +
-                                         static_cast<ptrdiff_t>(i));
-            break;
+            return "Spotlight";
         }
-    }
-    if (static_cast<int>(cfg.neon.segmentBoosts.size()) <
-        EdgeLighting::NeonConfig::MAX_SEGMENT_BOOSTS_CAP)
-    {
-        if (ImGui::Button("+ Add Segment##Neon"))
+        case EdgeLighting::RendererLayer::DEBUG:
         {
-            cfg.neon.segmentBoosts.push_back({0.0f, 0.15f, 4.0f});
+            return "Debug overlays";
+        }
+        default:
+        {
+            return "Unknown";
+        }
         }
     }
 
-    // --- Arcs (multiple lit slices; winner-take-all in overlap regions) ---
-    ImGui::TextDisabled("Arcs (%zu / %d) - overlap resolves winner-take-all",
-                        cfg.neon.arcs.size(),
-                        EdgeLighting::NeonConfig::MAX_ARCS_CAP);
-    for (size_t i = 0; i < cfg.neon.arcs.size(); ++i)
-    {
-        ImGui::PushID(static_cast<int>(500 + i));
-        bool remove = DrawArcRow(cfg.neon.arcs[i], i);
-        ImGui::PopID();
-        if (remove)
-        {
-            cfg.neon.arcs.erase(cfg.neon.arcs.begin() +
-                                static_cast<ptrdiff_t>(i));
-            break;
-        }
-    }
-    if (static_cast<int>(cfg.neon.arcs.size()) <
-        EdgeLighting::NeonConfig::MAX_ARCS_CAP)
-    {
-        if (ImGui::Button("+ Add Arc##Neon"))
-        {
-            cfg.neon.arcs.push_back(EdgeLighting::Arc{});
-        }
-    }
-
-    const char *blendItems[] = {"RGB", "HSV", "HSL"};
-    int blendIdx = static_cast<int>(cfg.neon.blendSpace);
-    if (ImGui::Combo("Blend Space##Neon", &blendIdx, blendItems, IM_ARRAYSIZE(blendItems)))
-    {
-        cfg.neon.blendSpace = static_cast<EdgeLighting::BlendSpace>(blendIdx);
-    }
-
-    // Cross-fade time when the stop set / blend space changes (0 = instant).
-    SliderWithInput("Color Transition (s)##Neon", cfg.neon.colorTransitionDuration,
-                    0.0f, 2.0f, "%.2f");
-
-    for (size_t i = 0; i < cfg.neon.colorStops.size(); ++i)
-    {
-        ImGui::PushID(static_cast<int>(i));
-        float p = cfg.neon.colorStops[i].position;
-        if (SliderWithInput("Pos##Neon", p, 0.0f, 1.0f, "%.2f"))
-        {
-            cfg.neon.colorStops[i].position = p;
-        }
-        ImGui::SameLine();
-        glm::vec4 c = cfg.neon.colorStops[i].color;
-        if (ImGui::ColorEdit4("Col##Neon", &c.x, ImGuiColorEditFlags_NoInputs))
-        {
-            cfg.neon.colorStops[i].color = c;
-        }
-        ImGui::SameLine();
-        if (cfg.neon.colorStops.size() > 1 && ImGui::SmallButton("X"))
-        {
-            cfg.neon.colorStops.erase(cfg.neon.colorStops.begin() + static_cast<ptrdiff_t>(i));
-        }
-        ImGui::PopID();
-    }
-
-    if (cfg.neon.colorStops.size() < MAX_COLOR_STOPS)
-    {
-        if (ImGui::Button("+ Add Stop##Neon"))
-        {
-            float lastPos = cfg.neon.colorStops.empty() ? 0.0f : cfg.neon.colorStops.back().position;
-            cfg.neon.colorStops.push_back(
-                {std::min(1.0f, lastPos + 0.1f), glm::vec4(1.0f, 1.0f, 1.0f, 1.0f)});
-        }
-    }
-}
-
-namespace
-{
     // Colour-coded label for an animation's current state.
     void DrawStateBadge(EdgeLighting::AnimationState s)
     {
@@ -964,6 +609,471 @@ namespace
     }
 }
 
+// ---------------------------------------------------------------------------
+// Lifecycle
+// ---------------------------------------------------------------------------
+
+DebugUI::~DebugUI()
+{
+    Shutdown();
+}
+
+bool DebugUI::Init(GLFWwindow *mainWindow, int mainW, int mainH)
+{
+    int dbgW = 420, dbgH = 700;
+    glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
+    glfwWindowHint(GLFW_FOCUSED, GLFW_FALSE);
+    mWindow = glfwCreateWindow(dbgW, dbgH, "Debug Controls", nullptr, mainWindow);
+    if (!mWindow)
+    {
+        LOG_E("Failed to create debug window");
+        return false;
+    }
+    glfwSetWindowPos(mWindow, mainW + 20, 40);
+    glfwSetWindowAttrib(mWindow, GLFW_FLOATING, GLFW_TRUE);
+
+    mMainWindow = mainWindow;
+
+    // Seed the capture size from the main window's FRAMEBUFFER size, not its
+    // logical size: Config::geometry is in framebuffer pixels, so a capture
+    // that is half the framebuffer (as it would be on a 2x display) shows only
+    // the top-left quadrant of the scene. This is a starting value the user can
+    // edit, not a live binding - the capture itself never reads the drawable,
+    // which is what keeps it reproducible on a machine with a different scale.
+    int mainFbW = mainW, mainFbH = mainH;
+    glfwGetFramebufferSize(mainWindow, &mainFbW, &mainFbH);
+    mCaptureSize[0] = mainFbW;
+    mCaptureSize[1] = mainFbH;
+
+    // Keep main context current after window creation (shared context)
+    glfwMakeContextCurrent(mainWindow);
+
+    // Second ImGui context for the debug window
+    IMGUI_CHECKVERSION();
+    mContext = ImGui::CreateContext();
+    ImGui::SetCurrentContext(mContext);
+    ImGuiIO &io = ImGui::GetIO();
+    io.IniFilename = nullptr;
+    ImGui::StyleColorsDark();
+    ImGui_ImplGlfw_InitForOpenGL(mWindow, true);
+    ImGui_ImplOpenGL3_Init(GLSL_VERSION);
+
+    return true;
+}
+
+void DebugUI::Shutdown()
+{
+    if (mContext)
+    {
+        ImGui::SetCurrentContext(mContext);
+        ImGui_ImplOpenGL3_Shutdown();
+        ImGui_ImplGlfw_Shutdown();
+        ImGui::DestroyContext(mContext);
+        mContext = nullptr;
+    }
+    if (mWindow)
+    {
+        glfwDestroyWindow(mWindow);
+        mWindow = nullptr;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-frame
+// ---------------------------------------------------------------------------
+
+void DebugUI::Build(EdgeLighting::Config &cfg, EdgeLighting::EdgeLightingEffect &effect)
+{
+    ImGui::SetCurrentContext(mContext);
+    ImGui_ImplOpenGL3_NewFrame();
+    ImGui_ImplGlfw_NewFrame();
+    ImGui::NewFrame();
+
+    bool playing = effect.GetClock().IsPlaying();
+
+    ImGui::Begin("Debug Controls");
+
+    // --- Perf readout (always visible, sticky at the top) ---
+    const ImGuiIO &io = ImGui::GetIO();
+    ImGui::Text("FPS: %.1f  |  %.2f ms (frame)  |  %.2f ms (render)",
+                io.Framerate, 1000.0f / io.Framerate, mLastRenderTimeMs);
+    ImGui::Separator();
+
+    // The active config carries every animation's current overlay values
+    const EdgeLighting::Config &active = effect.GetActiveConfig();
+    buildGeometrySection(cfg);
+    buildLayerOrderSection(effect);
+    buildNeonSection(cfg, active);
+    buildDebugSection(cfg);
+    buildDropletsSection(cfg);
+    buildLensFlareSection(cfg);
+    buildSpotlightSection(cfg);
+    buildColorPickerSection(cfg);
+    buildAnimationSection(cfg, effect.GetAnimationManager());
+    buildBackgroundSection();
+
+    ImGui::Separator();
+    ImGui::Text("Animation: %s", playing ? "PLAYING" : "PAUSED");
+    if (ImGui::Button(playing ? "Pause" : "Play"))
+    {
+        if (playing)
+        {
+            effect.GetClock().Pause();
+        }
+        else
+        {
+            effect.GetClock().Play();
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Stop"))
+    {
+        effect.GetClock().Stop();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Capture"))
+    {
+        // Deferred to the render loop - see ConsumeCaptureRequest.
+        mCaptureRequested = true;
+    }
+    if (ImGui::IsItemHovered())
+    {
+        ImGui::SetTooltip("Renders one frame into an offscreen RGBA8 framebuffer at the size below\n"
+                          "and writes it to RES_DIR as a PNG. Independent of the window and of the\n"
+                          "display's DPI scale, so the same config gives the same pixels anywhere.\n"
+                          "Geometry is in framebuffer pixels, so the capture size also decides\n"
+                          "the framing - shrink it and you crop rather than zoom out.");
+    }
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(120.0f);
+    ImGui::InputInt2("Capture size", mCaptureSize);
+    ImGui::SameLine();
+    if (ImGui::Button("Dump Config"))
+    {
+        EdgeLightingDemo::PrintFullConfig(effect.GetConfig(), effect.GetClock().IsPlaying());
+    }
+    ImGui::End();
+}
+
+bool DebugUI::ConsumeCaptureRequest(int &outWidth, int &outHeight)
+{
+    if (!mCaptureRequested)
+    {
+        return false;
+    }
+    mCaptureRequested = false;
+
+    if (mCaptureSize[0] <= 0 || mCaptureSize[1] <= 0)
+    {
+        LOG_W("Capture size %dx%d is invalid; ignoring the request.", mCaptureSize[0], mCaptureSize[1]);
+        return false;
+    }
+
+    outWidth = mCaptureSize[0];
+    outHeight = mCaptureSize[1];
+    return true;
+}
+
+void DebugUI::Render()
+{
+    ImGui::Render();
+
+    glfwMakeContextCurrent(mWindow);
+    int fbDW, fbDH;
+    glfwGetFramebufferSize(mWindow, &fbDW, &fbDH);
+    glViewport(0, 0, fbDW, fbDH);
+    glClearColor(0.12f, 0.12f, 0.14f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+    glfwSwapBuffers(mWindow);
+}
+
+// ---------------------------------------------------------------------------
+// Sections
+// ---------------------------------------------------------------------------
+
+void DebugUI::buildGeometrySection(EdgeLighting::Config &cfg)
+{
+    if (!ImGui::CollapsingHeader("Geometry", ImGuiTreeNodeFlags_DefaultOpen))
+    {
+        return;
+    }
+
+    SliderWithInput("Width", cfg.geometry.width, 100.0f, 1920.0f * 2, "%.0f");
+    SliderWithInput("Height", cfg.geometry.height, 100.0f, 1080.0f * 2, "%.0f");
+    SliderWithInput("Pos X", cfg.geometry.position.x, 0.0f, 1600.0f, "%.0f");
+    SliderWithInput("Pos Y", cfg.geometry.position.y, 0.0f, 1200.0f, "%.0f");
+    SliderWithInput("Corner Radius", cfg.geometry.cornerRadius, 0.0f, 1080.0f, "%.0f");
+
+    const char *windingItems[] = {"CW", "CCW"};
+    int windingIdx = static_cast<int>(cfg.geometry.winding);
+    if (ImGui::Combo("Winding", &windingIdx, windingItems, IM_ARRAYSIZE(windingItems)))
+    {
+        cfg.geometry.winding = static_cast<EdgeLighting::Winding>(windingIdx);
+    }
+}
+
+void DebugUI::buildLayerOrderSection(EdgeLighting::EdgeLightingEffect &effect)
+{
+    if (!ImGui::CollapsingHeader("Layer order"))
+    {
+        return;
+    }
+
+    ImGui::TextDisabled("Top of the list draws last, over everything below it.");
+
+    std::vector<EdgeLighting::RendererLayer> order = effect.GetLayerOrder();
+    const int count = static_cast<int>(order.size());
+    int swapAt = -1;
+    int swapWith = -1;
+
+    // Listed TOP first, the way a layer stack reads; the effect's own order
+    // is bottom first, so row r shows index count - 1 - r.
+    for (int row = 0; row < count; row++)
+    {
+        const int i = count - 1 - row;
+        ImGui::PushID(i);
+        ImGui::BeginDisabled(i == count - 1);
+        if (ImGui::ArrowButton("##Up", ImGuiDir_Up))
+        {
+            swapAt = i;
+            swapWith = i + 1;
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::BeginDisabled(i == 0);
+        if (ImGui::ArrowButton("##Down", ImGuiDir_Down))
+        {
+            swapAt = i;
+            swapWith = i - 1;
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::Text("%d  %s%s", i, LayerName(order[static_cast<size_t>(i)]),
+                    i == 0 ? "  (bottom)" : (i == count - 1 ? "  (top)" : ""));
+        ImGui::PopID();
+    }
+
+    // Applied after the loop so the rows above all read the same order.
+    // Swapping two neighbours always leaves a valid order to hand back whole.
+    if (swapAt >= 0)
+    {
+        std::swap(order[static_cast<size_t>(swapAt)], order[static_cast<size_t>(swapWith)]);
+        effect.SetLayerOrder(order);
+    }
+
+    if (ImGui::Button("Default##LayerOrder"))
+    {
+        // The library's default order, narrowed to what is registered here.
+        std::vector<EdgeLighting::RendererLayer> defaults;
+        for (EdgeLighting::RendererLayer layer : EdgeLighting::EdgeLightingEffect::GetDefaultLayerOrder())
+        {
+            if (std::find(order.begin(), order.end(), layer) != order.end())
+            {
+                defaults.push_back(layer);
+            }
+        }
+        effect.SetLayerOrder(defaults);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Spotlight at bottom##LayerOrder"))
+    {
+        // The spotlight first, everything else in its current order. Nothing to
+        // do if the spotlight layer is not registered.
+        auto spot = std::find(order.begin(), order.end(), EdgeLighting::RendererLayer::SPOTLIGHT);
+        if (spot != order.end())
+        {
+            std::rotate(order.begin(), spot, spot + 1);
+            effect.SetLayerOrder(order);
+        }
+    }
+    if (ImGui::IsItemHovered())
+    {
+        ImGui::SetTooltip("Draws the cones first, so the neon composites over them by its own\n"
+                          "coverage instead of the cones adding onto the neon. The neon's opaque\n"
+                          "fill, if on, then covers any cone inside the rect.");
+    }
+}
+
+void DebugUI::buildNeonSection(EdgeLighting::Config &cfg,
+                               const EdgeLighting::Config &active)
+{
+    if (!ImGui::CollapsingHeader("Neon", ImGuiTreeNodeFlags_DefaultOpen))
+    {
+        return;
+    }
+
+    ImGui::Checkbox("Enable##Neon", &cfg.neon.enable);
+    if (!cfg.neon.enable)
+    {
+        return;
+    }
+
+    // --- Performance ------------------------------------------------------
+    // Was its own "Optimized Neon" section back when the half-res path was a
+    // second renderer. It is one renderer now, so these are just knobs on it:
+    // Res Scale 1.0 is the full-resolution path (no offscreen buffer, no
+    // blit), anything lower renders scaled and composites back.
+    if (ImGui::TreeNodeEx("Performance##Neon", ImGuiTreeNodeFlags_DefaultOpen))
+    {
+        SliderWithInput("Res Scale##Neon", cfg.neon.resolutionScale, 0.125f, 1.0f, "%.3f");
+        if (ImGui::IsItemHovered())
+        {
+            ImGui::SetTooltip("1.0 draws straight onto the target at full resolution.\n"
+                              "Below that the glow renders into a scaled buffer and is\n"
+                              "bilinear-blitted back, with a thin ring around the edge\n"
+                              "re-shaded at full resolution - the line stays sharp.\n"
+                              "Not always cheaper: a tight cutoff band can get slower.");
+        }
+        SliderIntWithInput("Samples##Neon", cfg.neon.numSamples, 8, NEON_MAX_LOOP_SAMPLES);
+        SliderIntWithInput("LUT Size##Neon", cfg.neon.gradientLutSize, 32, MAX_GRADIENT_LUT_SIZE);
+        ImGui::TreePop();
+    }
+
+    const char *opaqueItems[] = {"None", "Outside", "Inside", "Both", "All"};
+    int opaqueIdx = static_cast<int>(cfg.neon.opaqueMode);
+    if (ImGui::Combo("Opaque##Neon", &opaqueIdx, opaqueItems, IM_ARRAYSIZE(opaqueItems)))
+    {
+        cfg.neon.opaqueMode = static_cast<EdgeLighting::OpaqueMode>(opaqueIdx);
+    }
+    if (cfg.neon.opaqueMode != EdgeLighting::OpaqueMode::NONE)
+    {
+        ImGui::SameLine();
+        ImGui::ColorEdit4("Opaque Color##Neon", &cfg.neon.opaqueColor.x,
+                          ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_AlphaPreview);
+        // The fill's OWN cutoffs, independent of the glow's below. Only the
+        // sides the current mode fills are shown - ALL has neither.
+        const EdgeLighting::OpaqueMode om = cfg.neon.opaqueMode;
+        if (om == EdgeLighting::OpaqueMode::INSIDE || om == EdgeLighting::OpaqueMode::BOTH)
+        {
+            CutoffRow("Fill Inside Cutoff", "FillInside", cfg.neon.opaqueInsideCutoff,
+                      active.neon.opaqueInsideCutoff, false);
+        }
+        if (om == EdgeLighting::OpaqueMode::OUTSIDE || om == EdgeLighting::OpaqueMode::BOTH)
+        {
+            CutoffRow("Fill Outside Cutoff", "FillOutside", cfg.neon.opaqueOutsideCutoff,
+                      active.neon.opaqueOutsideCutoff, false);
+        }
+    }
+    AnimatedSlider("Line Width##Neon", cfg.neon.lineWidth, active.neon.lineWidth, 0.0f, 20.0f, "%.0f");
+    AnimatedSlider("Filament Falloff##Neon", cfg.neon.filamentFalloff, active.neon.filamentFalloff, 0.0f, 5.0f);
+    AnimatedSlider("Intensity##Neon", cfg.neon.intensity, active.neon.intensity, 0.0f, 3.0f);
+    AnimatedSlider("Glow Radius##Neon", cfg.neon.glowRadius, active.neon.glowRadius, 0.0f, 80.0f, "%.0f");
+    AnimatedSlider("Bloom Strength##Neon", cfg.neon.bloomStrength, active.neon.bloomStrength, 0.0f, 2.0f);
+    AnimatedSlider("Hue Rotation Rate##Neon", cfg.neon.hueRotationRate, active.neon.hueRotationRate, 0.0f, 2.0f);
+
+    const char *sideItems[] = {"Both", "Inside", "Outside"};
+    int sideIdx = static_cast<int>(cfg.neon.glowSide);
+    if (ImGui::Combo("Glow Side##Neon", &sideIdx, sideItems, IM_ARRAYSIZE(sideItems)))
+    {
+        cfg.neon.glowSide = static_cast<EdgeLighting::GlowSide>(sideIdx);
+    }
+    if (cfg.neon.glowSide != EdgeLighting::GlowSide::BOTH)
+    {
+        SliderWithInput("Side Softness##Neon", cfg.neon.glowSideSoftness, 0.0f, 20.0f, "%.1f");
+    }
+
+    // The GLOW's cutoffs. One on the side glowSide culls is ignored; neither
+    // reaches the opaque fill, which has its own pair above.
+    CutoffRow("Inside Cutoff", "NeonInside", cfg.neon.insideCutoff, active.neon.insideCutoff,
+              cfg.neon.glowSide == EdgeLighting::GlowSide::OUTSIDE);
+    CutoffRow("Outside Cutoff", "NeonOutside", cfg.neon.outsideCutoff, active.neon.outsideCutoff,
+              cfg.neon.glowSide == EdgeLighting::GlowSide::INSIDE);
+
+    // --- Travelling segments (independent additive lights on the perimeter) ---
+    ImGui::TextDisabled("Segment Lights (%zu / %d) - additive, independent of intensity",
+                        cfg.neon.segmentBoosts.size(),
+                        EdgeLighting::NeonConfig::MAX_SEGMENT_BOOSTS_CAP);
+    for (size_t i = 0; i < cfg.neon.segmentBoosts.size(); ++i)
+    {
+        ImGui::PushID(static_cast<int>(300 + i));
+        bool remove = DrawSegmentRow(cfg.neon.segmentBoosts[i], i);
+        ImGui::PopID();
+        if (remove)
+        {
+            cfg.neon.segmentBoosts.erase(cfg.neon.segmentBoosts.begin() +
+                                         static_cast<ptrdiff_t>(i));
+            break;
+        }
+    }
+    if (static_cast<int>(cfg.neon.segmentBoosts.size()) <
+        EdgeLighting::NeonConfig::MAX_SEGMENT_BOOSTS_CAP)
+    {
+        if (ImGui::Button("+ Add Segment##Neon"))
+        {
+            cfg.neon.segmentBoosts.push_back({0.0f, 0.15f, 4.0f});
+        }
+    }
+
+    // --- Arcs (multiple lit slices; winner-take-all in overlap regions) ---
+    ImGui::TextDisabled("Arcs (%zu / %d) - overlap resolves winner-take-all",
+                        cfg.neon.arcs.size(),
+                        EdgeLighting::NeonConfig::MAX_ARCS_CAP);
+    for (size_t i = 0; i < cfg.neon.arcs.size(); ++i)
+    {
+        ImGui::PushID(static_cast<int>(500 + i));
+        bool remove = DrawArcRow(cfg.neon.arcs[i], i);
+        ImGui::PopID();
+        if (remove)
+        {
+            cfg.neon.arcs.erase(cfg.neon.arcs.begin() +
+                                static_cast<ptrdiff_t>(i));
+            break;
+        }
+    }
+    if (static_cast<int>(cfg.neon.arcs.size()) <
+        EdgeLighting::NeonConfig::MAX_ARCS_CAP)
+    {
+        if (ImGui::Button("+ Add Arc##Neon"))
+        {
+            cfg.neon.arcs.push_back(EdgeLighting::Arc{});
+        }
+    }
+
+    const char *blendItems[] = {"RGB", "HSV", "HSL"};
+    int blendIdx = static_cast<int>(cfg.neon.blendSpace);
+    if (ImGui::Combo("Blend Space##Neon", &blendIdx, blendItems, IM_ARRAYSIZE(blendItems)))
+    {
+        cfg.neon.blendSpace = static_cast<EdgeLighting::BlendSpace>(blendIdx);
+    }
+
+    // Cross-fade time when the stop set / blend space changes (0 = instant).
+    SliderWithInput("Color Transition (s)##Neon", cfg.neon.colorTransitionDuration,
+                    0.0f, 2.0f, "%.2f");
+
+    for (size_t i = 0; i < cfg.neon.colorStops.size(); ++i)
+    {
+        ImGui::PushID(static_cast<int>(i));
+        float p = cfg.neon.colorStops[i].position;
+        if (SliderWithInput("Pos##Neon", p, 0.0f, 1.0f, "%.2f"))
+        {
+            cfg.neon.colorStops[i].position = p;
+        }
+        ImGui::SameLine();
+        glm::vec4 c = cfg.neon.colorStops[i].color;
+        if (ImGui::ColorEdit4("Col##Neon", &c.x, ImGuiColorEditFlags_NoInputs))
+        {
+            cfg.neon.colorStops[i].color = c;
+        }
+        ImGui::SameLine();
+        if (cfg.neon.colorStops.size() > 1 && ImGui::SmallButton("X"))
+        {
+            cfg.neon.colorStops.erase(cfg.neon.colorStops.begin() + static_cast<ptrdiff_t>(i));
+        }
+        ImGui::PopID();
+    }
+
+    if (cfg.neon.colorStops.size() < MAX_COLOR_STOPS)
+    {
+        if (ImGui::Button("+ Add Stop##Neon"))
+        {
+            float lastPos = cfg.neon.colorStops.empty() ? 0.0f : cfg.neon.colorStops.back().position;
+            cfg.neon.colorStops.push_back(
+                {std::min(1.0f, lastPos + 0.1f), glm::vec4(1.0f, 1.0f, 1.0f, 1.0f)});
+        }
+    }
+}
+
 void DebugUI::buildDebugSection(EdgeLighting::Config &cfg)
 {
     if (!ImGui::CollapsingHeader("Debug"))
@@ -1102,262 +1212,6 @@ void DebugUI::buildLensFlareSection(EdgeLighting::Config &cfg)
     SliderWithInput("Rotation Rate##Lens", cfg.lensFlare.rotationRate, -2.0f, 2.0f, "%.3f rev/s");
 }
 
-void DebugUI::buildParticleSection(EdgeLighting::Config &cfg)
-{
-    if (!ImGui::CollapsingHeader("Particles", ImGuiTreeNodeFlags_DefaultOpen))
-    {
-        return;
-    }
-
-    auto &pc = cfg.particle;
-    ImGui::Checkbox("Enable##Particle", &pc.enable);
-    if (ImGui::IsItemHovered())
-    {
-        ImGui::SetTooltip("Off clears every particle and frees the layer's memory;\n"
-                          "on starts again from nothing.");
-    }
-    // Live count against the ring - one block of MAX_PARTICLES_CAP slots per
-    // arc. Each arc clamps its own spawn RATE to its Max Alive / Lifetime, so
-    // a thinning trail is the clamp at work rather than a full block. Reads
-    // 0 / 0 while the layer is off: it holds no ring then.
-    if (mParticleManager)
-    {
-        ImGui::SameLine();
-        ImGui::Text("alive %zu / %zu", mParticleManager->GetParticleCount(),
-                    mParticleManager->GetCapacity());
-    }
-    if (!pc.enable)
-    {
-        return;
-    }
-
-    // --- Where the arcs come from: ONE switch for the whole layer. ---
-    ImGui::Checkbox("Use Neon Arcs##Particle", &pc.useNeonArc);
-    if (ImGui::IsItemHovered())
-    {
-        ImGui::SetTooltip("On: one emitter per Neon > Arcs entry, moving with it.\n"
-                          "Off: one emitter per arc below, each at its own Start / Length.");
-    }
-
-    auto &arcs = pc.arcs;
-    const int maxArcs = EdgeLighting::ParticleConfig::MAX_ARCS_CAP;
-    int listed = 0; // arcs shown - and editable - below
-    if (pc.useNeonArc)
-    {
-        // One entry per neon arc, so each has settings of its own to edit.
-        // The library already gives a neon arc past the end of the list the
-        // LAST entry's settings, so growing the list with copies of that entry
-        // changes nothing on screen - it only makes them editable one by one.
-        listed = std::min(static_cast<int>(cfg.neon.arcs.size()), maxArcs);
-        if (static_cast<int>(arcs.size()) < listed)
-        {
-            const EdgeLighting::ParticleArcConfig last =
-                arcs.empty() ? EdgeLighting::ParticleArcConfig{} : arcs.back();
-            arcs.resize(static_cast<size_t>(listed), last);
-        }
-        ImGui::TextDisabled("%d arc(s) - one per Neon > Arcs entry", listed);
-    }
-    else
-    {
-        ImGui::Text("%d / %d arcs", static_cast<int>(arcs.size()), maxArcs);
-        ImGui::SameLine();
-        if (ImGui::SmallButton("+ Add##Particle") && static_cast<int>(arcs.size()) < maxArcs)
-        {
-            // A copy of the arc being edited, moved on past its end so the
-            // two do not start out on top of each other.
-            EdgeLighting::ParticleArcConfig added;
-            if (!arcs.empty())
-            {
-                const int from = std::clamp(mParticleSelected, 0, static_cast<int>(arcs.size()) - 1);
-                added = arcs[static_cast<size_t>(from)];
-                added.arcStart = std::fmod(added.arcStart + added.arcLength, 1.0f);
-            }
-            arcs.push_back(added);
-            mParticleSelected = static_cast<int>(arcs.size()) - 1;
-        }
-        listed = std::min(static_cast<int>(arcs.size()), maxArcs);
-    }
-
-    if (listed == 0)
-    {
-        ImGui::TextDisabled(pc.useNeonArc ? "No neon arcs. Add one under Neon > Arcs."
-                                          : "No arcs. Add one to emit.");
-        return;
-    }
-    mParticleSelected = std::clamp(mParticleSelected, 0, listed - 1);
-
-    // Order matches EdgeLighting::ParticleMode.
-    const char *modeItems[] = {"Movement (trail)", "Head Sparks"};
-
-    // Arc picker: one row each, so the arc an entry drives - neon arc i, or
-    // the i-th own arc - is always visible.
-    for (int i = 0; i < listed; i++)
-    {
-        const auto &a = arcs[static_cast<size_t>(i)];
-        char label[64];
-        std::snprintf(label, sizeof(label), "arc %d  %s%s##ParticlePick%d", i,
-                      modeItems[static_cast<int>(a.mode)], a.enable ? "" : "  (off)", i);
-        if (ImGui::RadioButton(label, mParticleSelected == i))
-        {
-            mParticleSelected = i;
-        }
-        // Own arcs only: with neon arcs the list follows Neon > Arcs.
-        if (!pc.useNeonArc)
-        {
-            ImGui::SameLine();
-            char killLabel[32];
-            std::snprintf(killLabel, sizeof(killLabel), "x##ParticleKill%d", i);
-            if (ImGui::SmallButton(killLabel))
-            {
-                arcs.erase(arcs.begin() + i);
-                mParticleSelected = std::max(0, std::min(mParticleSelected, static_cast<int>(arcs.size()) - 1));
-                return;
-            }
-        }
-    }
-
-    EdgeLighting::ParticleArcConfig &p = arcs[static_cast<size_t>(mParticleSelected)];
-
-    ImGui::Separator();
-    ImGui::Checkbox("Arc Enabled##Particle", &p.enable);
-    if (ImGui::IsItemHovered())
-    {
-        ImGui::SetTooltip("Off clears this arc's particles at once;\n"
-                          "on starts its emitter again from nothing.");
-    }
-    if (!pc.useNeonArc)
-    {
-        // Perimeter space, as in Neon > Arcs: 0 is the rect's top-left corner.
-        SliderWithInput("Arc Start##Particle", p.arcStart, 0.0f, 1.0f, "%.3f");
-        SliderWithInput("Arc Length##Particle", p.arcLength, 0.0f, 1.0f, "%.3f");
-    }
-
-    ImGui::Checkbox("Custom Colour##Particle", &p.useCustomColor);
-    if (p.useCustomColor)
-    {
-        ImGui::SameLine();
-        ImGui::ColorEdit4("##ParticleCustomColour", &p.customColor.x,
-                          ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_AlphaBar);
-    }
-    else if (mParticleManager)
-    {
-        // Where this arc's newborns took the neon's colour from last frame.
-        // It moves with settings that live in OTHER sections - the drawn glow
-        // needs Neon > Res Scale below 1 and the neon drawing (not off, not
-        // Debug > Opaque only) - so it is worth seeing here.
-        switch (mParticleManager->GetColorSource())
-        {
-        case EdgeLighting::ParticleColorSource::NEON_OUTPUT:
-        {
-            ImGui::TextDisabled(pc.useNeonArc ? "Colour: neon as drawn (latched at spawn)"
-                                              : "Colour: neon as drawn (latched at spawn) -\n"
-                                                "invisible where the neon draws nothing");
-            break;
-        }
-        case EdgeLighting::ParticleColorSource::COLOR_RING:
-        {
-            ImGui::TextDisabled("Colour: CPU colour ring - no drawn glow to copy\n"
-                                "(needs Neon on and Neon > Res Scale below 1)");
-            break;
-        }
-        }
-    }
-
-    int modeIdx = static_cast<int>(p.mode);
-    if (ImGui::Combo("Mode##Particle", &modeIdx, modeItems, IM_ARRAYSIZE(modeItems)))
-    {
-        p.mode = static_cast<EdgeLighting::ParticleMode>(modeIdx);
-    }
-    const EdgeLighting::ParticleMode mode = p.mode;
-
-    // HEAD_SPARKS spawns from one point, so its emissionRate is a plain rate;
-    // MOVEMENT reads it as a density along the arc.
-    if (mode == EdgeLighting::ParticleMode::HEAD_SPARKS)
-    {
-        SliderWithInput("Rate##Particle", p.emissionRate, 0.0f, 1000.0f, "%.0f sparks/s");
-        if (ImGui::IsItemHovered())
-        {
-            ImGui::SetTooltip("Sparks/s, clamped to Max Alive / Lifetime");
-        }
-    }
-    else
-    {
-        SliderWithInput("Density##Particle", p.emissionRate, 0.0f, 200.0f, "%.1f");
-        if (ImGui::IsItemHovered())
-        {
-            ImGui::SetTooltip("Motes/s = arc length (px) x 2 x Density / 100,\n"
-                              "clamped to Max Alive / Lifetime");
-        }
-    }
-    SliderWithInput("Lifetime##Particle", p.lifetime, 0.05f, 3.0f, "%.2f s");
-    // Speed means something different per mode - see ParticleArcConfig::speed.
-    switch (mode)
-    {
-    case EdgeLighting::ParticleMode::MOVEMENT:
-    {
-        SliderWithInput("Drift##Particle", p.speed, 0.0f, 400.0f, "%.0f");
-        break;
-    }
-    case EdgeLighting::ParticleMode::HEAD_SPARKS:
-    {
-        SliderWithInput("Speed##Particle", p.speed, 0.0f, 400.0f, "%.0f px/s");
-        break;
-    }
-    }
-    SliderWithInput("Drag##Particle", p.drag, 0.0f, 10.0f);
-    SliderWithInput("Size##Particle", p.sizeStart, 1.0f, 30.0f, "%.1f px");
-    SliderIntWithInput("Max Alive##Particle", p.maxParticles, 32,
-                       EdgeLighting::ParticleArcConfig::MAX_PARTICLES_CAP);
-    SliderWithInput("Scatter Radius##Particle", p.scatterRadius, 0.0f, 40.0f, "%.1f px");
-
-    // The knobs only one mode reads.
-    switch (mode)
-    {
-    case EdgeLighting::ParticleMode::MOVEMENT:
-    {
-        SliderWithInput("Head Bias##Particle", p.headBias, 0.05f, 4.0f);
-        SliderWithInput("Tail Size##Particle", p.tailSizeFraction, 0.0f, 1.0f);
-        break;
-    }
-    case EdgeLighting::ParticleMode::HEAD_SPARKS:
-    {
-        SliderWithInput("Spread##Particle", p.spreadDeg, 0.0f, 360.0f, "%.0f deg");
-        SliderWithInput("Outward Bias##Particle", p.outwardBias, 0.0f, 1.0f);
-        if (ImGui::IsItemHovered())
-        {
-            ImGui::SetTooltip("0 = along the sweep, 1 = straight out of the rect");
-        }
-        break;
-    }
-    }
-
-    if (listed > 1)
-    {
-        if (ImGui::SmallButton("Copy To Every Arc##Particle"))
-        {
-            // Everything but WHERE: each own arc keeps its Start / Length.
-            const EdgeLighting::ParticleArcConfig source = p;
-            for (auto &a : arcs)
-            {
-                const float start = a.arcStart;
-                const float length = a.arcLength;
-                a = source;
-                a.arcStart = start;
-                a.arcLength = length;
-            }
-        }
-        if (ImGui::IsItemHovered())
-        {
-            ImGui::SetTooltip("This arc's settings onto every other arc, all but Start / Length");
-        }
-    }
-
-    ImGui::TextDisabled(pc.useNeonArc ? "A static neon arc keeps its emission in place -\n"
-                                        "add an Outline Tracer or Arc Wipe to move it."
-                                      : "Own arcs stay where Start / Length put them;\n"
-                                        "they do not follow the neon's arcs.");
-}
-
 void DebugUI::buildSpotlightSection(EdgeLighting::Config &cfg)
 {
     if (!ImGui::CollapsingHeader("Spotlights", ImGuiTreeNodeFlags_DefaultOpen))
@@ -1378,26 +1232,26 @@ void DebugUI::buildSpotlightSection(EdgeLighting::Config &cfg)
     SliderWithInput("Res Scale##Spot", cfg.spotlight.resolutionScale, 0.125f, 1.0f, "%.3f");
     if (cfg.spotlight.resolutionScale < 1.0f)
     {
-        // The library holds the scale at 1.0 while a clipped lamp is enabled,
-        // because the clip edge has to be resolved at full resolution. Say so
-        // here, or the slider reads as broken: it moves and the frame does not
-        // change. Mirrors SpotlightRenderer's own HasClippedLamp test - the
-        // lamps that DRAW, within the ceiling.
+        // The library holds the scale at 1.0 while a clipped or shadow-casting
+        // lamp is enabled, because a mask edge has to be resolved at full
+        // resolution. Say so here, or the slider reads as broken: it moves and
+        // the frame does not change. Mirrors SpotlightRenderer's own
+        // HasMaskedLamp test - the lamps that DRAW, within the ceiling.
         size_t drawnLamps = std::min(cfg.spotlight.lamps.size(), size_t(SPOT_MAX_LAMPS));
-        bool anyClippedLamp = false;
+        bool anyMaskedLamp = false;
         for (size_t i = 0; i < drawnLamps; i++)
         {
             const auto &lamp = cfg.spotlight.lamps[i];
-            if (lamp.clipped && lamp.enable && lamp.intensity > 0.0f)
+            if ((lamp.clipped || lamp.castsShadow) && lamp.enable && lamp.intensity > 0.0f)
             {
-                anyClippedLamp = true;
+                anyMaskedLamp = true;
                 break;
             }
         }
 
-        if (anyClippedLamp)
+        if (anyMaskedLamp)
         {
-            ImGui::TextDisabled("Held at 1.0: a clipped lamp is enabled.");
+            ImGui::TextDisabled("Held at 1.0: a clipped or shadow-casting lamp is enabled.");
         }
         else if (cfg.spotlight.lamps.size() < 6)
         {
@@ -1465,6 +1319,118 @@ void DebugUI::buildSpotlightSection(EdgeLighting::Config &cfg)
         {
             ImGui::TextDisabled("Zero-size area: every clipped lamp draws nothing.");
         }
+
+        ImGui::Unindent();
+    }
+
+    // --- Shadow caster: ONE picture standing off the wall, opted into per
+    // lamp below with "Cast Shadow". Always shown for the reason the clip area
+    // is: it has no enable of its own.
+    ImGui::SeparatorText("Shadow Caster");
+    auto &caster = cfg.spotlight.shadowCaster;
+    {
+        ImGui::Indent();
+
+        SliderWithInput("X##SpotShadow", caster.position.x, -200.0f, 2400.0f, "%.0f px");
+        SliderWithInput("Y##SpotShadow", caster.position.y, -200.0f, 1600.0f, "%.0f px");
+        SliderWithInput("Width##SpotShadow", caster.width, 0.0f, 2400.0f, "%.0f px");
+        SliderWithInput("Height##SpotShadow", caster.height, 0.0f, 1600.0f, "%.0f px");
+        SliderWithInput("Corner Radius##SpotShadow", caster.cornerRadius, 0.0f, 400.0f, "%.0f px");
+        // How far the picture stands off the wall. Against each lamp's own
+        // Wall Distance this sets how far the shadow is thrown and how soft
+        // its edge is: the shadow is the picture scaled by
+        // lamp / (lamp - caster) about the lamp.
+        SliderWithInput("Wall Distance##SpotShadow", caster.wallDistance, 0.0f, 200.0f, "%.0f px");
+        SliderWithInput("Softness##SpotShadow", caster.softness, 0.0f, 40.0f, "%.1f px");
+        SliderWithInput("Opacity##SpotShadow", caster.opacity, 0.0f, 1.0f, "%.2f");
+        // 0 is physical: a second lamp only adds its own light inside the
+        // first one's shadow. Above it the other lamps wash the shadow out -
+        // a look, and a second pass of this layer.
+        SliderWithInput("Fill##SpotShadow", caster.fill, 0.0f, 1.0f, "%.2f");
+        if (ImGui::IsItemHovered())
+        {
+            ImGui::SetTooltip("How far the OTHER lamps' light washes a lamp's shadow out.\n"
+                              "0 = physical (the shadow shows lighter where another lamp shines).\n"
+                              "1 = gone wherever the others give half the shadowed lamp's light.\n"
+                              "Above 0 the layer draws twice.");
+        }
+
+        // A solid block (a framed picture standing out from the wall) rather
+        // than a flat panel floating in front of it. See
+        // docs/spotlight-solid-frame-plan.md.
+        ImGui::Checkbox("Solid##SpotShadow", &caster.solid);
+        if (ImGui::IsItemHovered())
+        {
+            ImGui::SetTooltip("The caster fills everything from the wall to its Wall Distance.\n"
+                              "Its shadow is attached to it, and a lamp no further from the\n"
+                              "wall than it is deep throws a shadow that never ends.");
+        }
+        // The frame's rails, and how far the picture sits behind them: with
+        // both above 0 the top rail shades the top of the picture.
+        SliderWithInput("Frame Width##SpotShadow", caster.frameWidth, 0.0f, 200.0f, "%.0f px");
+        SliderWithInput("Frame Depth##SpotShadow", caster.frameDepth, 0.0f, 100.0f, "%.0f px");
+
+        // Same bridge as the clip's: a one-off copy, not a binding.
+        if (ImGui::SmallButton("Match Rect##SpotShadow"))
+        {
+            caster.position = cfg.geometry.position;
+            caster.width = cfg.geometry.width;
+            caster.height = cfg.geometry.height;
+            caster.cornerRadius = cfg.geometry.cornerRadius;
+        }
+        ImGui::SameLine();
+
+        // A downlight over the rect throwing its shadow, after the reference
+        // photo this feature was built against: the caster matched to the
+        // rect, one warm lamp a rect-height above it, the lamp about five and a
+        // half times further off the wall than the picture. Replaces the lamp
+        // list - it is a starting point, not an addition to a rig.
+        //
+        // "Solid Frame" is the same rig with the caster made a solid framed
+        // picture: rails 4% of the shorter side, the picture 10 px behind
+        // them. Lower the lamp's Wall Distance under the caster's to see the
+        // light stop at the frame.
+        const bool pictureLight = ImGui::SmallButton("Picture Light##SpotShadow");
+        ImGui::SameLine();
+        const bool solidFrame = ImGui::SmallButton("Solid Frame##SpotShadow");
+        if (pictureLight || solidFrame)
+        {
+            const auto &g = cfg.geometry;
+            caster.position = g.position;
+            caster.width = g.width;
+            caster.height = g.height;
+            caster.cornerRadius = g.cornerRadius;
+            caster.wallDistance = 29.0f;
+            caster.softness = 6.0f;
+            caster.opacity = 1.0f;
+            caster.fill = 0.0f;
+            caster.solid = solidFrame;
+            caster.frameWidth = solidFrame ? 0.04f * std::min(g.width, g.height) : 0.0f;
+            caster.frameDepth = solidFrame ? 10.0f : 0.0f;
+
+            EdgeLighting::SpotLight l;
+            l.position = glm::vec2(g.position.x + g.width * 0.5f,
+                                   std::max(g.position.y - g.height, 24.0f));
+            l.angle = 90.0f;
+            l.beamAngle = 64.0f;
+            l.throwLength = 1400.0f;
+            l.spreadFalloff = 0.6f;
+            l.apertureWidth = 22.0f;
+            l.softness = 0.75f;
+            l.intensity = 4.0f;
+            l.bloom = 0.6f;
+            l.bloomRadius = 22.0f;
+            l.colorTemp = 2900.0f;
+            l.wallDistance = 160.0f;
+            l.castsShadow = true;
+
+            cfg.spotlight.lamps.clear();
+            cfg.spotlight.lamps.push_back(l);
+            mSpotlightSelected = 0;
+        }
+        ImGui::TextDisabled("copy once - it does not follow the rect");
+        ImGui::TextDisabled("Light only: the shadow shows over a dark backdrop.");
+        ImGui::TextDisabled("For a picture in the rect: Border Color Picker > Show as backdrop.");
 
         ImGui::Unindent();
     }
@@ -1545,6 +1511,19 @@ void DebugUI::buildSpotlightSection(EdgeLighting::Config &cfg)
     ImGui::Checkbox("Lamp Enabled##Spot", &l.enable);
 
     ImGui::Checkbox("Clip This Lamp##Spot", &l.clipped);
+
+    // The shadow caster's per-lamp half. Wall Distance is read by the shadow
+    // only - the cone does not change with it - so it sits here with the
+    // switch rather than among the beam controls.
+    ImGui::Checkbox("Cast Shadow##Spot", &l.castsShadow);
+    SliderWithInput("Wall Distance##Spot", l.wallDistance, 1.0f, 1000.0f, "%.0f px");
+    if (ImGui::IsItemHovered())
+    {
+        ImGui::SetTooltip("How far the lamp stands off the wall. Shadow only.\n"
+                          "Closer to the wall (relative to the caster) throws\n"
+                          "a longer, softer shadow. At or under the caster's\n"
+                          "distance the lamp casts nothing.");
+    }
 
     // App coordinates, top-left origin, +y down - the same space as
     // Geometry > Position, which is why the ranges here are viewport-sized

@@ -10,25 +10,28 @@
 
 namespace EdgeLighting
 {
-    /// Freely placed and aimed cones of light, drawn as ONE additive pass.
+    /// Freely placed and aimed cones of light, drawn as ONE screened pass.
     ///
     /// The odd one out in this library: every other renderer parameterises its
     /// look by position along the rect's perimeter, and this one does not
     /// touch the rect at all. A lamp sits at a @c SpotLight::position in app
-    /// coordinates and points at a @c SpotLight::angle, and nothing occludes
-    /// it - a cone crosses the frame freely.
+    /// coordinates and points at a @c SpotLight::angle, and the rect does not
+    /// occlude it - a cone crosses the frame freely. The only occluder is one
+    /// the host places explicitly: see the shadow caster below.
     ///
     /// It also emits LIGHT ONLY. No backdrop, no fixture housings, no floor,
     /// no framebuffer capture, no LUT. What it is is the whole term stack in
     /// spotlight.frag, evaluated over the smallest geometry that can contain
     /// it.
     ///
-    /// Light only, but NOT alpha-free: the pass is additive in the alpha
-    /// channel as well as in colour, so the framebuffer ends up recording
-    /// where light was written. It used to emit a literal alpha 0, which costs
-    /// nothing on an opaque desktop window and erases the entire layer on an
-    /// embedded surface a compositor or hardware video plane blends by alpha.
-    /// See @ref Render for the blend and the measurement.
+    /// Light only, but NOT alpha-free: the pass SCREENS - `dst + src * (1 -
+    /// dst)` - in the alpha channel as well as in colour, so the framebuffer
+    /// ends up recording where light was written. It used to emit a literal
+    /// alpha 0, which costs nothing on an opaque desktop window and erases the
+    /// entire layer on an embedded surface a compositor or hardware video
+    /// plane blends by alpha. A screen rather than an add so that overlapping
+    /// lamps approach full scale instead of clipping. See @ref Render for the
+    /// blend and the measurements.
     ///
     /// **One renderer, two resolution paths**, selected by
     /// @c SpotlightConfig::resolutionScale: at 1.0 the strips draw straight
@@ -36,8 +39,9 @@ namespace EdgeLighting
     /// blit); below 1.0 they draw into a buffer of that fraction of the
     /// viewport and are bilinear-blitted back.
     ///
-    /// **An enabled clipped lamp pins the scale to 1.0**, because the clip
-    /// mask is resolved per fragment and a reduced buffer would resolve its
+    /// **An enabled clipped or shadow-casting lamp pins the scale to 1.0**,
+    /// because the clip mask (and the shadow's edge at the caster) is resolved
+    /// per fragment and a reduced buffer would resolve its
     /// boundary at that buffer's texel pitch - moving the edge, leaking light
     /// outside a @c KEEP_INSIDE area, and flattening
     /// @c ClipArea::edgeSoftness. The scaled path below is therefore only
@@ -98,6 +102,32 @@ namespace EdgeLighting
     /// reduced-resolution buffer, which is why opting a lamp in costs the
     /// resolution scale - see the note on the two paths above.
     ///
+    /// **Light can be shadowed by a picture** -
+    /// @c SpotlightConfig::shadowCaster, a rounded rectangle standing
+    /// @c ShadowCaster::wallDistance px off the wall, opted into per lamp by
+    /// @c SpotLight::castsShadow. Each fragment tests the line from itself to
+    /// the lamp (which stands @c SpotLight::wallDistance px off the wall)
+    /// against the caster, so the shadow is thrown away from the lamp and
+    /// follows it when it moves; the lamp's aperture sets the penumbra. The
+    /// caster's own face stays lit. Like the clip it is a coverage multiply
+    /// that only removes light, so the solved strips stand as they are - and
+    /// like the clip it pins the resolution scale.
+    ///
+    /// The caster is a flat panel by default. @c ShadowCaster::solid makes it
+    /// a block from the wall out to its depth - a framed picture - whose
+    /// shadow is attached to it and, for a lamp no further from the wall than
+    /// the block is deep, never ends; @c frameWidth / @c frameDepth give it
+    /// rails that shade the recessed picture inside them. See
+    /// docs/spotlight-solid-frame-plan.md.
+    ///
+    /// By default that shadow is physical: a second lamp lights a point in
+    /// the first one's shadow with exactly its own light, so the shadow shows
+    /// lighter wherever the second lamp is weaker. @c ShadowCaster::fill
+    /// washes it out instead, at the price of a SECOND PASS: the lamps are
+    /// drawn into @c mFillBuffer first, then drawn again onto the target by
+    /// a variant of the same program that reads how much of each pixel's
+    /// light came from the other lamps.
+    ///
     /// Parameters come from @c Config::spotlight. Nothing else is read - not
     /// @c Config::geometry, not @c Config::neon. The clip area is part of that
     /// sub-config rather than a reuse of @c Config::geometry for exactly this
@@ -112,6 +142,7 @@ namespace EdgeLighting
         virtual void Update(float deltaTime, float time, const Config &config) override;
         virtual void Render(int viewportWidth, int viewportHeight, float time, const Config &config) override;
         virtual void OnConfigChanged(const Config &config) override;
+        virtual RendererLayer GetLayer() const override { return RendererLayer::SPOTLIGHT; }
 
     private:
         /// One vertex of a lamp's strip. Declared here rather than in the .cpp
@@ -146,13 +177,38 @@ namespace EdgeLighting
             /// costs nothing here: these are separate attribute pointers, not
             /// a std140 block.
             float spreadFalloff;
+            /// The shadow, per lamp: the lamp's app position (x, y), the ratio
+            /// t = caster / lamp wall distance, and the penumbra's half width
+            /// on the caster's plane in px. Well-formed for EVERY lamp, a lamp
+            /// that casts nothing included (t 0, half width floored), because
+            /// the shader evaluates the mask before weighting it - see
+            /// spotShadowMask in spotlight.frag.
+            float shadow[4];
+            /// How much of the caster this lamp honours: @c ShadowCaster::opacity
+            /// for a lamp that casts a shadow, 0 for one that does not. A
+            /// WEIGHT, for the reason @c clipWeight is one.
+            float shadowWeight;
+            /// The frame's rails shading the picture inside them, per lamp:
+            /// t_in = frameDepth / (lamp distance - picture depth), and the
+            /// penumbra's half width at the rails' front in px. (0, floored
+            /// width) when the caster has no recess. See
+            /// docs/spotlight-solid-frame-plan.md section 3.2.
+            float recess[2];
         } StripVertex;
 
-        static_assert(sizeof(StripVertex) == 17 * sizeof(float),
+        static_assert(sizeof(StripVertex) == 24 * sizeof(float),
                       "StripVertex must be tightly packed - ensureBuffer's "
                       "attribute pointers use sizeof(StripVertex) as the stride.");
 
         bool setupShaders();
+
+        /// The uniforms every strip program reads - the projection, the clip
+        /// area and the shadow caster. One function for the plain program and
+        /// the fill variant, so the two passes of a filled frame cannot draw
+        /// the strips under different values.
+        void uploadStripUniforms(ShaderProgram &program, const glm::mat4 &mvp,
+                                 const Config &config);
+
         void setupBlitGeometry();
 
         /// Allocate the VBO at its CEILING size and record the attribute
@@ -174,7 +230,8 @@ namespace EdgeLighting
         /// includes the <= 37 KB @c glBufferSubData into the ceiling-sized
         /// allocation @ref ensureBuffer made once. (Those numbers predate the
         /// clip attribute, which added one float per vertex and no
-        /// transcendental calls at all.)
+        /// transcendental calls at all, and the shadow's five, which take the
+        /// ceiling upload to ~50 KB and add one divide per lamp.)
         ///
         /// The flatness across lamp counts is the useful part of that number.
         /// The arithmetic is **998 transcendental calls for one lamp and 7,880
@@ -198,10 +255,23 @@ namespace EdgeLighting
         /// off 1.0, is a stall exactly where it will be blamed on the scale.
         /// (Reuses the neon blit shader - identical job.)
         ShaderProgram mBlitShader;
+        /// spotlight.frag with SPOT_FILL defined: the second pass of a frame
+        /// with @c ShadowCaster::fill above 0, reading @c mFillBuffer to find
+        /// how much of each pixel's light came from the OTHER lamps. Built in
+        /// @ref setupShaders with the others, but NOT required by
+        /// @ref Initialize - if it fails, a filled frame draws the physical
+        /// shadow instead, and the layer keeps working.
+        ShaderProgram mFillShader;
         /// Allocated only when the scaled path first runs; at scale 1.0 this
         /// stays empty and costs nothing, and it is released again as soon as
         /// a config stops asking for it.
         Framebuffer mScaledBuffer{"Spotlight.Scaled"};
+        /// The fill pass's source: every lamp, shadows applied, at the
+        /// viewport's size. Same lifetime rule as @c mScaledBuffer - allocated
+        /// the first frame a fill needs it, released when a config stops
+        /// asking. Never needed alongside it: a fill needs a shadow-casting
+        /// lamp, and that pins the scale to 1.0.
+        Framebuffer mFillBuffer{"Spotlight.Fill"};
         VertexArray mVertexArray{"SpotlightRenderer"};
         /// Fullscreen NDC quad for the blit. A second VAO rather than a reuse
         /// of @c mVertexArray: that one carries the five-attribute strip
@@ -218,12 +288,12 @@ namespace EdgeLighting
         /// Staging for @ref buildStrips, a member rather than a local for the
         /// reason @ref ensureBuffer gives about the VBO: under an animation
         /// that method runs every frame, and a local would heap-allocate and
-        /// free its 34 KB ceiling on each one. Cleared, never shrunk, so it
+        /// free its ~50 KB ceiling on each one. Cleared, never shrunk, so it
         /// allocates exactly once.
         std::vector<StripVertex> mStripVerts;
 
-        int mVertexCount = 0;       ///< Vertices @ref buildStrips last wrote.
-        bool mBufferReady = false;  ///< Whether @ref ensureBuffer has run.
+        int mVertexCount = 0;      ///< Vertices @ref buildStrips last wrote.
+        bool mBufferReady = false; ///< Whether @ref ensureBuffer has run.
         /// Whether the VBO has been filled for @c mCurrentSpotlight. Starts
         /// false so the first build is unconditional however the renderer is
         /// brought up - @ref Initialize and @ref OnConfigChanged both honour it.

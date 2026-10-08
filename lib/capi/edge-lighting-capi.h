@@ -91,7 +91,6 @@
 #include "el-effect.h"
 #include "el-animation.h"
 #include "el-modulator.h"
-#include "el-particle.h"
 
 /* Still-exported names scheduled for removal; see the checklist at the top of
  * that header. Included last so the replacements above are declared first. */

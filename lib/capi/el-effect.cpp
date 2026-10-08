@@ -8,6 +8,123 @@ namespace
     /// ColorStop::color.a is an emission scale rather than a blend opacity,
     /// that renders as "dark here" instead of as a merely unset colour.
     const EdgeLighting::ColorStop DEFAULT_COLOR_STOP{0.0f, glm::vec4(1.0f)};
+
+    /// The opaque fill's cutoff on @p side. Returns nullptr and logs for a
+    /// value outside el_cutoff_side_e - the enum crosses the ABI as a plain
+    /// int, so an out-of-range one is a caller error, not something to clamp.
+    ///
+    /// Switched on as an int, not as the enum. C++ gives an unscoped enum
+    /// whose enumerators are 0 and 1 the value range [0, 1], so a switch on
+    /// the enum itself lets an optimiser assume nothing else arrives - and
+    /// the rejection below is exactly the path it would be free to drop.
+    EdgeLighting::Cutoff *OpaqueCutoffSlot(el_effect_handle_t effect, el_cutoff_side_e side, const char *who)
+    {
+        switch (static_cast<int>(side))
+        {
+        case EL_CUTOFF_SIDE_INSIDE:
+        {
+            return &effect->config.neon.opaqueInsideCutoff;
+        }
+        case EL_CUTOFF_SIDE_OUTSIDE:
+        {
+            return &effect->config.neon.opaqueOutsideCutoff;
+        }
+        default:
+        {
+            break;
+        }
+        }
+        LOG_E("%s: invalid side %d", who, static_cast<int>(side));
+        return nullptr;
+    }
+
+    /// Writes the ABI's (enable, size, softness) triple into @p c and reports
+    /// whether anything moved. The shared body of every cutoff setter, glow
+    /// and fill alike; logging stays with the caller so each line is
+    /// attributed to the entry point that made the change.
+    bool AssignCutoff(EdgeLighting::Cutoff &c, el_bool_t enable, float size, float softness)
+    {
+        const EdgeLighting::Cutoff next = {enable != 0, size, softness};
+        if (c == next)
+        {
+            return false;
+        }
+        c = next;
+        return true;
+    }
+
+    /// The getter-side mirror of @ref AssignCutoff. The out pointers are
+    /// validated by the caller, which owns the name the error is logged under.
+    void ReadCutoff(const EdgeLighting::Cutoff &c, el_bool_t *outEnable, float *outSize, float *outSoftness)
+    {
+        *outEnable = c.enable ? 1 : 0;
+        *outSize = c.size;
+        *outSoftness = c.softness;
+    }
+
+    /// Shared bounds check for the by-index spotlight accessors. Returns
+    /// nullptr and logs when @p index names no lamp.
+    EdgeLighting::SpotLight *SpotlightSlot(el_effect_handle_t effect, int32_t index, const char *who)
+    {
+        if (index < 0 || static_cast<size_t>(index) >= effect->config.spotlight.lamps.size())
+        {
+            LOG_E("%s: index %d out of range (size=%zu)", who, index,
+                  effect->config.spotlight.lamps.size());
+            return nullptr;
+        }
+        return &effect->config.spotlight.lamps[static_cast<size_t>(index)];
+    }
+
+    /// Copies a C layer array into RendererLayers, checking only its C shape:
+    /// a non-negative count and a non-null array when the count is not zero.
+    /// The flag values are the enum's (see the static_asserts in
+    /// capi-internal.h); whether each names exactly one layer, once, is
+    /// EdgeLightingEffect::IsValidLayerList's to judge.
+    bool CopyLayerArray(const uint32_t *order, int32_t count, const char *fn,
+                        std::vector<EdgeLighting::RendererLayer> &out)
+    {
+        if (count < 0 || (count > 0 && !order))
+        {
+            LOG_E("%s: invalid layer list (order=%p, count=%d)", fn, (const void *)order, count);
+            return false;
+        }
+        out.clear();
+        for (int32_t i = 0; i < count; i++)
+        {
+            out.push_back(static_cast<EdgeLighting::RendererLayer>(order[i]));
+        }
+        return true;
+    }
+
+    /// Fresh effect, then the layers in @p order, then Initialize. A renderer
+    /// that fails is dropped by Initialize and the rest keep running.
+    /// Re-initialising a handle replaces its whole stack.
+    el_result_e InitLayers(el_effect_handle_t effect, const std::vector<EdgeLighting::RendererLayer> &order)
+    {
+        effect->impl = std::make_unique<EdgeLighting::EdgeLightingEffect>();
+        for (EdgeLighting::RendererLayer layer : order)
+        {
+            effect->impl->AddRenderer(layer);
+        }
+        if (!effect->impl->Initialize())
+        {
+            LOG_E("renderer initialisation failed - %zu of %zu layers kept",
+                  effect->impl->GetLayerOrder().size(), order.size());
+            return EL_ERROR_INIT_FAILED;
+        }
+        return EL_SUCCESS;
+    }
+
+    /// Shared entry check for the calls that reorder an initialised effect.
+    bool IsInitialised(el_effect_handle_t effect, const char *fn)
+    {
+        if (!effect->impl)
+        {
+            LOG_E("%s: effect is not initialised", fn);
+            return false;
+        }
+        return true;
+    }
 }
 
 // ==========================================================================
@@ -104,10 +221,6 @@ el_result_e el_effect_get_opaque_mode(el_effect_handle_t effect, el_opaque_mode_
     return EL_SUCCESS;
 }
 
-// Lives in DebugConfig with the overlay flags, but it selects which of the
-// NEON renderer's passes run - so it is declared and implemented here with
-// the rest of the opaque group rather than with the overlays.
-
 el_result_e el_effect_set_opaque_color(el_effect_handle_t effect,
                                        float r, float g, float b, float a)
 {
@@ -132,19 +245,38 @@ el_result_e el_effect_get_opaque_color(el_effect_handle_t effect,
     return EL_SUCCESS;
 }
 
-el_result_e el_effect_set_opaque_softness(el_effect_handle_t effect, float softness)
+el_result_e el_effect_set_opaque_cutoff(el_effect_handle_t effect, el_cutoff_side_e side,
+                                        el_bool_t enable, float size, float softness)
 {
-    VALIDATE_EFFECT_PTR(effect, "el_effect_set_opaque_softness");
-    SET_AND_LOG(effect->config.neon.opaqueSoftness, softness,
-                "effect=%p, softness=%f", (void *)effect, softness);
+    VALIDATE_EFFECT_PTR(effect, "el_effect_set_opaque_cutoff");
+    EdgeLighting::Cutoff *c = OpaqueCutoffSlot(effect, side, "el_effect_set_opaque_cutoff");
+    if (!c)
+    {
+        return EL_ERROR_INVALID_PARAMETER;
+    }
+    if (AssignCutoff(*c, enable, size, softness))
+    {
+        LOG_I("effect=%p, side=%d, enable=%d, size=%f, softness=%f", (void *)effect,
+              static_cast<int>(side), enable, size, softness);
+    }
+    return EL_SUCCESS;
 }
 
-el_result_e el_effect_get_opaque_softness(el_effect_handle_t effect, float *outSoftness)
+el_result_e el_effect_get_opaque_cutoff(el_effect_handle_t effect, el_cutoff_side_e side,
+                                        el_bool_t *outEnable, float *outSize, float *outSoftness)
 {
-    VALIDATE_EFFECT_PTR(effect, "el_effect_get_opaque_softness");
-    VALIDATE_OUT_PTR(outSoftness, "el_effect_get_opaque_softness");
-    *outSoftness = effect->config.neon.opaqueSoftness;
-    LOG_D("effect=%p, softness=%f", (void *)effect, *outSoftness);
+    VALIDATE_EFFECT_PTR(effect, "el_effect_get_opaque_cutoff");
+    VALIDATE_OUT_PTR(outEnable, "el_effect_get_opaque_cutoff");
+    VALIDATE_OUT_PTR(outSize, "el_effect_get_opaque_cutoff");
+    VALIDATE_OUT_PTR(outSoftness, "el_effect_get_opaque_cutoff");
+    const EdgeLighting::Cutoff *c = OpaqueCutoffSlot(effect, side, "el_effect_get_opaque_cutoff");
+    if (!c)
+    {
+        return EL_ERROR_INVALID_PARAMETER;
+    }
+    ReadCutoff(*c, outEnable, outSize, outSoftness);
+    LOG_D("effect=%p, side=%d, enable=%d, size=%f, softness=%f", (void *)effect,
+          static_cast<int>(side), *outEnable, *outSize, *outSoftness);
     return EL_SUCCESS;
 }
 
@@ -152,16 +284,10 @@ el_result_e el_effect_set_inside_cutoff(el_effect_handle_t effect,
                                         el_bool_t enable, float size, float softness)
 {
     VALIDATE_EFFECT_PTR(effect, "el_effect_set_inside_cutoff");
-    auto &c = effect->config.neon.insideCutoff;
-    bool en = (enable != 0);
-    if (c.enable == en && c.size == size && c.softness == softness)
+    if (AssignCutoff(effect->config.neon.insideCutoff, enable, size, softness))
     {
-        return EL_SUCCESS;
+        LOG_I("effect=%p, enable=%d, size=%f, softness=%f", (void *)effect, enable, size, softness);
     }
-    LOG_I("effect=%p, enable=%d, size=%f, softness=%f", (void *)effect, enable, size, softness);
-    c.enable = en;
-    c.size = size;
-    c.softness = softness;
     return EL_SUCCESS;
 }
 
@@ -172,10 +298,7 @@ el_result_e el_effect_get_inside_cutoff(el_effect_handle_t effect,
     VALIDATE_OUT_PTR(outEnable, "el_effect_get_inside_cutoff");
     VALIDATE_OUT_PTR(outSize, "el_effect_get_inside_cutoff");
     VALIDATE_OUT_PTR(outSoftness, "el_effect_get_inside_cutoff");
-    const auto &c = effect->config.neon.insideCutoff;
-    *outEnable = c.enable ? 1 : 0;
-    *outSize = c.size;
-    *outSoftness = c.softness;
+    ReadCutoff(effect->config.neon.insideCutoff, outEnable, outSize, outSoftness);
     LOG_D("effect=%p, enable=%d, size=%f, softness=%f", (void *)effect, *outEnable, *outSize, *outSoftness);
     return EL_SUCCESS;
 }
@@ -184,16 +307,10 @@ el_result_e el_effect_set_outside_cutoff(el_effect_handle_t effect,
                                          el_bool_t enable, float size, float softness)
 {
     VALIDATE_EFFECT_PTR(effect, "el_effect_set_outside_cutoff");
-    auto &c = effect->config.neon.outsideCutoff;
-    bool en = (enable != 0);
-    if (c.enable == en && c.size == size && c.softness == softness)
+    if (AssignCutoff(effect->config.neon.outsideCutoff, enable, size, softness))
     {
-        return EL_SUCCESS;
+        LOG_I("effect=%p, enable=%d, size=%f, softness=%f", (void *)effect, enable, size, softness);
     }
-    LOG_I("effect=%p, enable=%d, size=%f, softness=%f", (void *)effect, enable, size, softness);
-    c.enable = en;
-    c.size = size;
-    c.softness = softness;
     return EL_SUCCESS;
 }
 
@@ -204,10 +321,7 @@ el_result_e el_effect_get_outside_cutoff(el_effect_handle_t effect,
     VALIDATE_OUT_PTR(outEnable, "el_effect_get_outside_cutoff");
     VALIDATE_OUT_PTR(outSize, "el_effect_get_outside_cutoff");
     VALIDATE_OUT_PTR(outSoftness, "el_effect_get_outside_cutoff");
-    const auto &c = effect->config.neon.outsideCutoff;
-    *outEnable = c.enable ? 1 : 0;
-    *outSize = c.size;
-    *outSoftness = c.softness;
+    ReadCutoff(effect->config.neon.outsideCutoff, outEnable, outSize, outSoftness);
     LOG_D("effect=%p, enable=%d, size=%f, softness=%f", (void *)effect, *outEnable, *outSize, *outSoftness);
     return EL_SUCCESS;
 }
@@ -1099,22 +1213,6 @@ el_result_e el_effect_clear_arcs(el_effect_handle_t effect)
 // per scalar; all of them address a lamp by index and none of them grows
 // the list, mirroring the arc family above.
 
-namespace
-{
-    /// Shared bounds check for the by-index spotlight accessors. Returns
-    /// nullptr and logs when @p index names no lamp.
-    EdgeLighting::SpotLight *SpotlightSlot(el_effect_handle_t effect, int32_t index, const char *who)
-    {
-        if (index < 0 || static_cast<size_t>(index) >= effect->config.spotlight.lamps.size())
-        {
-            LOG_E("%s: index %d out of range (size=%zu)", who, index,
-                  effect->config.spotlight.lamps.size());
-            return nullptr;
-        }
-        return &effect->config.spotlight.lamps[static_cast<size_t>(index)];
-    }
-}
-
 el_result_e el_effect_set_spotlight_renderer_enabled(el_effect_handle_t effect, el_bool_t enabled)
 {
     VALIDATE_EFFECT_PTR(effect, "el_effect_set_spotlight_renderer_enabled");
@@ -1446,6 +1544,67 @@ el_result_e el_effect_get_spotlight_clipped(el_effect_handle_t effect, int32_t i
     return EL_SUCCESS;
 }
 
+el_result_e el_effect_set_spotlight_casts_shadow(el_effect_handle_t effect, int32_t index, el_bool_t castsShadow)
+{
+    VALIDATE_EFFECT_PTR(effect, "el_effect_set_spotlight_casts_shadow");
+    auto *l = SpotlightSlot(effect, index, "el_effect_set_spotlight_casts_shadow");
+    if (!l)
+    {
+        return EL_ERROR_INVALID_PARAMETER;
+    }
+    const bool v = (castsShadow != 0);
+    if (l->castsShadow == v)
+    {
+        return EL_SUCCESS;
+    }
+    LOG_I("effect=%p, index=%d, castsShadow=%d", (void *)effect, index, (int)castsShadow);
+    l->castsShadow = v;
+    return EL_SUCCESS;
+}
+
+el_result_e el_effect_get_spotlight_casts_shadow(el_effect_handle_t effect, int32_t index, el_bool_t *outCastsShadow)
+{
+    VALIDATE_EFFECT_PTR(effect, "el_effect_get_spotlight_casts_shadow");
+    VALIDATE_OUT_PTR(outCastsShadow, "el_effect_get_spotlight_casts_shadow");
+    auto *l = SpotlightSlot(effect, index, "el_effect_get_spotlight_casts_shadow");
+    if (!l)
+    {
+        return EL_ERROR_INVALID_PARAMETER;
+    }
+    *outCastsShadow = l->castsShadow ? 1 : 0;
+    return EL_SUCCESS;
+}
+
+el_result_e el_effect_set_spotlight_wall_distance(el_effect_handle_t effect, int32_t index, float wallDistance)
+{
+    VALIDATE_EFFECT_PTR(effect, "el_effect_set_spotlight_wall_distance");
+    auto *l = SpotlightSlot(effect, index, "el_effect_set_spotlight_wall_distance");
+    if (!l)
+    {
+        return EL_ERROR_INVALID_PARAMETER;
+    }
+    if (l->wallDistance == wallDistance)
+    {
+        return EL_SUCCESS;
+    }
+    LOG_I("effect=%p, index=%d, wallDistance=%f", (void *)effect, index, wallDistance);
+    l->wallDistance = wallDistance;
+    return EL_SUCCESS;
+}
+
+el_result_e el_effect_get_spotlight_wall_distance(el_effect_handle_t effect, int32_t index, float *outWallDistance)
+{
+    VALIDATE_EFFECT_PTR(effect, "el_effect_get_spotlight_wall_distance");
+    VALIDATE_OUT_PTR(outWallDistance, "el_effect_get_spotlight_wall_distance");
+    auto *l = SpotlightSlot(effect, index, "el_effect_get_spotlight_wall_distance");
+    if (!l)
+    {
+        return EL_ERROR_INVALID_PARAMETER;
+    }
+    *outWallDistance = l->wallDistance;
+    return EL_SUCCESS;
+}
+
 el_result_e el_effect_clear_spotlights(el_effect_handle_t effect)
 {
     VALIDATE_EFFECT_PTR(effect, "el_effect_clear_spotlights");
@@ -1538,6 +1697,164 @@ el_result_e el_effect_get_spotlight_clip_mode(el_effect_handle_t effect, el_clip
     VALIDATE_OUT_PTR(outMode, "el_effect_get_spotlight_clip_mode");
     *outMode = static_cast<el_clip_mode_e>(effect->config.spotlight.clipArea.mode);
     LOG_D("effect=%p, mode=%d", (void *)effect, (int)*outMode);
+    return EL_SUCCESS;
+}
+
+// --- Spotlight shadow caster ---
+
+// Same parameter order as el_effect_set_geometry and the clip rectangle, so a
+// host can forward its rect straight in. See the header.
+el_result_e el_effect_set_spotlight_shadow_rect(el_effect_handle_t effect,
+                                                float width, float height,
+                                                float x, float y,
+                                                float cornerRadius)
+{
+    VALIDATE_EFFECT_PTR(effect, "el_effect_set_spotlight_shadow_rect");
+    EdgeLighting::ShadowCaster &c = effect->config.spotlight.shadowCaster;
+    if (c.width == width && c.height == height &&
+        c.position.x == x && c.position.y == y &&
+        c.cornerRadius == cornerRadius)
+    {
+        return EL_SUCCESS;
+    }
+    LOG_I("effect=%p, width=%f, height=%f, x=%f, y=%f, cornerRadius=%f",
+          (void *)effect, width, height, x, y, cornerRadius);
+    c.width = width;
+    c.height = height;
+    c.position.x = x;
+    c.position.y = y;
+    c.cornerRadius = cornerRadius;
+    return EL_SUCCESS;
+}
+
+el_result_e el_effect_get_spotlight_shadow_rect(el_effect_handle_t effect,
+                                                float *outWidth, float *outHeight,
+                                                float *outX, float *outY,
+                                                float *outCornerRadius)
+{
+    VALIDATE_EFFECT_PTR(effect, "el_effect_get_spotlight_shadow_rect");
+    VALIDATE_OUT_PTR(outWidth, "el_effect_get_spotlight_shadow_rect");
+    VALIDATE_OUT_PTR(outHeight, "el_effect_get_spotlight_shadow_rect");
+    VALIDATE_OUT_PTR(outX, "el_effect_get_spotlight_shadow_rect");
+    VALIDATE_OUT_PTR(outY, "el_effect_get_spotlight_shadow_rect");
+    VALIDATE_OUT_PTR(outCornerRadius, "el_effect_get_spotlight_shadow_rect");
+    const EdgeLighting::ShadowCaster &c = effect->config.spotlight.shadowCaster;
+    *outWidth = c.width;
+    *outHeight = c.height;
+    *outX = c.position.x;
+    *outY = c.position.y;
+    *outCornerRadius = c.cornerRadius;
+    LOG_D("effect=%p, width=%f, height=%f, x=%f, y=%f, cornerRadius=%f",
+          (void *)effect, *outWidth, *outHeight, *outX, *outY, *outCornerRadius);
+    return EL_SUCCESS;
+}
+
+el_result_e el_effect_set_spotlight_shadow_distance(el_effect_handle_t effect, float wallDistance)
+{
+    VALIDATE_EFFECT_PTR(effect, "el_effect_set_spotlight_shadow_distance");
+    SET_AND_LOG(effect->config.spotlight.shadowCaster.wallDistance, wallDistance,
+                "effect=%p, wallDistance=%f", (void *)effect, wallDistance);
+}
+
+el_result_e el_effect_get_spotlight_shadow_distance(el_effect_handle_t effect, float *outWallDistance)
+{
+    VALIDATE_EFFECT_PTR(effect, "el_effect_get_spotlight_shadow_distance");
+    VALIDATE_OUT_PTR(outWallDistance, "el_effect_get_spotlight_shadow_distance");
+    *outWallDistance = effect->config.spotlight.shadowCaster.wallDistance;
+    LOG_D("effect=%p, wallDistance=%f", (void *)effect, *outWallDistance);
+    return EL_SUCCESS;
+}
+
+el_result_e el_effect_set_spotlight_shadow_softness(el_effect_handle_t effect, float softness)
+{
+    VALIDATE_EFFECT_PTR(effect, "el_effect_set_spotlight_shadow_softness");
+    SET_AND_LOG(effect->config.spotlight.shadowCaster.softness, softness,
+                "effect=%p, softness=%f", (void *)effect, softness);
+}
+
+el_result_e el_effect_get_spotlight_shadow_softness(el_effect_handle_t effect, float *outSoftness)
+{
+    VALIDATE_EFFECT_PTR(effect, "el_effect_get_spotlight_shadow_softness");
+    VALIDATE_OUT_PTR(outSoftness, "el_effect_get_spotlight_shadow_softness");
+    *outSoftness = effect->config.spotlight.shadowCaster.softness;
+    LOG_D("effect=%p, softness=%f", (void *)effect, *outSoftness);
+    return EL_SUCCESS;
+}
+
+el_result_e el_effect_set_spotlight_shadow_opacity(el_effect_handle_t effect, float opacity)
+{
+    VALIDATE_EFFECT_PTR(effect, "el_effect_set_spotlight_shadow_opacity");
+    SET_AND_LOG(effect->config.spotlight.shadowCaster.opacity, opacity,
+                "effect=%p, opacity=%f", (void *)effect, opacity);
+}
+
+el_result_e el_effect_get_spotlight_shadow_opacity(el_effect_handle_t effect, float *outOpacity)
+{
+    VALIDATE_EFFECT_PTR(effect, "el_effect_get_spotlight_shadow_opacity");
+    VALIDATE_OUT_PTR(outOpacity, "el_effect_get_spotlight_shadow_opacity");
+    *outOpacity = effect->config.spotlight.shadowCaster.opacity;
+    LOG_D("effect=%p, opacity=%f", (void *)effect, *outOpacity);
+    return EL_SUCCESS;
+}
+
+el_result_e el_effect_set_spotlight_shadow_fill(el_effect_handle_t effect, float fill)
+{
+    VALIDATE_EFFECT_PTR(effect, "el_effect_set_spotlight_shadow_fill");
+    SET_AND_LOG(effect->config.spotlight.shadowCaster.fill, fill,
+                "effect=%p, fill=%f", (void *)effect, fill);
+}
+
+el_result_e el_effect_get_spotlight_shadow_fill(el_effect_handle_t effect, float *outFill)
+{
+    VALIDATE_EFFECT_PTR(effect, "el_effect_get_spotlight_shadow_fill");
+    VALIDATE_OUT_PTR(outFill, "el_effect_get_spotlight_shadow_fill");
+    *outFill = effect->config.spotlight.shadowCaster.fill;
+    LOG_D("effect=%p, fill=%f", (void *)effect, *outFill);
+    return EL_SUCCESS;
+}
+
+el_result_e el_effect_set_spotlight_shadow_solid(el_effect_handle_t effect, el_bool_t solid)
+{
+    VALIDATE_EFFECT_PTR(effect, "el_effect_set_spotlight_shadow_solid");
+    const bool v = (solid != 0);
+    SET_AND_LOG(effect->config.spotlight.shadowCaster.solid, v,
+                "effect=%p, solid=%d", (void *)effect, (int)solid);
+}
+
+el_result_e el_effect_get_spotlight_shadow_solid(el_effect_handle_t effect, el_bool_t *outSolid)
+{
+    VALIDATE_EFFECT_PTR(effect, "el_effect_get_spotlight_shadow_solid");
+    VALIDATE_OUT_PTR(outSolid, "el_effect_get_spotlight_shadow_solid");
+    *outSolid = effect->config.spotlight.shadowCaster.solid ? 1 : 0;
+    LOG_D("effect=%p, solid=%d", (void *)effect, (int)*outSolid);
+    return EL_SUCCESS;
+}
+
+el_result_e el_effect_set_spotlight_shadow_frame(el_effect_handle_t effect,
+                                                 float frameWidth, float frameDepth)
+{
+    VALIDATE_EFFECT_PTR(effect, "el_effect_set_spotlight_shadow_frame");
+    EdgeLighting::ShadowCaster &c = effect->config.spotlight.shadowCaster;
+    if (c.frameWidth == frameWidth && c.frameDepth == frameDepth)
+    {
+        return EL_SUCCESS;
+    }
+    LOG_I("effect=%p, frameWidth=%f, frameDepth=%f", (void *)effect, frameWidth, frameDepth);
+    c.frameWidth = frameWidth;
+    c.frameDepth = frameDepth;
+    return EL_SUCCESS;
+}
+
+el_result_e el_effect_get_spotlight_shadow_frame(el_effect_handle_t effect,
+                                                 float *outFrameWidth, float *outFrameDepth)
+{
+    VALIDATE_EFFECT_PTR(effect, "el_effect_get_spotlight_shadow_frame");
+    VALIDATE_OUT_PTR(outFrameWidth, "el_effect_get_spotlight_shadow_frame");
+    VALIDATE_OUT_PTR(outFrameDepth, "el_effect_get_spotlight_shadow_frame");
+    const EdgeLighting::ShadowCaster &c = effect->config.spotlight.shadowCaster;
+    *outFrameWidth = c.frameWidth;
+    *outFrameDepth = c.frameDepth;
+    LOG_D("effect=%p, frameWidth=%f, frameDepth=%f", (void *)effect, *outFrameWidth, *outFrameDepth);
     return EL_SUCCESS;
 }
 
@@ -2143,6 +2460,9 @@ el_result_e el_effect_get_debug_wireframe_color(el_effect_handle_t effect, float
     return EL_SUCCESS;
 }
 
+// Lives in DebugConfig with the overlay flags, but it selects which of the
+// NEON renderer's passes run rather than drawing an overlay - which is why
+// it sits last in this group.
 el_result_e el_effect_set_debug_opaque_only(el_effect_handle_t effect, el_bool_t opaqueOnly)
 {
     VALIDATE_EFFECT_PTR(effect, "el_effect_set_debug_opaque_only");
@@ -2200,67 +2520,64 @@ el_result_e el_effect_init_with_renderers(el_effect_handle_t effect, uint32_t re
     VALIDATE_EFFECT_PTR(effect, "el_effect_init_with_renderers");
     try
     {
-        effect->impl = std::make_unique<EdgeLighting::EdgeLightingEffect>();
+        // The mask decides INCLUSION only; the order is the default one.
+        std::vector<EdgeLighting::RendererLayer> order;
+        for (EdgeLighting::RendererLayer layer : EdgeLighting::EdgeLightingEffect::GetDefaultLayerOrder())
+        {
+            if (rendererMask & static_cast<uint32_t>(layer))
+            {
+                order.push_back(layer);
+            }
+        }
+        return InitLayers(effect, order);
+    }
+    catch (const std::exception &e)
+    {
+        LOG_E("exception: %s", e.what());
+        return mapExceptionToResult(e);
+    }
+}
 
-        // ONE bit per layer: the content layers dense from 0, the debug
-        // layer on the top bit (see el_renderer_flags_e), which is what
-        // pins its value while content layers keep taking the next free
-        // low bit. The deprecated "optimized" and wireframe
-        // aliases that used to be ORed in beside these are gone: the
-        // half-res paths are a resolution scale on the neon and flare
-        // layers, and the bounding box is one of the debug layer's
-        // overlays. Nothing can double-register a layer any more, which is
-        // what the paired tests here existed to prevent.
-        //
-        // Compositing order is THIS sequence of ifs, and it matches the bit
-        // order: content layers first on the low bits, the debug layer
-        // last on the highest.
-        // Kept for the particles below, which copy the neon's drawn glow.
-        std::shared_ptr<EdgeLighting::NeonRenderer> neon;
-        if (rendererMask & EL_RENDERER_NEON)
+el_result_e el_effect_init_with_renderer_order(el_effect_handle_t effect,
+                                               const uint32_t *order, int32_t count)
+{
+    LOG_I("effect=%p, count=%d", (void *)effect, count);
+    VALIDATE_EFFECT_PTR(effect, "el_effect_init_with_renderer_order");
+    try
+    {
+        // Validated BEFORE InitLayers replaces the effect, so a malformed
+        // list leaves any previous stack running.
+        std::vector<EdgeLighting::RendererLayer> layers;
+        if (!CopyLayerArray(order, count, "el_effect_init_with_renderer_order", layers) ||
+            !EdgeLighting::EdgeLightingEffect::IsValidLayerList(layers))
         {
-            LOG_I("registering NeonRenderer");
-            neon = std::make_shared<EdgeLighting::NeonRenderer>();
-            effect->impl->AddRenderer(neon);
+            return EL_ERROR_INVALID_PARAMETER;
         }
-        if (rendererMask & EL_RENDERER_DROPLETS)
+        return InitLayers(effect, layers);
+    }
+    catch (const std::exception &e)
+    {
+        LOG_E("exception: %s", e.what());
+        return mapExceptionToResult(e);
+    }
+}
+
+el_result_e el_effect_set_renderer_order(el_effect_handle_t effect,
+                                         const uint32_t *order, int32_t count)
+{
+    LOG_I("effect=%p, count=%d", (void *)effect, count);
+    VALIDATE_EFFECT_PTR(effect, "el_effect_set_renderer_order");
+    if (!IsInitialised(effect, "el_effect_set_renderer_order"))
+    {
+        return EL_ERROR_INVALID_HANDLE;
+    }
+    try
+    {
+        std::vector<EdgeLighting::RendererLayer> layers;
+        if (!CopyLayerArray(order, count, "el_effect_set_renderer_order", layers) ||
+            !effect->impl->SetLayerOrder(layers))
         {
-            LOG_I("registering DropletsRenderer");
-            effect->impl->AddRenderer(std::make_shared<EdgeLighting::DropletsRenderer>());
-        }
-        if (rendererMask & EL_RENDERER_LENS_FLARE)
-        {
-            LOG_I("registering LensFlareRenderer");
-            effect->impl->AddRenderer(std::make_shared<EdgeLighting::LensFlareRenderer>());
-        }
-        if (rendererMask & EL_RENDERER_SPOTLIGHT)
-        {
-            LOG_I("registering SpotlightRenderer");
-            effect->impl->AddRenderer(std::make_shared<EdgeLighting::SpotlightRenderer>());
-        }
-        // After every light layer, as in the C++ demo: newborn particles copy
-        // the neon's glow as drawn THIS frame, so they have to follow it. With
-        // no neon registered the source stays empty and they take the colour
-        // ring instead.
-        if (rendererMask & EL_RENDERER_PARTICLES)
-        {
-            LOG_I("registering ParticleManager");
-            auto particles = std::make_shared<EdgeLighting::ParticleManager>();
-            particles->SetNeonSource(neon);
-            effect->impl->AddRenderer(particles);
-        }
-        // LAST, so the annotations sit above every layer they describe -
-        // after the neon whose glow the strip and markers measure, and
-        // above the droplets and flare that would otherwise cover them.
-        if (rendererMask & EL_RENDERER_DEBUG)
-        {
-            LOG_I("registering DebugRenderer");
-            effect->impl->AddRenderer(std::make_shared<EdgeLighting::DebugRenderer>());
-        }
-        if (!effect->impl->Initialize())
-        {
-            LOG_E("el_effect_init_with_renderers: renderer initialisation failed");
-            return EL_ERROR_INIT_FAILED;
+            return EL_ERROR_INVALID_PARAMETER;
         }
         return EL_SUCCESS;
     }
@@ -2269,6 +2586,29 @@ el_result_e el_effect_init_with_renderers(el_effect_handle_t effect, uint32_t re
         LOG_E("exception: %s", e.what());
         return mapExceptionToResult(e);
     }
+}
+
+el_result_e el_effect_get_renderer_count(el_effect_handle_t effect, int32_t *outCount)
+{
+    VALIDATE_EFFECT_PTR(effect, "el_effect_get_renderer_count");
+    VALIDATE_OUT_PTR(outCount, "el_effect_get_renderer_count");
+    *outCount = effect->impl ? static_cast<int32_t>(effect->impl->GetLayerOrder().size()) : 0;
+    return EL_SUCCESS;
+}
+
+el_result_e el_effect_get_renderer_at(el_effect_handle_t effect, int32_t index, uint32_t *outLayer)
+{
+    VALIDATE_EFFECT_PTR(effect, "el_effect_get_renderer_at");
+    VALIDATE_OUT_PTR(outLayer, "el_effect_get_renderer_at");
+    const std::vector<EdgeLighting::RendererLayer> order =
+        effect->impl ? effect->impl->GetLayerOrder() : std::vector<EdgeLighting::RendererLayer>();
+    if (index < 0 || static_cast<size_t>(index) >= order.size())
+    {
+        LOG_E("el_effect_get_renderer_at: index %d out of range (size=%zu)", index, order.size());
+        return EL_ERROR_INVALID_PARAMETER;
+    }
+    *outLayer = static_cast<uint32_t>(order[static_cast<size_t>(index)]);
+    return EL_SUCCESS;
 }
 
 el_result_e el_effect_capture(el_effect_handle_t effect)
