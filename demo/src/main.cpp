@@ -111,9 +111,9 @@ int main()
     auto dropletsRenderer = std::make_shared<EdgeLighting::DropletsRenderer>();
     // One manager for every arc's motes - an emitter per arc, one draw.
     auto particleManager = std::make_shared<EdgeLighting::ParticleManager>();
-    // Newborn particles copy the neon's drawn glow at their spawn point when
-    // Neon > Res Scale is below 1 (the CPU colour ring otherwise) - which is
-    // why the particles are registered after the neon below.
+    // Newborn particles copy the neon's drawn glow at their spawn point (the
+    // CPU colour ring when there is none) - which is why the particles are
+    // registered after the neon below.
     particleManager->SetNeonSource(neonRenderer);
 
     gEffect->AddRenderer(neonRenderer);
@@ -382,8 +382,8 @@ void OnKey(GLFWwindow *window, int key, int scancode, int action, int mods)
     {
         if (mods & GLFW_MOD_SHIFT)
         {
-            // Toggle the neon layer between full resolution and half. There is
-            // no second renderer to switch to any more - this IS the old
+            // Toggle the neon layer's buffer between full size and half. There
+            // is no second renderer to switch to any more - this IS the old
             // "optimized on/off", expressed as the scale it always was.
             config.neon.resolutionScale = (config.neon.resolutionScale < 1.0f) ? 1.0f : 0.5f;
         }

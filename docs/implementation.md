@@ -1,10 +1,11 @@
 # Implementation
 
 The short version of how this library is put together and how a frame runs.
-For depth, see [`architecture-design.md`](architecture-design.md) (full
-architecture), [`effect-reference.md`](effect-reference.md) (per-parameter
-behaviour), and [`neon-renderer-explained.html`](neon-renderer-explained.html)
-(why the shader is shaped the way it is). When any of them disagrees with the
+For depth, see [`neon-onboarding-guide.md`](neon-onboarding-guide.md) (the
+neon from first principles, every pass and config field),
+[`effect-reference.md`](effect-reference.md) (per-parameter behaviour), and
+[`neon-renderer-explained.html`](neon-renderer-explained.html) (why the shader
+is shaped the way it is). When any of them disagrees with the
 headers under `lib/include/`, the headers win.
 
 ## 1. What gets built
@@ -88,25 +89,43 @@ compositing order, since they blend onto one another in the order they draw:
 
 | # | Renderer | Layer |
 |---|---|---|
-| 1 | `NeonRenderer` | The neon stroke: an emission pre-pass, the opaque fill, the gather, and - below `resolutionScale` 1.0 - a scaled buffer plus its blit. |
+| 1 | `NeonRenderer` | The neon stroke: an emission pre-pass, the opaque fill, the gather, and - below `resolutionScale` 1.0 - a scaled buffer plus its blit, with a full-resolution ring re-shaded around the edge. |
 | 2 | `DropletsRenderer` | Rain-on-glass in a band hugging the perimeter. Screen-space gravity, self-lit, no framebuffer capture. Always full-res. |
 | 3 | `LensFlareRenderer` | Sun plus hex-aperture flare as one fullscreen premultiplied pass. The sun rides the perimeter, and - below `resolutionScale` 1.0 - a scaled buffer plus its blit. |
-| 4 | `SpotlightRenderer` | Freely placed and aimed cones of light, as one additive pass over solved per-lamp strips. The odd one out: not a perimeter effect, reads only `Config::spotlight`, and - below `resolutionScale` 1.0 - a scaled buffer plus its blit. See [`spotlight-renderer.md`](spotlight-renderer.md). |
+| 4 | `SpotlightRenderer` | Freely placed and aimed cones of light, as one screened pass over solved per-lamp strips. The odd one out: not a perimeter effect, reads only `Config::spotlight`, and - below `resolutionScale` 1.0 - a scaled buffer plus its blit. See [`spotlight-renderer.md`](spotlight-renderer.md). |
 | 5 | `DebugRenderer` | The LUT strip, colour-stop markers and the 1px bounding box. **Last on purpose** - it annotates what the layers under it drew, so its overlays have to sit above all of them. Always full-res. |
 
 `DebugRenderer` being last is the one position in that list that is load-bearing
 rather than incidental, and the C ABI's `el_effect_init_with_renderers`
-registers it last too. The bit it holds in `el_renderer_flags_e` is the top one
-for the same reason: a content layer added later takes the next dense bit and
-never renumbers it.
+registers it last too. The bit `DebugRenderer` holds in `el_renderer_flags_e` is
+the top one for the same reason: a content layer added later takes the next
+dense bit and never renumbers it.
+
+That list is only the DEFAULT order, though: layers composite by blending, so a
+layer lands on whatever was drawn before it, and a host can choose differently.
+The core owns the order: every renderer names its layer
+(`BaseRenderer::GetLayer` returns a `RendererLayer`), and `EdgeLightingEffect`
+builds and reorders by layer - `AddRenderer(RendererLayer)`, `GetLayerOrder`,
+`SetLayerOrder`, `GetDefaultLayerOrder` - with `SetRendererOrder` underneath for
+a host's own `CUSTOM` renderers, which the layer calls leave in place. The C
+ABI's flag bits are the same values, so its calls only forward:
+`el_effect_init_with_renderer_order` registers the listed layers, bottom first;
+`el_effect_set_renderer_order` reorders an initialised effect with no re-init;
+`el_effect_get_renderer_count` / `el_effect_get_renderer_at` read it back. The
+motivating case is the spotlight: below the neon, the neon composites over the
+cones by its own coverage instead of the cones adding onto the neon.
 
 **There are no forked renderer pairs left.** Both layers that had one now carry
 the half-res path as a resolution scale on a single renderer: `NeonConfig::
-resolutionScale` and `LensFlareConfig::resolutionScale`, where 1.0 draws
+resolutionScale` and `LensFlareConfig::resolutionScale`, where the flare's 1.0 draws
 straight onto the target and anything lower renders into a scaled buffer and
-blits back. One `.cpp` and one `.frag` each, no pair to keep in step and no way
-to double-draw. See `docs/neon-unification-plan.md` and
-`docs/lens-flare-unification-comparison.md`.
+blits back; the neon has one path at every scale (default 0.5; 1.0 is a
+full-size buffer), re-shading a thin ring around the edge at full
+resolution, from the same `neon.frag` compiled as a second program. One
+`.cpp` each and one copy of every shader stage, no pair to keep in step and no
+way to double-draw. (The neon's gather is a pass of its own, `neon-gather.frag`,
+the only place its loop lives; `neon.frag` reads what that pass stored.) See
+`docs/neon-unification-plan.md`, which also records how both merges were verified.
 
 To add a renderer: subclass `BaseRenderer`, add a sub-config struct to `Config`
 with `operator==`, register it in [`demo/src/main.cpp`](../demo/src/main.cpp),
@@ -150,20 +169,60 @@ Multiply the two, tone map hue-preservingly, apply gamma, emit premultiplied
 alpha (coverage = brightest channel) so the effect composites over arbitrary
 content rather than only adding light.
 
-Before that quad runs, both neon renderers execute an **emission pre-pass**.
+Before that quad runs, the neon renderer executes an **emission pre-pass**.
 The gather's per-sample work - the arc winner-take-all, the segment bells, the
 LUT fetches - is a pure function of `(si, uTime, config)` and does not vary per
-fragment, so it is baked once per frame into an `N x 2` RGBA16F table
-(`neon-emission.frag`) that the gather then reads with `texelFetch`.
+fragment, so it is baked into an `N x 2` RGBA16F table
+(`neon-emission.frag`) that the gather then reads with `texelFetch` - and
+only on the frames one of its inputs moved, since nothing else writes it.
 Per-fragment cost is `O(samples)` rather than `O(samples * (arcs + segments))`.
 The invariant that keeps the split honest: **a pure function of
 `(si, uTime, config)` belongs in the pre-pass; anything that reads `vPos`
 belongs in the main shader.**
 
+A second pre-pass bakes the **glow coverage table** (`neon-glow-cover.frag`):
+for each of the outline's eight pieces - four straights, four corner arcs -
+how lit that piece is as the halo and the bloom see it from a fragment, its own
+coverage over its own extent weighted by each layer's kernel, in closed form
+for the arcs and numerically for the segments' bells. The halo and bloom are a
+sum over those pieces, and each piece's share is scaled by its own read of
+that table (one linear fetch), not by one coverage gathered around the
+fragment: the gathered one let an unlit stretch keep a faint line of light
+along it and dimmed lit edges' light reaching a dark one (V19 and V20 in
+[`review-findings.md`](review-findings.md)), and a table per perimeter rather
+than per piece spilled light round each corner (V21). Where each piece's
+coverage sits in the table is in `neon-pieces.glsl`, which both the bake and
+`neon.frag` include. The table depends on the arcs, the segments, the rect's
+shape and the glow radius only, so it is re-baked on a config change and never
+on time. Its width follows the rect and the halo width (`GetGlowCoverWidth`,
+256-1024 columns), and its layout is stored with it, so the bake and every
+read agree on it (I59). The segments' bells, far wider than an arc's feather,
+are baked into a narrow table of their own and copied into the main one by a
+fill pass (`neon-glow-cover-fill.frag`, I60), so `neon.frag` still reads one
+texel per piece.
+
+The same split pays a second time, at every `resolutionScale`. The gather is
+the only part of the shader that is both expensive and smooth across the
+screen, so it runs alone, in a pass of its own (`neon-gather.frag`,
+`gatherPerimeter`), on a grid set by its own smoothness (about two texels per
+colour kernel - far coarser than the reduced buffer), and stores its four
+results in a small buffer. `neon.frag` reads those results back with a
+bilinear fetch and shades the glow twice, as two program objects: at
+`resolutionScale` into the reduced buffer, and at full resolution in a thin
+ring around the edge. The line and every edge near it are shaded at full
+resolution, as with no scale at all. Everything outside the ring is the
+reduced buffer, bilinear-blitted; at 1.0 that buffer is simply full size.
+Frames that move nothing skip the offscreen passes, and frames where only the
+hue or the intensity moves composite a baked hue-invariant field instead of
+shading (Part 5.5 of [`neon-onboarding-guide.md`](neon-onboarding-guide.md)).
+
 The full derivation, including the closed forms and the sampling bugs they
 replaced, is in [`neon-renderer-explained.html`](neon-renderer-explained.html);
 the pre-pass has its own design note in
-[`emission-prepass.md`](emission-prepass.md).
+[`emission-prepass.md`](emission-prepass.md), and the edge ring in
+[`neon-resolution-scale-plan.md`](neon-resolution-scale-plan.md) (sections 7
+and 13). For the whole pipeline walked once in order, pass by pass and field
+by field, start with [`neon-onboarding-guide.md`](neon-onboarding-guide.md).
 
 ## 7. Shader and C++ interop
 
@@ -250,6 +309,28 @@ surface. `edge-lighting-capi.h` is the single public include, aggregating
   `capi-internal.h`. **Reordering or renumbering a mirrored C++ enum means
   adjusting those asserts** - append new values at the end.
 - Symbols are hidden by default; only `EL_API`-marked `el_*` functions export.
+- **Lifecycle.** `el_effect_create` makes a handle that owns only its staging
+  `Config` - no GL state, no renderers - so a host can build it before a context
+  exists. `el_effect_init` (the whole stack in the default order),
+  `el_effect_init_with_renderers(mask)` or `el_effect_init_with_renderer_order`
+  constructs the effect and its layers, and must run on the GL thread with a
+  current context. `el_effect_destroy` tears it down.
+- **Setters short-circuit unchanged writes** (`SET_AND_LOG` in
+  `capi-internal.h`): an unchanged value returns `EL_SUCCESS` without logging,
+  so a debug UI's get - widget - set every frame does not flood the log. Getters
+  log at `LOG_D`, which `capi-internal.h` compiles out on macOS and Windows.
+- **Arrays** (colour stops, segments, arcs, and each one's own stops) are a
+  `_count` setter plus per-index accessors: grow with `set_..._count(n + 1)`
+  then set index `n`; remove `k` by shifting down and `set_..._count(n - 1)`.
+  Both demos do exactly that.
+- **Animations** come from `el_animation_create(EL_ANIM_*)` presets, the
+  parametric `el_animation_create_*` factories, or
+  `el_animation_create_field_bound()` plus `el_animation_add_*_field` over
+  modulator handles (`el_modulator_create_*`). Each carries its own play state,
+  playhead, speed, duration, mode and end action, and completion /
+  state-change callbacks with a `void *userData`. The effect's manager is
+  reached through `el_effect_attach_animation` and its siblings; the clock
+  through `el_effect_clock_play` / `_pause`.
 
 `demo-capi/`'s include path deliberately excludes `lib/include/`, so it can only
 compile against the flat ABI. That is the guard proving the ABI is sufficient
@@ -277,12 +358,61 @@ Two rules that are easy to get wrong:
   scale. (`demo-capi/src/` is the exception - it cannot see `lib/include/`, so it
   has its own minimal helpers in `gl-mini.h`.)
 
-## 11. Where to change what
+## 11. Coordinate spaces, and the viewport origin
+
+| Space | Origin | +X | +Y | Used by |
+|---|---|---|---|---|
+| **App** | viewport top-left | right | down | `RectGeometry::position`, `SpotLight::position`, mouse input |
+| **Local** | rect centre | right | up | the SDF, `GetPointOnRectangle`, the loop samples, `vPos` |
+| **GL window** | viewport bottom-left | right | up | the model translation, `gl_FragCoord` |
+| **NDC** | viewport centre | right | up | `gl_Position` |
+
+The app-to-GL flip is one line, `center.y = viewportH - position.y - halfH`, and
+every renderer builds its MVP the same way, so rect-local vertices land where
+the app placed the rect. (The spotlight keeps app coordinates in its VBO and
+flips in its ortho instead.)
+
+**The viewport origin is assumed to be (0, 0).** `BaseRenderer::Render` takes
+the viewport's SIZE, never its origin, and that is baked into the shaders, not
+just the C++: several read `gl_FragCoord`, which is in window coordinates, against
+uniforms the CPU computes as if the viewport started at the window's origin -
+`black-rect.frag`'s `gl_FragCoord.xy - uRectCenter` is the plainest case, and
+the blit's cut is another. Render into a viewport at `(x, y)` and every such
+comparison is off by exactly that, so the fill and the cut draw displaced from
+the glow. A sub-viewport is not supported; supporting one means threading an
+origin into those uniforms, not restoring the viewport more carefully. The
+framebuffer is the opposite case, because it genuinely varies (the default one,
+or an `OffscreenCapture` FBO): a multi-pass renderer restores exactly the one
+it was handed (section 10).
+
+## 12. The demos
+
+`demo/` opens two GLFW windows sharing one GL context: the render surface and a
+floating debug panel (`DebugUI`). Each frame it snapshots the authored config
+(`GetConfig`), lets `DebugUI::Build` mutate that copy and attach or drive
+animations on the effect, writes it back with `SetConfig` (which reaches the
+renderers through `OnConfigChanged` only when something changed), draws the
+panel, then on the main context draws any backdrop, `Update(dt)` and
+`Render(w, h)`. Sliders showing an animated field read `GetActiveConfig()`, so
+the knob follows the live value, and pin to the base while being dragged. The
+border colour picker (`border-color-picker.{h,cpp}`) samples an image's border
+into colour stops placed on the rect's own perimeter parameterisation.
+
+`demo-capi/` is the same UI against the C ABI alone: its include path omits
+`lib/include/`, so an accidental `#include "core/..."` fails to build. Its
+`gl-mini.h`, `background-quad.h` and `image-quad.h` are raw-GLAD ports of the
+C++ demo's helpers, since the RAII wrappers live under `lib/include/gl/`, and its
+debug UI reads every widget through a getter and writes through a setter. It is
+a hand-maintained fork: a change to one demo usually needs the same change in
+the other.
+
+## 13. Where to change what
 
 | Goal | Touch |
 |---|---|
-| Tune neon appearance | `neon-tuning.h` and `neon.frag` - one copy, both resolution paths |
-| Change what the gather bakes | `neon-emission.frag` **and** `neon.frag` - keep the pre-pass invariant (§6) |
+| Tune neon appearance | `neon-tuning.h` and `neon.frag` - one copy, every scale |
+| Change the gather loop | `neon-gather.frag` (`gatherPerimeter`) - the loop and its encode; the decode in `neon.frag` changes with it |
+| Change what the gather bakes | `neon-emission.frag` **and** `neon-gather.frag` - keep the pre-pass invariant (§6) |
 | Add a config field | `config.h` (field **and** `operator==`), the renderer that reads it, `DebugUI`, and the C ABI mirror if exposed |
 | Add a shader | `lib/CMakeLists.txt` (two lists) and `shaders.h.in` |
 | Add a renderer | `BaseRenderer` subclass, `Config` sub-struct, `main.cpp` registration, `DebugUI` section, `el_renderer_flags_e` bit |
@@ -291,4 +421,6 @@ Two rules that are easy to get wrong:
 
 Conventions (naming, bracing, the no-em-dash rule) are in
 [`AGENTS.md`](../AGENTS.md) and enforced by hand. There is no formatter config
-and no test target.
+and no test target; the nearest thing is the optional
+[`tools/neon-scale-check`](../tools/neon-scale-check/README.md), a regression
+check for the neon's resolution scale (`-DEDGE_LIGHTING_BUILD_TOOLS=ON`).

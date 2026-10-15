@@ -377,16 +377,15 @@ namespace EdgeLighting
         mRunning = true;
 
         // Where this frame's newborns take their colour from. The drawn glow
-        // lives in the neon's scaled buffer, which only exists on its scaled
-        // path - neon on, Res Scale below 1. The neon is registered before
-        // this layer, so its Render has already filled the buffer this frame;
-        // the buffer check itself guards the frames it could not (an
+        // lives in the neon's scaled buffer, which the neon now fills at every
+        // Res Scale, 1.0 included (it has one path). The neon is registered
+        // before this layer, so its Render has already filled the buffer this
+        // frame; the buffer check itself guards the frames it could not (an
         // allocation failure, or a config change the neon has not drawn yet).
         // opaqueOnly keeps the buffer but skips the gather that fills it, so
         // it would hand back a stale glow. Anything else: the CPU ring.
         const std::shared_ptr<const NeonRenderer> neon = mNeonSource.lock();
-        const bool neonDrawsToBuffer = config.neon.enable && !config.debug.opaqueOnly &&
-                                       config.neon.resolutionScale < 1.0f;
+        const bool neonDrawsToBuffer = config.neon.enable && !config.debug.opaqueOnly;
         if (neon && neonDrawsToBuffer && neon->HasOutputBuffer())
         {
             mColorSource = ParticleColorSource::NEON_OUTPUT;
@@ -545,8 +544,17 @@ namespace EdgeLighting
             // A latch write replaces the texel; blending would mix in the
             // colour of whichever dead mote held the slot before.
             glDisable(GL_BLEND);
-            renderLatchPass(neon.get(), center,
-                            glm::vec2(static_cast<float>(viewportWidth), static_cast<float>(viewportHeight)));
+            // Where the spawn points land in the neon's buffer: its own map,
+            // for this frame's config and viewport. The buffer covers a region
+            // of the frame, not the viewport, so (center + p) / viewport would
+            // read the wrong texel - by an amount that moves with the rect's
+            // position and size.
+            NeonDetail::UVMap neonUV;
+            if (mColorSource == ParticleColorSource::NEON_OUTPUT)
+            {
+                neonUV = neon->GetOutputUVMap(viewportWidth, viewportHeight, config);
+            }
+            renderLatchPass(neon.get(), neonUV);
         }
 
         glEnable(GL_BLEND);
@@ -821,8 +829,7 @@ namespace EdgeLighting
         }
     }
 
-    void ParticleManager::renderLatchPass(const NeonRenderer *neon, const glm::vec2 &rectCenter,
-                                          const glm::vec2 &viewport)
+    void ParticleManager::renderLatchPass(const NeonRenderer *neon, const NeonDetail::UVMap &neonUV)
     {
         // The target this renderer was handed - framebuffer AND viewport, both
         // of which the bind below replaces. Not necessarily the window's: an
@@ -848,8 +855,8 @@ namespace EdgeLighting
         if (mColorSource == ParticleColorSource::NEON_OUTPUT)
         {
             neon->BindOutputBuffer(0);
-            mLatchShader.SetUniform("uRectCenter", rectCenter);
-            mLatchShader.SetUniform("uViewport", viewport);
+            mLatchShader.SetUniform("uUVScale", neonUV.scale);
+            mLatchShader.SetUniform("uUVOffset", neonUV.offset);
         }
         mLatchShader.SetUniform("uNeonOutput", 0);
         mLatchVertexArray.SetVertexData(mLatchScratch.data(),

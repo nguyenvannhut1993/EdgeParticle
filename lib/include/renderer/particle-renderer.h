@@ -19,6 +19,10 @@
 namespace EdgeLighting
 {
     class NeonRenderer;
+    namespace NeonDetail
+    {
+        struct UVMap;
+    }
 
     /// Deterministic xorshift32 RNG, so the mote pattern is reproducible across
     /// runs without pulling in a heavier PRNG or std::random. One per
@@ -172,7 +176,7 @@ namespace EdgeLighting
     /// with @c ParticleArcConfig::useCustomColor ignores it.
     typedef enum class ParticleColorSource
     {
-        NEON_OUTPUT, ///< The neon's drawn glow (scaled path only): colour AND coverage as drawn.
+        NEON_OUTPUT, ///< The neon's drawn glow, from its scaled buffer under the spawn point.
         COLOR_RING   ///< No drawn glow this frame: the hue-rotated colour-stop ring, from the CPU.
     } ParticleColorSource;
 
@@ -244,12 +248,20 @@ namespace EdgeLighting
     /// with @c ParticleArcConfig::useCustomColor latches its own colour. Every
     /// other arc takes the neon's, from the source (@ref ParticleColorSource)
     /// picked per frame:
-    ///   - the DRAWN glow of the neon attached with @ref SetNeonSource, the
-    ///     pixel under the spawn point - colour and coverage exactly as
-    ///     composited, so a mote is a copy of the neon pixel it was born on
-    ///     and is invisible where the neon drew nothing. Scaled path only
-    ///     (@c NeonConfig::resolutionScale < 1): at 1.0 the neon draws
-    ///     straight to the target and keeps no buffer.
+    ///   - the DRAWN glow of the neon attached with @ref SetNeonSource: its
+    ///     scaled buffer (@ref NeonRenderer::HasOutputBuffer), at every
+    ///     resolution scale, read under the spawn point through the neon's own
+    ///     map (@ref NeonRenderer::GetOutputUVMap - the buffer covers a region
+    ///     of the frame, not the viewport) and copied AS STORED, colour and
+    ///     coverage: a faint glow makes a faint mote, a strong one a strong
+    ///     mote, and a mote is invisible where the neon drew nothing. A
+    ///     newborn's latch texel is that buffer value to 8-bit rounding;
+    ///     particle.frag then scales colour and coverage alike by the mote's
+    ///     own sprite and age. That buffer holds the glow around the line
+    ///     rather than the line, which the neon's edge ring draws at full
+    ///     resolution, so a mote is dimmer than the line on screen (about two
+    ///     thirds at the defaults), and a line with no glow round it
+    ///     (glowRadius near 0) leaves it nothing to copy.
     ///   - otherwise the hue-rotated @c NeonConfig::colorStops ring, from the
     ///     CPU, at full coverage.
     class ParticleManager : public BaseRenderer
@@ -262,6 +274,9 @@ namespace EdgeLighting
         virtual void Update(float deltaTime, float time, const Config &config) override;
         virtual void Render(int viewportWidth, int viewportHeight, float time, const Config &config) override;
         virtual void OnConfigChanged(const Config &config) override;
+
+        /// @return @ref RendererLayer::PARTICLES.
+        virtual RendererLayer GetLayer() const override { return RendererLayer::PARTICLES; }
 
         /// Take newborn colours from @p neon's drawn glow, on the frames it
         /// has one - see the class note. Pass an empty pointer to go back to
@@ -346,13 +361,14 @@ namespace EdgeLighting
         void commitNewborns(int arcIndex, const ParticleArcConfig &p);
         /// Write this frame's newborn colours into their @c mColorLatch slots:
         /// @p neon's output buffer for a newborn queued to copy it, its queued
-        /// CPU colour otherwise. @p rectCenter (window px, y up) and
-        /// @p viewport place the spawn points on the output buffer. Retargets
-        /// the framebuffer and viewport, so it restores both before returning.
+        /// CPU colour otherwise. @p neonUV places the spawn points (rect-local
+        /// full-res px) on the output buffer - the neon's own map
+        /// (@ref NeonRenderer::GetOutputUVMap), since the buffer covers a
+        /// region of the frame rather than the viewport. Retargets the
+        /// framebuffer and viewport, so it restores both before returning.
         /// @pre Blending disabled - a latch write replaces the texel.
         /// @pre @p neon is non-null when @c mColorSource is NEON_OUTPUT.
-        void renderLatchPass(const NeonRenderer *neon, const glm::vec2 &rectCenter,
-                             const glm::vec2 &viewport);
+        void renderLatchPass(const NeonRenderer *neon, const NeonDetail::UVMap &neonUV);
         /// Draw every block's live window - one call each, two where a window
         /// wraps its block's end.
         void drawWindows();

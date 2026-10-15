@@ -48,18 +48,20 @@ They composite in the order they are registered, which is the order below.
   one fullscreen premultiplied pass. The sun rides the perimeter in the same
   parameter space as neon segments and arcs, so the same modulators drive it.
 - **SpotlightRenderer** - freely placed and aimed cones of light, as one
-  additive pass. The odd one out: not a perimeter effect at all. Each lamp
-  carries its own position, direction, beam angle, throw, softness, intensity
-  and colour temperature, and gets a strip of geometry solved to hug exactly
-  the region it lights. See [`docs/spotlight-renderer.md`](docs/spotlight-renderer.md).
+  screened pass (light only ever adds, but never past full scale). The odd
+  one out: not a perimeter effect at all. Each lamp carries its own position,
+  direction, beam angle, throw, softness, intensity and colour temperature,
+  and gets a strip of geometry solved to hug exactly the region it lights.
+  See [`docs/spotlight-renderer.md`](docs/spotlight-renderer.md).
 - **DebugRenderer** - the debug annotations in one layer: the baked ring as a
   LUT strip, a disc per colour stop, and a 1 px `GL_LINE_LOOP` bounding box.
   Registered **last**, because it annotates what the layers under it drew.
 
 **There are no forked renderer pairs.** The neon, the lens flare and the
 spotlight each carry their half-res path as a `resolutionScale` on the one
-renderer: `1.0` draws straight onto the target, anything lower renders into a
-scaled buffer and blits back. One `.cpp` and one `.frag` each, and no way to
+renderer. The flare and the spotlight draw straight onto the target at `1.0` and
+render into a scaled buffer below it; the neon always takes the scaled path
+(default `0.5`, and `1.0` is a full-size buffer). One `.cpp` and one `.frag` each, and no way to
 double-draw. (Note the spotlight's scale is not automatically cheaper - its
 geometry is already bounded, so the blit is a fixed cost that only pays for a
 large rig. Its reference doc has the measurements.)

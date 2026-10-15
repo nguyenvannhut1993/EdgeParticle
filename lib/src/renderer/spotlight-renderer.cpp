@@ -21,11 +21,69 @@ namespace EdgeLighting
         constexpr int MAX_VERTS = SPOT_MAX_LAMPS * VERTS_PER_LAMP;
         constexpr float DEG_TO_RAD = 3.14159265358979323846f / 180.0f;
 
-
         /// Floor under SpotlightConfig::resolutionScale. Below this the blit
         /// is reading so few texels that the light turns to blocks, and the
         /// strips are already the cheap part.
         constexpr float MIN_RESOLUTION_SCALE = 0.125f;
+
+        /// One candidate format for @c mScaledBuffer.
+        typedef struct ScaledFormat
+        {
+            GLint internalFormat; ///< The sized internal format, e.g. GL_RGBA16F.
+            GLenum format;        ///< The pixel format of a transfer, e.g. GL_RGBA.
+            GLenum type;          ///< Its component type, e.g. GL_HALF_FLOAT.
+            /// Whether this format holds the dark tail unrounded, so the
+            /// strips draw it undithered and the blit alone dithers. False for
+            /// RGBA8, where spotlight.frag has to dither into the buffer too.
+            bool holdsSubLevels;
+            const char *name; ///< For the fallback log line.
+        } ScaledFormat;
+
+        /// @c mScaledBuffer's formats in PREFERENCE ORDER, best first - the
+        /// same pair, for the same reason, as the neon's SCALED_FORMATS.
+        ///
+        /// Half float leads because this layer's tail is the flattest gradient
+        /// in the library - one 8-bit level every 13 to 50 px at default
+        /// settings, so 3 to 12 texels at 0.25 - and in RGBA8 it is a staircase
+        /// of one-level plateaus before the blit reads it. Dithering into the
+        /// buffer does not save it: the blit's bilinear read averages that
+        /// noise over texels 1 / scale px wide, and what reaches the target is
+        /// blotches and blocky, diamond-shaped contours where 1.0 is smooth.
+        /// In half float the buffer keeps the tail to a fraction of a level,
+        /// the bilinear read joins it smoothly, and spotlight-blit.frag
+        /// dithers once per destination pixel - the split the neon makes (R7).
+        ///
+        /// Measured at 1280 x 720 against the 1.0 render, as the error left
+        /// after a 9 x 9 box filter (which removes the dither and keeps the
+        /// contours), over tail pixels between 1 and 48 levels: pixels off by
+        /// more than half a level at 0.25 went 3,586 -> 49 on a wide soft
+        /// lamp and 6,472 -> 0 on a five-lamp fan (7,359 -> 498 and
+        /// 15,608 -> 210 at 0.125). The RGBA8 row below, dithered in the pass
+        /// AND in the blit, only reaches 2,676 and 5,855: better than it was,
+        /// still visibly blotchy. Scale 1.0 is byte-identical - it never
+        /// touches this buffer.
+        ///
+        /// What it costs (AMD Radeon Pro 5300M, 1920 x 1080, wall clock, four
+        /// interleaved rounds): 1.04-1.08x the old scaled frame for one to
+        /// eight lamps at 0.25 and 0.5, of which half float itself is
+        /// 1.01-1.05x and the blit's dither the rest - see
+        /// spotlight-blit.frag for the two things that keep that small. Eight
+        /// lamps at 0.25 still render in a third of their 1.0 time.
+        ///
+        /// The blend is a SCREEN into this buffer, so the format has to be
+        /// blendable as well as renderable: half float is both wherever it is
+        /// renderable at all (GL 3.3 core; GLES 3.x with
+        /// EXT_color_buffer_half_float or EXT_color_buffer_float - only 32-bit
+        /// float blending needs EXT_float_blend). RGBA8 follows for a driver
+        /// that refuses it, with the old in-pass dither switched back on.
+        ///
+        /// Twice the memory: 960 x 540 texels at 1080p and 0.5 is 4.1 MB
+        /// instead of 2.1; 1.0 MB at 0.25.
+        constexpr ScaledFormat SCALED_FORMATS[] = {
+            {GL_RGBA16F, GL_RGBA, GL_HALF_FLOAT, true, "RGBA16F"},
+            {GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE, false, "RGBA8"},
+        };
+        constexpr size_t SCALED_FORMAT_COUNT = sizeof(SCALED_FORMATS) / sizeof(SCALED_FORMATS[0]);
 
         /// Whether any lamp this pass will actually DRAW honours the clip area.
         ///
@@ -194,18 +252,18 @@ namespace EdgeLighting
         /// Everything the solve and the upload need, derived once per lamp.
         typedef struct LampSolve
         {
-            float tanHalf; ///< tan(beamAngle / 2)
-            float throwLength; ///< SpotLight::throwLength, floored
+            float tanHalf;       ///< tan(beamAngle / 2)
+            float throwLength;   ///< SpotLight::throwLength, floored
             float spreadFalloff; ///< SpotLight::spreadFalloff, clamped to [0, 2]
-            float softK;   ///< gaussian exponent across the beam
+            float softK;         ///< gaussian exponent across the beam
             float apertureWidth; ///< SpotLight::apertureWidth, floored
             float intensity;
             float bloom;
             float bloomRadius;
-            float bloomWindow; ///< Where spotlight.frag's window closes.
-            float bloomReach;  ///< Where the bloom actually stops mattering:
-                               ///< min(@ref bloomWindow, the inverse-square
-                               ///< core's own visibility limit).
+            float bloomWindow;     ///< Where spotlight.frag's window closes.
+            float bloomReach;      ///< Where the bloom actually stops mattering:
+                                   ///< min(@ref bloomWindow, the inverse-square
+                                   ///< core's own visibility limit).
             float visibilityFloor; ///< This lamp's share of the half-step budget.
             /// @c intensity scaled by the BRIGHTEST channel of @c color.
             ///
@@ -624,7 +682,7 @@ namespace EdgeLighting
             // the CALLER'S framebuffer - with ClearBuffer about to wipe it.
             // Bail instead: nothing has been drawn, and noScissor puts the
             // scissor enable back as this return unwinds.
-            if (!mScaledBuffer.Resize(bufW, bufH))
+            if (!resizeScaledBuffer(bufW, bufH))
             {
                 return;
             }
@@ -657,53 +715,89 @@ namespace EdgeLighting
                                          static_cast<float>(viewportHeight), 0.0f,
                                          -1.0f, 1.0f);
 
-        // FULLY ADDITIVE, colour and alpha alike, and the only separate-alpha
-        // blend in the library. Both halves are deliberate.
+        // SCREENED, colour and alpha alike - `dst + src * (1 - dst)` - and the
+        // only separate-alpha blend in the library.
         //
-        // COLOUR is GL_ONE / GL_ONE because light only ever adds - which also
-        // makes the pass order-independent, so the lamp order in the config
-        // cannot change the image. That is unchanged behaviour: this used to
-        // be GL_ONE / GL_ONE_MINUS_SRC_ALPHA against a shader that emitted a
-        // literal alpha 0, and 1 - 0 is 1, so the destination factor was
-        // always exactly GL_ONE anyway. Writing it out is what lets
-        // spotlight.frag start emitting a real alpha without the colour
-        // channel quietly acquiring an occlusion term the other layers have
-        // and this one should not.
+        // COLOUR is GL_ONE_MINUS_DST_COLOR / GL_ONE. Light still only adds - a
+        // lamp never darkens what is under it - but the sum now APPROACHES full
+        // scale instead of crossing it. That is the whole point: spotlight.frag's
+        // highlight shoulder keeps ONE lamp under 1.0 and cannot see the
+        // others, so under the GL_ONE / GL_ONE this used to be, two beams
+        // crossing at ~0.6 each summed to ~1.2 and the RGBA8 target clipped
+        // the overlap to a flat white disc with a hard rim - V12a in
+        // docs/review-findings.md. Screened, the same pair reads ~0.84 and
+        // shades smoothly through the crossing, and the blend costs exactly
+        // what the add did.
         //
-        // ALPHA is GL_ONE / GL_ONE because the framebuffer's alpha has to end
-        // up saying "there is light here". It did not before. Every other
-        // layer writes a coverage alpha; the spotlight wrote 0 and so left the
-        // surface transparent wherever it was the only thing that drew. On a
-        // desktop window that is invisible - the window is opaque and nobody
-        // reads the alpha back. On an embedded surface it is fatal: a
-        // compositor or hardware video plane finishes the frame with
-        // `out = ui.rgb * ui.a + video * (1 - ui.a)`, and every lit spotlight
-        // pixel is multiplied by zero. That is the Tizen report - the layer
-        // missing over a playing video while neon, droplets and the flare
-        // (all of which write coverage) came through.
+        // Still ORDER-INDEPENDENT: 1 - (1 - a)(1 - b) is symmetric and
+        // associative, so the lamp order in the config cannot change the
+        // image, and the scaled path below - lamps screened into a cleared
+        // buffer, the buffer screened onto the target - makes the same
+        // composite as the direct path up to the buffer's rounding.
+        //
+        // What it gives up against the add, measured at 3840x2160:
+        //   - nothing over a transparent clear, which is the Tizen surface: a
+        //     lone lamp is byte-identical there, colour and alpha;
+        //   - a lamp adds LESS over anything already lit - up to 9 levels at a
+        //     default lamp's core over the demo's (0.03, 0.03, 0.05) clear, and
+        //     more over a bright neon glow, which the add clipped as well;
+        //   - it screens per CHANNEL, so a coloured overlap drifts towards
+        //     white: two 2700 K beams cross at green/red 0.80 against 0.72 for
+        //     one beam alone (the clipped sum read 0.87).
+        // Putting the hue-preserving shoulder on the SUM instead - every lamp
+        // evaluating the lamps it overlaps - was built and measured against
+        // this and rejected: 2.5x to 9.3x the GPU time on overlapping rigs, and
+        // a crease wherever two differently coloured beams cross. See V12a.
+        //
+        // ALPHA is GL_ONE_MINUS_DST_ALPHA / GL_ONE: the coverage composites the
+        // same way the colour does, so N overlapping lamps saturate towards 1
+        // whatever order they are in. And it has to be WRITTEN at all, which it
+        // once was not. Every other layer writes a coverage alpha; the
+        // spotlight wrote 0 and so left the surface transparent wherever it was
+        // the only thing that drew. On a desktop window that is invisible - the
+        // window is opaque and nobody reads the alpha back. On an embedded
+        // surface it is fatal: a compositor or hardware video plane finishes
+        // the frame with `out = ui.rgb * ui.a + video * (1 - ui.a)`, and every
+        // lit spotlight pixel is multiplied by zero. That is the Tizen report -
+        // the layer missing over a playing video while neon, droplets and the
+        // flare (all of which write coverage) came through.
         //
         // Measured offscreen at 640x360 over a transparent clear, before the
         // fix: one lamp lit 72,615 pixels of colour and 0 pixels of alpha, and
         // composited to nothing at all.
         //
-        // Accumulating the alpha rather than compositing it keeps the
-        // order-independence the colour has: N lamps overlapping sum their
-        // coverage and saturate at the framebuffer, whatever order they are
-        // in.
+        // One host-state assumption the add did not make: (1 - dst) is a
+        // weight only while the destination is in [0, 1]. Every target this
+        // library owns is RGBA8, but a host that hands Render a FLOAT
+        // framebuffer already holding values above 1 turns the factor negative,
+        // and the layer subtracts light there.
         glEnable(GL_BLEND);
-        glBlendFuncSeparate(GL_ONE, GL_ONE, GL_ONE, GL_ONE);
+        glBlendFuncSeparate(GL_ONE_MINUS_DST_COLOR, GL_ONE, GL_ONE_MINUS_DST_ALPHA, GL_ONE);
 
         mShaderProgram.Use();
 
-        // NOT ONE UNIFORM differs between the two paths - fewer than the
-        // flare's two, and none at all. The ortho is over APP coordinates, and
-        // the viewport transform alone carries the scale: the same vertex
-        // lands at scale * its app pixel in a scale-sized buffer. The fragment
-        // stage then reads only vLocal, which interpolates in full-res lamp
-        // pixels, against flat per-lamp values that are full-res pixels too -
-        // so it never learns, and never needs to learn, which buffer it is
-        // shading into. That is what makes 1.0 bit-identical.
+        // ONE uniform differs between the two paths, and it is not geometry.
+        // The ortho is over APP coordinates, and the viewport transform alone
+        // carries the scale: the same vertex lands at scale * its app pixel in
+        // a scale-sized buffer. The fragment stage then reads only vLocal,
+        // which interpolates in full-res lamp pixels, against flat per-lamp
+        // values that are full-res pixels too - so its LIGHT never learns
+        // which buffer it is shading into. That is what makes 1.0
+        // bit-identical.
+        //
+        // What does differ is where the output is dithered. At 1.0 this pass
+        // writes the caller's 8-bit target and dithers its own output. Below
+        // it, into a half-float buffer, the dither is the blit's: this pass
+        // writes the light undithered, the blit reads it bilinearly and adds
+        // the noise once per destination pixel. Dithered here instead, the
+        // noise would be one buffer texel - 1 / scale px - wide and the
+        // filter would average it into blotches; and an RGBA8 buffer rounds
+        // the tail to one-level plateaus before any noise downstream can
+        // help. See SCALED_FORMATS for what that looked like. On the RGBA8
+        // fallback this pass dithers as before and the blit adds its own.
+        const bool blitDithersAlone = scaled && SCALED_FORMATS[mScaledFormat].holdsSubLevels;
         mShaderProgram.SetUniform("uMVP", mvp);
+        mShaderProgram.SetUniform("uDither", blitDithersAlone ? 0.0f : 1.0f);
 
         // The clip area, in the SAME app coordinates the ortho above maps -
         // which is what keeps the sentence two comments up true. A clip is a
@@ -719,7 +813,7 @@ namespace EdgeLighting
         // more scale-invariant term: see GetClampedSpotScale for the numbers
         // and for why the neon's fix could not be reused. Past that pin, the
         // two paths below are only ever reached with NO lamp clipped, which is
-        // what keeps "not one uniform differs" true of both of them.
+        // what keeps uDither the only uniform that differs between them.
         //
         // Uploaded unconditionally, including when no lamp is clipped. The
         // per-lamp opt-in is baked into the strips as a vertex attribute (see
@@ -749,42 +843,31 @@ namespace EdgeLighting
             noScissor.Restore();
 
             // Back to the caller's target and viewport, both at once, then
-            // composite. The buffer holds premultiplied colour and the
-            // accumulated coverage alpha, and the blend above is still in
-            // force, so this blit is a plain bilinear read ADDED onto whatever
-            // is already there - colour and alpha alike. That is what carries
-            // the coverage through to the caller's framebuffer, which is the
-            // whole point of writing it; a blit under the old
+            // composite. The buffer holds the lamps' screened colour and
+            // coverage, and the blend above is still in force, so this blit is
+            // a bilinear read, dithered (spotlight-blit.frag), SCREENED onto
+            // whatever is already there - colour and alpha alike. That is what
+            // carries the coverage through to the caller's framebuffer, which
+            // is the whole point of writing it; a blit under the old
             // GL_ONE_MINUS_SRC_ALPHA would instead have let the buffer's new
             // alpha eat the destination it is supposed to be adding to.
             //
-            // One behavioural note the direct path does not have: overlapping
-            // lamps sum into an RGBA8 buffer and clamp THERE before reaching
-            // the target, whereas at 1.0 they clamp once against the target's
-            // existing content. Only reachable where several lamps already sum
-            // past white, and the same trade every accumulate-then-composite
-            // path in this library makes.
+            // Because the screen is associative, screening the lamps into a
+            // cleared buffer and then the buffer onto the target is the same
+            // composite as screening each lamp onto the target at 1.0 - the
+            // only difference is that the lamps' total is stored once in
+            // between, in half float (or 8 bits on the fallback). (Under the
+            // add this used to be a real difference: overlapping lamps clamped
+            // in the buffer before the target saw them. Nothing screened
+            // reaches 1.0.)
             prevTarget.Restore();
 
             mBlitShader.Use();
             mBlitShader.SetUniform("uMVP", glm::mat4(1.0f));
             mScaledBuffer.BindTexture(0);
             mBlitShader.SetUniform("uSource", 0);
-            // neon-blit.frag carries the neon's one-sided glow cut, which this
-            // layer has no business applying - so switch it off EXPLICITLY.
-            // Every other uniform of that cut is then unread, which is why
-            // none of them is set here.
-            //
-            // It was already off without this line, but only by luck twice
-            // over: GlowSide::BOTH happens to be the enum's zero, and GL
-            // happens to zero-initialise uniforms. Renumbering GlowSide would
-            // have redirected this blit through a rounded-box SDF built from
-            // uniforms nobody uploads - silently, and in the lens flare's blit
-            // at the same time. Naming the value makes this track a renumber
-            // instead, on the same terms neon-renderer.cpp already relies on:
-            // the enum's ordinals and neon-blit.frag's GLOW_SIDE_* defines are
-            // one numbering, kept in step by hand.
-            mBlitShader.SetUniform("uGlowSide", static_cast<int>(GlowSide::BOTH));
+            mBlitShader.SetUniform("uViewportSize",
+                                   glm::vec2(static_cast<float>(viewportWidth), static_cast<float>(viewportHeight)));
             mBlitQuad.DrawArrays(GL_TRIANGLES, 6);
             mBlitShader.Unuse();
         }
@@ -836,8 +919,11 @@ namespace EdgeLighting
         mShaderProgram = ShaderProgram(ShaderSource::SPOTLIGHT_VERT_SRC,
                                        ShaderSource::SPOTLIGHT_FRAG_SRC,
                                        "SpotlightRenderer");
+        // Its own blit, not blit.frag: the scaled path dithers there, after
+        // the bilinear read, rather than into the buffer. See
+        // spotlight-blit.frag.
         mBlitShader = ShaderProgram(ShaderSource::NEON_VERT_SRC,
-                                    ShaderSource::NEON_BLIT_FRAG_SRC,
+                                    ShaderSource::SPOTLIGHT_BLIT_FRAG_SRC,
                                     "SpotlightRenderer.Blit");
         return mShaderProgram.IsValid() && mBlitShader.IsValid();
     }
@@ -856,6 +942,33 @@ namespace EdgeLighting
         // clang-format on
         mBlitQuad.SetVertexData(ndc, sizeof(ndc));
         mBlitQuad.SetAttribPointer(0, 2, GL_FLOAT, 2 * sizeof(float), 0);
+    }
+
+    bool SpotlightRenderer::resizeScaledBuffer(int width, int height)
+    {
+        // Walk SCALED_FORMATS from the last tier that allocated. A refused
+        // format is never asked for again: Resize treats a format change as a
+        // reallocation, and its failure path destroys what was there, so
+        // re-asking every frame would churn the attachment - and the buffer is
+        // released between uses, so it cannot remember the refusal itself.
+        for (; mScaledFormat < SCALED_FORMAT_COUNT; ++mScaledFormat)
+        {
+            const ScaledFormat &f = SCALED_FORMATS[mScaledFormat];
+            if (mScaledBuffer.Resize(width, height, f.internalFormat, f.format, f.type))
+            {
+                return true;
+            }
+            if (mScaledFormat + 1 < SCALED_FORMAT_COUNT)
+            {
+                LOG_E("SpotlightRenderer: %s reduced-scale target unavailable, falling back to %s. "
+                      "The dark tail is rounded to 8 bits before the blit reads it.",
+                      f.name, SCALED_FORMATS[mScaledFormat + 1].name);
+            }
+        }
+        // Every candidate refused: stay on the last, the one most likely to
+        // allocate on a later frame, rather than off the end of the list.
+        mScaledFormat = SCALED_FORMAT_COUNT - 1;
+        return false;
     }
 
     void SpotlightRenderer::ensureBuffer()

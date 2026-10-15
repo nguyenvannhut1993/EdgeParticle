@@ -50,9 +50,10 @@ precision highp float;
 //
 // This shader never reads gl_FragCoord: everything arrives interpolated in the
 // lamp's frame - or, for the clip area, in app space through vApp. That is why
-// the y-flip in Render is free, why SpotlightConfig::resolutionScale still
-// needs no uniform of its own, and why the sub-viewport caveat in
-// BaseRenderer's doc comment does not apply here.
+// the y-flip in Render is free, why SpotlightConfig::resolutionScale needs no
+// uniform to shape the light (uDither below only says whether THIS pass
+// dithers), and why the sub-viewport caveat in BaseRenderer's doc comment does
+// not apply here.
 //
 // One caveat of its own, and the clip is the whole of it: reading app space
 // rather than gl_FragCoord keeps the mask's GEOMETRY identical at any scale,
@@ -79,10 +80,12 @@ precision highp float;
 //
 // Output is premultiplied colour plus a COVERAGE ALPHA, the same
 // max-of-channels rule neon.frag and lens-flare.frag use. The renderer pairs
-// it with a separate-alpha blend (GL_ONE / GL_ONE on both channels), so the
-// colour is still pure addition - light only adds, and lamp order still cannot
-// change the image - while the alpha channel accumulates a record of where
-// light was written.
+// it with a separate-alpha SCREEN (GL_ONE_MINUS_DST_COLOR / GL_ONE, and the
+// same on alpha): light only adds, lamp order still cannot change the image,
+// and the alpha channel accumulates a record of where light was written - but
+// overlapping lamps approach full scale instead of summing past it. The
+// highlight shoulder below keeps ONE lamp under 1.0; it cannot see the others,
+// and the screen is what stops two of them clipping where they cross.
 //
 // That alpha is NOT decoration and this shader is the reason the whole layer
 // once vanished on a device. Every other layer here writes a coverage alpha;
@@ -147,29 +150,12 @@ float spotClipMask(vec2 app) {
     return mix(1.0 - inside, inside, uClipParams.z);
 }
 
-/// Interleaved gradient noise, in [-0.5, 0.5]. One fract, one dot: the whole
-/// dither costs about as much as the bloom's sqrt.
-///
-/// Deliberately NOT the fract(sin(dot(...))) hash. That one feeds sin an
-/// argument in the tens of thousands, and how much of it survives is a
-/// precision question every GPU answers differently - on a part that rounds
-/// it coarsely the "noise" degenerates into a second set of bands, which is
-/// the artefact this function exists to remove.
-///
-/// @p p is in PIXELS, and vLocal is the right pixel-valued thing to hand it:
-/// the lamp frame is a rotation plus a translation of the framebuffer, so a
-/// step of one fragment is a step of one unit here too, whatever the lamp's
-/// angle. That also keeps the promise below - the pattern is anchored to the
-/// lamp, so under an animation it travels WITH the beam instead of crawling
-/// across it, and gl_FragCoord still never appears in this shader.
-///
-/// NOT vApp, which is also in pixels but is anchored to the SCREEN: feeding it
-/// here would give every lamp the same pattern in the same place, so two
-/// overlapping beams would dither in lockstep and correlate exactly where the
-/// noise is meant to be independent.
-float spotDither(vec2 p) {
-    return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))) - 0.5;
-}
+/// 1 where this pass writes the caller's framebuffer (resolutionScale 1.0) or
+/// an RGBA8 reduced buffer, 0 where it writes the half-float reduced buffer -
+/// whose dither spotlight-blit.frag adds instead, after its bilinear read. The
+/// ONE uniform the two paths set differently; see SpotlightRenderer::Render
+/// and spotlight-dither.glsl.
+uniform float uDither;
 
 void main() {
     float along = vLocal.x;
@@ -268,8 +254,8 @@ void main() {
     // Coverage = brightest channel, exactly as in neon.frag and
     // lens-flare.frag: a bright aperture core reads as solid to whatever
     // composites this surface, the dim spill stays as good as additive, and an
-    // unlit fragment leaves the alpha it found alone (the blend adds, so 0
-    // contributes nothing). Read from `lit` AFTER the clip, so a cut fragment
+    // unlit fragment leaves the alpha it found alone (0 screened onto
+    // anything leaves it unchanged). Read from `lit` AFTER the clip, so a cut fragment
     // records no coverage either - light that was removed must not go on
     // claiming the surface it would have lit.
     float cov = clamp(max(max(lit.r, lit.g), lit.b), 0.0, 1.0);
@@ -307,7 +293,18 @@ void main() {
     //
     // Same offset on all three channels and on the coverage, so the dither
     // moves the value and never the hue or the premultiplication.
-    float dither = spotDither(vLocal) * (SPOT_DITHER_STEPS / 255.0);
+    //
+    // vLocal, not vApp or gl_FragCoord: the lamp frame is a rotation plus a
+    // translation of the framebuffer, so one fragment is one unit of it
+    // whatever the lamp's angle, and the pattern is anchored to the lamp - it
+    // travels WITH the beam under an animation instead of crawling across it,
+    // and two overlapping beams dither independently rather than in lockstep.
+    //
+    // Scaled by uDither, which is 0 on the scaled path's half-float buffer:
+    // one fragment there is 1 / scale destination pixels, and the blit's
+    // bilinear read would average this noise into blotches that wide. The blit
+    // dithers instead (spotlight-blit.frag).
+    float dither = spotDitherOffset(vLocal) * uDither;
 
     fragColor = vec4(max(lit + dither, 0.0), max(cov + dither, 0.0));
 }

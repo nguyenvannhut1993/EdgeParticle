@@ -5,8 +5,9 @@
 // Shared spotlight constants - single source of truth.
 //
 // Consumed by BOTH:
-//   - the spotlight shader (spotlight.frag), where CMake text-injects this
-//     file via @SPOTLIGHT_TUNING@ in shaders.h.in, and
+//   - the spotlight shaders (spotlight.frag, and spotlight-blit.frag for
+//     SPOT_DITHER_STEPS), where CMake text-injects this file via
+//     @SPOTLIGHT_TUNING@ in shaders.h.in, and
 //   - the C++ renderer (spotlight-renderer.cpp), which #includes it to solve
 //     each lamp's support and size the strip it draws.
 //
@@ -165,8 +166,10 @@
 /// and re-run it before shipping a lower value.
 #define SPOT_STRIP_SEGMENTS       12
 
-/// Width of the ordered dither spotlight.frag adds before the framebuffer
-/// quantises its output, peak to peak, in destination steps. 1.0 is therefore
+/// Width of the ordered dither added before the framebuffer quantises the
+/// layer's output, peak to peak, in destination steps - by spotlight.frag at
+/// resolutionScale 1.0, and by spotlight-blit.frag below it (see
+/// spotlight-dither.glsl for why never into the reduced buffer). 1.0 is therefore
 /// a rectangular +/- HALF a step - the classic dither for an 8-bit target: it
 /// decorrelates the rounding error from the signal without adding visible
 /// noise, and its peak is exactly the rounding threshold, so it cannot round
@@ -245,7 +248,14 @@
 /// 0.15 flattens the emitter completely but starts eating the near beam (100 px
 /// out moves for the first time), which is why the value stops here.
 ///
-/// 1.0 disables the shoulder and restores per-channel clipping.
+/// PER LAMP. The shoulder sees one lamp's light and cannot see the others, so
+/// it bounds each lamp, not their sum: two crossing beams each held near 0.6
+/// would still add past full scale. What stops that is the renderer's blend,
+/// which SCREENS the lamps rather than adding them - see
+/// SpotlightRenderer::Render, and V12a in docs/review-findings.md for why the
+/// shoulder was not moved onto the sum instead.
+///
+/// 1.0 disables the shoulder and restores per-channel clipping of a lone lamp.
 #define SPOT_HIGHLIGHT_KNEE       0.30
 
 /// HALF an 8-bit step - the level below which a value quantises to zero,

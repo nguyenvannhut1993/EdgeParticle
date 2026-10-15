@@ -5,9 +5,8 @@ you get with the default `Config()`, and how each field in the config affects
 the rendered pixels.
 
 This document is a reader-facing complement to
-[`architecture-design.md`](architecture-design.md) (which explains *how* the
-code is put together) - here we focus on *what the parameters do to the
-picture*.
+[`implementation.md`](implementation.md) (which explains *how* the code is put
+together) - here we focus on *what the parameters do to the picture*.
 
 Field defaults come from [`lib/include/core/config.h`](../lib/include/core/config.h);
 tuning constants from
@@ -218,12 +217,15 @@ layer rather than dimming its emission into the tone map. A value carried over
 from before this changed reads dimmer and wider than it used to.
 
 It is measured in **destination** pixels at every `resolutionScale`. Below
-`1.0` the cut is applied by the blit rather than by the gather, for the reason
-in `neon-blit.frag`: the gather's output is upsampled, so an edge drawn in
-buffer pixels is smeared across the line as well as along the lit side. One
-consequence is that the whole parameter is now scale-invariant - the first lit
-pixel reads 37 / 37 / 36 at softness 4 across scales 1.0 / 0.5 / 0.25, where it
-used to read 37 / 129 / 103 and lose its bottom range entirely at 0.25.
+`1.0` the cut is never drawn by the gather, for the reason in
+`neon-blit.frag`: the gather's output is upsampled, so an edge drawn in buffer
+pixels is smeared across the line as well as along the lit side. Near the line
+the full-resolution edge ring applies it, exactly as a full-resolution shade does, and
+further out (a feather wider than the ring) the blit applies the same
+expression. One consequence is that the whole parameter is scale-invariant -
+the first lit pixel reads 37 / 37 / 36 at softness 4 across scales 1.0 / 0.5 /
+0.25 (measured when the blit drew the whole cut), where it used to read 37 /
+129 / 103 and lose its bottom range entirely at 0.25.
 
 ### 3.5 Colour and hue rotation
 
@@ -277,10 +279,11 @@ against.
 - `0.5` = one full lap of the perimeter every 2 seconds (default).
 - `~2+` = clearly kinetic; useful for arcade / marching-lights vibes.
 
-Also drives the per-arc gradient sample when arcs have their own stops:
-inside an arc, the arc's LUT scrolls through the arc's window at the same
-rate (see [`multiple-arcs-design.md`](multiple-arcs-design.md) for the
-sampling model).
+It does NOT move an arc's own stops (`Arc::colorStops`): those are laid along
+the arc from head to tail, so there is nothing to rotate, and scrolling them
+used to slide the gradient off one end and seam it mid-edge (V3 in
+[`review-findings.md`](review-findings.md)). An arc's gradient moves by moving
+the arc, or by animating its stops.
 
 **`neon.colorTransitionDuration`** (default 0.3 s)
 Seconds to cross-fade the *baked LUT* when the colour stops or blend space
@@ -418,19 +421,45 @@ All are demo-time debug aids; leave off in production.
 ### 3.9 Resolution and cost
 
 `NeonRenderer` draws either straight onto the framebuffer it was handed or into
-a downscaled buffer that is bilinear-blitted back. It is one renderer either
-way - these three fields shape its cost and nothing else about how it looks.
+a downscaled buffer that is bilinear-blitted back, with a thin ring around the
+edge re-shaded at full resolution. It is one renderer either way - these three
+fields shape its cost, and the scale shapes how it looks only within a couple
+of levels.
 
 (Before the unification these lived on a second renderer, `NeonOptimizedRenderer`,
 under `Config::optimizedNeon`. The C ABI's `el_effect_*_optimized_*` functions
 still exist and now write these fields; see `el-effect.h`.)
 
-**`neon.resolutionScale`** (default 1.0)
-Fraction of the framebuffer resolution the gather runs at. `1.0` is the direct
-path: no offscreen buffer, no blit, nothing allocated. `0.5` halves each axis
-(quarter the fragment work); `0.25` quarters each axis. Below ~0.35 the
-bilinear upscale starts showing. Clamped to `(0, 1]` at draw time - values
+**`neon.resolutionScale`** (default 0.5)
+Fraction of the framebuffer resolution the glow is shaded at. There is one path
+at every scale (the direct path at `1.0` was removed in I57): `1.0` is the same
+passes with a full-size buffer. `0.5` halves each axis
+(quarter the gather work); `0.25` quarters each axis. Below `1.0` the reduced
+buffer is bilinear-blitted back everywhere except a ring around the edge, which
+is shaded at full resolution from the gather's stored result - so the line, the
+one-sided cut and the cutoffs near it look as they do at 1.0. Within 2/255 of
+1.0 down to 0.125 on every scene of `neon-resolution-scale-comparison.html` but
+a 160 x 96 rect; before the edge ring the upscale started showing below ~0.35,
+and a thin line visibly at 0.75. The error grows as the rect shrinks - a 20 x 17
+rect reads 17 / 53 / 93 levels off at 0.5 / 0.25 / 0.125 - so keep small rects
+at 1.0. Clamped to `(0, 1]` at draw time - values
 above 1.0 do not supersample.
+
+It is not a guaranteed saving. The ring and the blit are a fixed cost, so a
+layer that is already cheap at 1.0 - a tight cutoff band, a one-sided glow -
+can render slower below 1.0, and a soft filament (`filamentFalloff` below
+~0.3) makes the ring wide. Measure on the target before lowering it.
+
+And at 1.0, with no segments and stops whose alpha a rotating hue cannot move,
+the renderer bakes the glow's hue-invariant field once the config holds and
+only composites the gathered hue after that (I46 in `review-findings.md`):
+there 1.0 is the cheapest scale on still frames and with the hue rotating, and
+a reduced scale pays only on frames whose config animates, with segments, or
+for a very small rect. The field costs ~3.3 MB at 1080p for a 960 x 540 rect.
+See `docs/neon-perf-plan.md` section 11. Below 1.0 the same field stands in for
+the reduced-scale shading on hue-rotating frames (I50): 1.55x on those frames
+at 0.5, for 0.84 MB more on that rect - which narrows the gap without closing
+it, since the blit and the ring are full-resolution costs it does not touch.
 
 **`neon.numSamples`** (default 128)
 Number of gather-loop samples per fragment, capped at `NEON_MAX_LOOP_SAMPLES`
@@ -577,5 +606,5 @@ If you need to *animate* one of these fields rather than set it, the
 `FieldBoundAnimation` + `Modulator` family lets you plug an oscillator, an
 ease, or a sequence into any of the animatable fields listed in
 [`field-bound-animation.h`](../lib/include/animation/field-bound-animation.h).
-See [`architecture-design.md`](architecture-design.md) for the animation
+See [`implementation.md`](implementation.md) section 8 for the animation
 model.

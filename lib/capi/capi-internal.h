@@ -95,14 +95,23 @@ static_assert(static_cast<int>(EdgeLighting::SpotlightField::SPREAD_FALLOFF) == 
 static_assert(static_cast<int>(EdgeLighting::ClipMode::KEEP_INSIDE) == EL_CLIP_KEEP_INSIDE);
 static_assert(static_cast<int>(EdgeLighting::ClipMode::KEEP_OUTSIDE) == EL_CLIP_KEEP_OUTSIDE);
 
-static_assert(static_cast<int>(EdgeLighting::ParticleMode::MOVEMENT) == EL_PARTICLE_MODE_MOVEMENT);
-static_assert(static_cast<int>(EdgeLighting::ParticleMode::HEAD_SPARKS) == EL_PARTICLE_MODE_HEAD_SPARKS);
-
 static_assert(static_cast<int>(EdgeLighting::ColorStopField::POSITION) == EL_STOP_FIELD_POSITION);
 static_assert(static_cast<int>(EdgeLighting::ColorStopField::R) == EL_STOP_FIELD_R);
 static_assert(static_cast<int>(EdgeLighting::ColorStopField::G) == EL_STOP_FIELD_G);
 static_assert(static_cast<int>(EdgeLighting::ColorStopField::B) == EL_STOP_FIELD_B);
 static_assert(static_cast<int>(EdgeLighting::ColorStopField::A) == EL_STOP_FIELD_A);
+
+static_assert(static_cast<int>(EdgeLighting::ParticleMode::MOVEMENT) == EL_PARTICLE_MODE_MOVEMENT);
+static_assert(static_cast<int>(EdgeLighting::ParticleMode::HEAD_SPARKS) == EL_PARTICLE_MODE_HEAD_SPARKS);
+
+// el_renderer_flags_e's layer bits ARE RendererLayer's values, so a flag
+// converts to a layer by a cast once it is known to name exactly one layer.
+static_assert(static_cast<uint32_t>(EdgeLighting::RendererLayer::NEON) == EL_RENDERER_NEON);
+static_assert(static_cast<uint32_t>(EdgeLighting::RendererLayer::DROPLETS) == EL_RENDERER_DROPLETS);
+static_assert(static_cast<uint32_t>(EdgeLighting::RendererLayer::LENS_FLARE) == EL_RENDERER_LENS_FLARE);
+static_assert(static_cast<uint32_t>(EdgeLighting::RendererLayer::SPOTLIGHT) == EL_RENDERER_SPOTLIGHT);
+static_assert(static_cast<uint32_t>(EdgeLighting::RendererLayer::PARTICLES) == EL_RENDERER_PARTICLES);
+static_assert(static_cast<uint32_t>(EdgeLighting::RendererLayer::DEBUG) == EL_RENDERER_DEBUG);
 
 // PlaybackMode / EndAction / AnimationState use dedicated to*/from* helpers,
 // so their ABI decoupling is enforced at the switch site rather than by

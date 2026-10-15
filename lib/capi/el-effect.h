@@ -67,9 +67,8 @@ extern "C"
     /** @brief Where the opaque-mode fill covers pixels.
      *  @details See @ref el_opaque_mode_e. NONE keeps the effect purely
      *           transparent; the other modes rasterise a coloured band shaped
-     *           by @ref el_effect_set_inside_cutoff /
-     *           @ref el_effect_set_outside_cutoff and filled with
-     *           @ref el_effect_set_opaque_color. To render the fill on its
+     *           by the fill's own @ref el_effect_set_opaque_cutoff and filled
+     *           with @ref el_effect_set_opaque_color. To render the fill on its
      *           own, with the emission suppressed, see
      *           @ref el_effect_set_debug_opaque_only. */
     EL_API el_result_e el_effect_set_opaque_mode(el_effect_handle_t effect, el_opaque_mode_e mode);
@@ -83,32 +82,71 @@ extern "C"
     EL_API el_result_e el_effect_get_opaque_color(el_effect_handle_t effect,
                                                   float *outR, float *outG, float *outB, float *outA);
 
-    /** @brief Feather width in pixels at the opaque fill's cutoff boundaries.
-     *  @details Applied only when @c opaqueMode != NONE. 0 = hard fill edge;
-     *           larger values soften where the fill fades to background. Kept
-     *           independent of the per-side cutoff softness so the emission
-     *           and the fill can taper at different rates. */
-    EL_API el_result_e el_effect_set_opaque_softness(el_effect_handle_t effect, float softness);
-    EL_API el_result_e el_effect_get_opaque_softness(el_effect_handle_t effect, float *outSoftness);
+    /** @brief Opaque-fill cutoff on one side of the rect edge.
+     *  @details The fill's OWN bound, independent of the glow's
+     *           @ref el_effect_set_inside_cutoff /
+     *           @ref el_effect_set_outside_cutoff: neither pair reaches the
+     *           other layer. @p side picks which cutoff; the INSIDE one caps
+     *           @c INSIDE / @c BOTH fills at d = -size, the OUTSIDE one caps
+     *           @c OUTSIDE / @c BOTH fills at d = +size - solid up to @c size,
+     *           then faded out over the next @c softness px. @c enable = 0 leaves
+     *           that side uncapped - an INSIDE fill covers the whole rect, an
+     *           OUTSIDE one runs to the viewport edge, and BOTH with both off
+     *           covers the whole viewport. @c size is a positive pixel
+     *           distance from the rect edge. @c softness is the feather width
+     *           in pixels, running OUTWARD from @c size (away from the rect
+     *           edge): full at @c size, gone at @c size + @c softness. 0 is a
+     *           pixel-tight antialiased edge at @c size, not a stair-stepped
+     *           one.
+     *
+     *           "Solid up to @c size" holds for softness of 1 px or more. Below
+     *           that the fade is widened to one pixel about
+     *           @c size + @c softness/2, so it starts up to half a pixel
+     *           inside @c size (~0.7 px on a diagonal) - antialiasing, not a
+     *           visible shoulder. The fill always draws at full resolution.
+     *
+     *           Both default to disabled.
+     *
+     *           Returns @ref EL_ERROR_INVALID_PARAMETER for a @p side outside
+     *           @ref el_cutoff_side_e. */
+    EL_API el_result_e el_effect_set_opaque_cutoff(el_effect_handle_t effect, el_cutoff_side_e side,
+                                                   el_bool_t enable, float size, float softness);
+    EL_API el_result_e el_effect_get_opaque_cutoff(el_effect_handle_t effect, el_cutoff_side_e side,
+                                                   el_bool_t *outEnable, float *outSize, float *outSoftness);
 
     /** @brief Inside cutoff (rect interior side): hard geometric limit for the neon glow.
      *  @details @c enable = 0 leaves the interior uncapped (natural halo/bloom
      *           decay bounds the emission). @c size is the pixel distance from
-     *           the rect edge to the cutoff boundary along the interior side
-     *           (always positive). @c softness is the TOTAL feather width in
-     *           pixels, centred on the boundary: 0 is a pixel-tight edge, not a
-     *           hard one, because the ramp is floored at one destination pixel
-     *           so the boundary is antialiased where it curves. Also caps the
-     *           geometric footprint of @c INSIDE / @c BOTH opaque fills.
+     *           the rect edge to where the feather STARTS along the interior
+     *           side (always positive): the glow is untouched up to @c size
+     *           (see below for the antialiasing pixel), at every neon
+     *           resolution scale.
+     *           @c softness is the feather width in pixels, running on from
+     *           @c size: the glow is gone at @c size + @c softness. 0 is a
+     *           pixel-tight edge at @c size, not a hard one, because the ramp
+     *           is floored at one destination pixel so the boundary is
+     *           antialiased where it curves.
      *
-     *           NOTE the shader used to spread this over 2x the stated width
-     *           and to apply it ahead of the tone map; a tuned non-zero value
-     *           now feathers over half the span it used to.
+     *           That floor is laid symmetrically about @c size + @c softness/2,
+     *           so below it the antialiasing ramp starts up to half a pixel
+     *           inside @c size - which keeps a softness-0 edge's 50% point on
+     *           @c size.
+     *
+     *           A neon resolution scale below 1 does not soften the edge. The
+     *           glow is drawn into a smaller buffer, but the cutoff is applied
+     *           at full resolution afterwards, with the same one-pixel floor:
+     *           measured on a 20 px cutoff, the pixels either side of @c size
+     *           read the same at scales 0.5 and 0.25 as at 1.0, at softness 0,
+     *           4 and 16. What the scale changes is the glow inside the band.
+     *           (Older builds did blur the edge, keeping as little as 56% just
+     *           inside @c size at scale 0.25; that is fixed.)
+     *
+     *           Does NOT shape the opaque fill, which has its own
+     *           @ref el_effect_set_opaque_cutoff.
      *
      *           A cutoff on the side the glow side already culls does nothing
      *           to the glow and is ignored: OUTSIDE subsumes the inside cutoff,
-     *           INSIDE subsumes the outside one. It still bounds the opaque
-     *           fill, which has no notion of a glow side. See
+     *           INSIDE subsumes the outside one. See
      *           docs/glow-side-comparison.md. */
     EL_API el_result_e el_effect_set_inside_cutoff(el_effect_handle_t effect,
                                                    el_bool_t enable, float size, float softness);
@@ -116,8 +154,8 @@ extern "C"
                                                    el_bool_t *outEnable, float *outSize, float *outSoftness);
 
     /** @brief Outside cutoff (rect exterior side). Mirror of @ref el_effect_set_inside_cutoff.
-     *  @details Also caps @c OUTSIDE / @c BOTH opaque fills and sizes the neon
-     *           draw quad so far-exterior pixels are rasteriser-culled. */
+     *  @details Also sizes the neon draw quad so far-exterior pixels are
+     *           rasteriser-culled. Does NOT shape the opaque fill. */
     EL_API el_result_e el_effect_set_outside_cutoff(el_effect_handle_t effect,
                                                     el_bool_t enable, float size, float softness);
     EL_API el_result_e el_effect_get_outside_cutoff(el_effect_handle_t effect,
@@ -171,8 +209,7 @@ extern "C"
      *
      *           The cut is coverage applied to the graded output, so a non-zero
      *           value fades the layer rather than dimming its emission into the
-     *           tone map. A value tuned before that changed reads dimmer and
-     *           wider. See docs/glow-side-comparison.md. */
+     *           tone map. See docs/glow-side-comparison.md. */
     EL_API el_result_e el_effect_set_glow_side_softness(el_effect_handle_t effect, float softness);
     EL_API el_result_e el_effect_get_glow_side_softness(el_effect_handle_t effect, float *outSoftness);
 
@@ -414,9 +451,46 @@ extern "C"
     /** @brief Set the neon layer's resolution scale.
      *  @details 1.0 is the full-resolution path - the gather draws straight
      *           onto the target framebuffer, with no offscreen buffer and no
-     *           blit. Below 1.0 the gather renders into a buffer of that
-     *           fraction of the viewport and is bilinear-blitted back, which
-     *           costs @c scale^2 as many shaded fragments.
+     *           blit. Below 1.0 the gather - most of the cost - runs once into
+     *           a small buffer at its own, coarser resolution; the glow is
+     *           shaded from it into a buffer of that fraction of the viewport
+     *           and bilinear-blitted back everywhere except a thin ring around
+     *           the rect edge; the ring is re-shaded at full resolution from
+     *           the same gather result, so the
+     *           line and every edge near it look as they do at 1.0 (within
+     *           2/255 down to 0.125 on the scenes in
+     *           docs/neon-resolution-scale-comparison.html, but for a very
+     *           small rect).
+     *
+     *           Not a guaranteed saving: the ring, the composite and the
+     *           gather pass are a fixed cost, so a layer that is already cheap
+     *           at 1.0 can render slower below 1.0, and a soft filament (falloff below ~0.3)
+     *           widens the ring and loses most of the gain. A one-sided glow or
+     *           a cutoff band pays less than it did: the ring and the composite
+     *           cover only where the glow can still be lit. Measure on the
+     *           target.
+     *
+     *           The error grows as the rect shrinks: a 20 x 17 rect reads
+     *           18 / 53 / 93 levels off at 0.5 / 0.25 / 0.125. Keep small rects
+     *           at 1.0.
+     *
+     *           At 1.0, with no segments and colour stops whose alpha a
+     *           rotating hue cannot move, the layer bakes the glow's
+     *           hue-invariant field once the config holds and only composites
+     *           the hue after that: there 1.0 is the CHEAPEST scale on still
+     *           frames and with the hue rotating, and a reduced scale pays
+     *           only on frames whose config animates, with segments, or for a
+     *           very small rect. The field costs ~3.3 MB at 1920 x 1080 for a
+     *           960 x 540 rect.
+     *
+     *           Each path compiles its own shaders the first frame it renders,
+     *           so the first frame after switching to or from 1.0 pays a
+     *           one-time compile. Below 1.0 the layer holds an RGBA8 buffer
+     *           at the reduced scale, never larger than the viewport at that
+     *           scale, plus a small RGBA16F gather buffer (two attachments
+     *           with segments), both covering only what the glow reaches:
+     *           2.15 MB at 1920 x 1080 and 0.5 for a full-screen rect, 0.6 MB
+     *           at 0.25, less for a smaller rect.
      *
      *           Clamped to (0, 1] at draw time: values above 1.0 do not
      *           supersample, they are refused, because the point of the knob
@@ -452,7 +526,6 @@ extern "C"
      *  @ref el_effect_init places droplets last, so the neon layers show
      *  through the pane. Mirrors @c EdgeLighting::DropletsConfig.
      *  @{ */
-
 
     /* ====================================================================
      * Spotlights (Config::spotlight)
@@ -653,7 +726,8 @@ extern "C"
     /** @brief Fraction of the viewport the lamps render at before being
      *         bilinear-blitted back. 1.0 (default) draws direct - no offscreen
      *         buffer, no blit. Clamped to [0.125, 1.0] at draw time.
-     *  @note  Lossless in shape: not one uniform differs between the paths.
+     *  @note  Lossless in shape: the same falloff, shaded into a half-float
+     *         buffer and dithered at full resolution by the blit.
      *         But unlike the neon and flare scales this one is NOT
      *         automatically a saving - this layer already bounds its geometry
      *         to what the lamps light, so the blit's full viewport of
@@ -925,8 +999,9 @@ extern "C"
 
     /** @brief Initialise every renderer layer under the current GL context.
      *  @details Convenience wrapper for @ref el_effect_init_with_renderers with
-     *           @ref EL_RENDERER_ALL - registers the full stack (neon,
-     *           droplets, lens flare, spotlight, particles, debug).
+     *           @ref EL_RENDERER_ALL - registers the full stack in the default
+     *           order, bottom first: neon, droplets, lens flare, spotlight,
+     *           particles, debug.
      *  @returns @ref EL_ERROR_INIT_FAILED if a renderer fails to initialise
      *           (usually a shader compile / link error - see native log). */
     EL_API el_result_e el_effect_init(el_effect_handle_t effect);
@@ -938,10 +1013,13 @@ extern "C"
      *                      nothing (render becomes a no-op until layers are
      *                      added C++-side); @ref EL_RENDERER_ALL is the full
      *                      stack.
-     *  @details Layers are always registered in the fixed compositing order
-     *           regardless of the mask, so droplets still refract the neon
-     *           beneath them, the lens flare still sits over both, and the
-     *           debug overlays still land on top of everything. An omitted
+     *  @details The mask decides which layers are registered, not their order:
+     *           they go in the default order (neon, droplets, lens flare,
+     *           spotlight, particles, debug - bottom first) whatever bits are
+     *           combined.
+     *           To choose the order, use @ref el_effect_init_with_renderer_order
+     *           instead, or reorder afterwards with
+     *           @ref el_effect_set_renderer_order. An omitted
      *           layer is never constructed and pays no GL cost. Prefer this
      *           over @ref el_effect_init when a host only needs some layers
      *           (e.g. neon alone) and wants to skip the others' shader compiles.
@@ -955,6 +1033,66 @@ extern "C"
      *           initialise (usually a shader compile / link error - see native
      *           log). */
     EL_API el_result_e el_effect_init_with_renderers(el_effect_handle_t effect, uint32_t rendererMask);
+
+    /** @brief Initialise the named renderer layers, in the order given.
+     *  @param effect Effect handle.
+     *  @param order  Layers to register, BOTTOM FIRST: @c order[0] draws first
+     *                and every later entry composites over it. Each entry is
+     *                exactly one @ref el_renderer_flags_e layer bit, named at
+     *                most once. Combined masks and @ref EL_RENDERER_ALL are
+     *                refused, since they do not say where their layers go. May
+     *                be @c NULL when @p count is 0.
+     *  @param count  Number of entries in @p order. 0 registers nothing, like
+     *                @ref EL_RENDERER_NONE.
+     *  @details The ordered form of @ref el_effect_init_with_renderers:
+     *           registers exactly the listed layers, and only they pay any GL
+     *           cost. Order is appearance, not just bookkeeping - the layers
+     *           composite by blending, so a layer only lands on what was drawn
+     *           before it. For example, putting @ref EL_RENDERER_SPOTLIGHT
+     *           BELOW @ref EL_RENDERER_NEON stops the cones adding onto the
+     *           neon: the neon then composites over them by its own coverage.
+     *           One consequence to plan for: the neon's opaque fill, when on,
+     *           then paints over any cone inside the rect.
+     *
+     *           Any order is accepted. @ref EL_RENDERER_DEBUG is meant to go
+     *           last, since its overlays annotate the layers under them.
+     *
+     *           Calling this again on an initialised handle rebuilds the whole
+     *           stack. The staging config is kept.
+     *  @returns @ref EL_ERROR_INVALID_PARAMETER if @p order is malformed
+     *           (nothing is registered and any previous stack is left as it
+     *           was); @ref EL_ERROR_INIT_FAILED if a renderer fails to
+     *           initialise, in which case that layer is dropped, the rest keep
+     *           running, and @ref el_effect_get_renderer_count reports the
+     *           survivors. */
+    EL_API el_result_e el_effect_init_with_renderer_order(el_effect_handle_t effect,
+                                                          const uint32_t *order, int32_t count);
+
+    /** @brief Reorder the registered layers without re-initialising any of them.
+     *  @param order Every registered layer exactly once, BOTTOM FIRST - a
+     *               permutation of what @ref el_effect_get_renderer_at
+     *               reports. This only moves layers; it cannot add or drop one.
+     *  @param count Number of entries in @p order; must equal
+     *               @ref el_effect_get_renderer_count.
+     *  @details Cheap: nothing is recompiled or reallocated, and it takes
+     *           effect on the next @ref el_effect_render. Safe to call every
+     *           frame, though there is rarely a reason to.
+     *  @returns @ref EL_ERROR_INVALID_HANDLE before the effect is initialised;
+     *           @ref EL_ERROR_INVALID_PARAMETER if @p order is not a
+     *           permutation of the registered layers, in which case the current
+     *           order is kept. */
+    EL_API el_result_e el_effect_set_renderer_order(el_effect_handle_t effect,
+                                                    const uint32_t *order, int32_t count);
+
+    /** @brief Number of layers currently registered. 0 before init. */
+    EL_API el_result_e el_effect_get_renderer_count(el_effect_handle_t effect, int32_t *outCount);
+
+    /** @brief The layer at a position in the compositing order.
+     *  @param index    0 = bottom (drawn first), count - 1 = top.
+     *  @param outLayer Receives that layer's single @ref el_renderer_flags_e bit.
+     *  @returns @ref EL_ERROR_INVALID_PARAMETER if @p index is out of range. */
+    EL_API el_result_e el_effect_get_renderer_at(el_effect_handle_t effect, int32_t index,
+                                                 uint32_t *outLayer);
 
     /** @brief Pull the effect's base config back into the effect's staging config.
      *  @details Snapshots the last-authored values (what @c SetConfig

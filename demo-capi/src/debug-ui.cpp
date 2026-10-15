@@ -82,173 +82,49 @@ namespace
         }
         }
     }
-} // namespace
 
-// ---------------------------------------------------------------------------
-// Lifecycle
-// ---------------------------------------------------------------------------
-
-DebugUI::~DebugUI()
-{
-    Shutdown();
-}
-
-bool DebugUI::Init(GLFWwindow *mainWindow, int mainW, int /*mainH*/)
-{
-    int dbgW = 420, dbgH = 700;
-    glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
-    glfwWindowHint(GLFW_FOCUSED, GLFW_FALSE);
-    mWindow = glfwCreateWindow(dbgW, dbgH, "Debug Controls", nullptr, mainWindow);
-    if (!mWindow)
+    // One row per cutoff: enable checkbox, then size + softness sliders
+    // indented under it and greyed out while it is off. Serves both the glow's
+    // pair and the opaque fill's own pair - getFn / setFn take the
+    // (effect, enable, size, softness) shape of el_effect_*_inside_cutoff; the
+    // fill's side-addressed pair is bound to that shape by the caller.
+    // @p subsumed - glowSide already culls this side, so the renderer ignores
+    // this GLOW cutoff. Always false for a fill cutoff.
+    template <typename GetFn, typename SetFn>
+    void DrawCutoffRow(el_effect_handle_t effect, const char *base, const char *idSuffix,
+                       GetFn getFn, SetFn setFn, bool subsumed)
     {
-        std::fprintf(stderr, "Failed to create debug window\n");
-        return false;
-    }
-    glfwSetWindowPos(mWindow, mainW + 20, 40);
-    glfwSetWindowAttrib(mWindow, GLFW_FLOATING, GLFW_TRUE);
-
-    mMainWindow = mainWindow;
-    glfwMakeContextCurrent(mainWindow);
-
-    IMGUI_CHECKVERSION();
-    mContext = ImGui::CreateContext();
-    ImGui::SetCurrentContext(mContext);
-    ImGuiIO &io = ImGui::GetIO();
-    io.IniFilename = nullptr;
-    ImGui::StyleColorsDark();
-    ImGui_ImplGlfw_InitForOpenGL(mWindow, true);
-    ImGui_ImplOpenGL3_Init(GLSL_VERSION);
-    return true;
-}
-
-void DebugUI::Shutdown()
-{
-    for (auto &e : mAnimations)
-    {
-        if (e.handle)
+        el_bool_t enable = 0;
+        float size = 0.0f, soft = 0.0f;
+        getFn(effect, &enable, &size, &soft);
+        bool en = enable != 0;
+        char enableLabel[64], sizeLabel[64], softLabel[64];
+        std::snprintf(enableLabel, sizeof(enableLabel), "%s##%s", base, idSuffix);
+        std::snprintf(sizeLabel, sizeof(sizeLabel), "%s size##%s", base, idSuffix);
+        std::snprintf(softLabel, sizeof(softLabel), "%s softness##%s", base, idSuffix);
+        bool changed = ImGui::Checkbox(enableLabel, &en);
+        ImGui::Indent();
+        if (!en)
         {
-            el_animation_destroy(e.handle);
+            ImGui::BeginDisabled();
+        }
+        changed |= ImGui::SliderFloat(sizeLabel, &size, 0.0f, 200.0f, "%.0f");
+        changed |= ImGui::SliderFloat(softLabel, &soft, 0.0f, 20.0f, "%.1f");
+        if (!en)
+        {
+            ImGui::EndDisabled();
+        }
+        if (en && subsumed)
+        {
+            ImGui::TextDisabled("subsumed by Glow Side - no effect");
+        }
+        ImGui::Unindent();
+        if (changed)
+        {
+            setFn(effect, en ? 1 : 0, size, soft);
         }
     }
-    mAnimations.clear();
 
-    if (mColorPickerTex)
-    {
-        glDeleteTextures(1, &mColorPickerTex);
-        mColorPickerTex = 0;
-    }
-
-    if (mContext)
-    {
-        ImGui::SetCurrentContext(mContext);
-        ImGui_ImplOpenGL3_Shutdown();
-        ImGui_ImplGlfw_Shutdown();
-        ImGui::DestroyContext(mContext);
-        mContext = nullptr;
-    }
-    if (mWindow)
-    {
-        glfwDestroyWindow(mWindow);
-        mWindow = nullptr;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Per-frame
-// ---------------------------------------------------------------------------
-
-void DebugUI::Build(el_effect_handle_t effect)
-{
-    ImGui::SetCurrentContext(mContext);
-    ImGui_ImplOpenGL3_NewFrame();
-    ImGui_ImplGlfw_NewFrame();
-    ImGui::NewFrame();
-
-    el_bool_t playing = 0;
-    el_effect_clock_is_playing(effect, &playing);
-
-    ImGui::Begin("Debug Controls");
-
-    const ImGuiIO &io = ImGui::GetIO();
-    ImGui::Text("FPS: %.1f  |  %.2f ms (frame)  |  %.2f ms (render)",
-                io.Framerate, 1000.0f / io.Framerate, mLastRenderTimeMs);
-    ImGui::Separator();
-
-    buildGeometrySection(effect);
-    buildNeonSection(effect);
-    buildDebugSection(effect);
-    buildDropletsSection(effect);
-    buildLensFlareSection(effect);
-    buildSpotlightSection(effect);
-    buildColorPickerSection(effect);
-    buildAnimationSection(effect);
-    buildBackgroundSection();
-
-    ImGui::Separator();
-    ImGui::Text("Clock: %s", playing ? "PLAYING" : "PAUSED");
-    if (ImGui::Button(playing ? "Pause" : "Play"))
-    {
-        if (playing)
-            el_effect_clock_pause(effect);
-        else
-            el_effect_clock_play(effect);
-    }
-    ImGui::End();
-}
-
-void DebugUI::Render()
-{
-    ImGui::Render();
-    glfwMakeContextCurrent(mWindow);
-    int fbW = 0, fbH = 0;
-    glfwGetFramebufferSize(mWindow, &fbW, &fbH);
-    glViewport(0, 0, fbW, fbH);
-    glClearColor(0.12f, 0.12f, 0.14f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
-    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-    glfwSwapBuffers(mWindow);
-}
-
-// ---------------------------------------------------------------------------
-// Geometry
-// ---------------------------------------------------------------------------
-
-void DebugUI::buildGeometrySection(el_effect_handle_t effect)
-{
-    if (!ImGui::CollapsingHeader("Geometry", ImGuiTreeNodeFlags_DefaultOpen))
-    {
-        return;
-    }
-
-    float w = 0, h = 0, x = 0, y = 0, r = 0;
-    el_effect_get_geometry(effect, &w, &h, &x, &y, &r);
-    bool changed = false;
-    changed |= ImGui::SliderFloat("Width", &w, 100.0f, 1600.0f, "%.0f");
-    changed |= ImGui::SliderFloat("Height", &h, 100.0f, 1200.0f, "%.0f");
-    changed |= ImGui::SliderFloat("Pos X", &x, 0.0f, 1600.0f, "%.0f");
-    changed |= ImGui::SliderFloat("Pos Y", &y, 0.0f, 1200.0f, "%.0f");
-    changed |= ImGui::SliderFloat("Corner Radius", &r, 0.0f, 200.0f, "%.0f");
-    if (changed)
-    {
-        el_effect_set_geometry(effect, w, h, x, y, r);
-    }
-
-    el_winding_e winding = EL_WINDING_CLOCKWISE;
-    el_effect_get_winding(effect, &winding);
-    const char *items[] = {"CW", "CCW"};
-    int idx = static_cast<int>(winding);
-    if (ImGui::Combo("Winding", &idx, items, IM_ARRAYSIZE(items)))
-    {
-        el_effect_set_winding(effect, static_cast<el_winding_e>(idx));
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Neon
-// ---------------------------------------------------------------------------
-
-namespace
-{
     // Draw the sliders shared between Neon and Optimized Neon sections. Reads
     // via getters and writes via setters. Suffix distinguishes ID scopes.
     void DrawSharedNeonSliders(el_effect_handle_t effect, const char *idSuffix)
@@ -298,57 +174,14 @@ namespace
             }
         }
 
-        // A cutoff on the side glowSide culls is ignored for the GLOW, but still
-        // bounds an opaque fill on that same side. See neon.frag's band-distance
-        // block and docs/glow-side-comparison.md section 4.3.
-        el_opaque_mode_e om = EL_OPAQUE_MODE_NONE;
-        el_effect_get_opaque_mode(effect, &om);
-        const bool fillUsesInside = (om == EL_OPAQUE_MODE_INSIDE || om == EL_OPAQUE_MODE_BOTH);
-        const bool fillUsesOutside = (om == EL_OPAQUE_MODE_OUTSIDE || om == EL_OPAQUE_MODE_BOTH);
-
-        auto cutoffRow = [&](const char *base,
-                             auto getFn, auto setFn,
-                             bool subsumed, bool fillUses)
-        {
-            el_bool_t enable = 0;
-            float size = 0.0f, soft = 0.0f;
-            getFn(effect, &enable, &size, &soft);
-            bool en = enable != 0;
-            char enableLabel[64], sizeLabel[64], softLabelInner[64];
-            std::snprintf(enableLabel, sizeof(enableLabel), "%s##%s", base, idSuffix);
-            std::snprintf(sizeLabel, sizeof(sizeLabel), "%s size##%s", base, idSuffix);
-            std::snprintf(softLabelInner, sizeof(softLabelInner), "%s softness##%s", base, idSuffix);
-            bool changed = ImGui::Checkbox(enableLabel, &en);
-            ImGui::Indent();
-            if (!en)
-                ImGui::BeginDisabled();
-            changed |= ImGui::SliderFloat(sizeLabel, &size, 0.0f, 200.0f, "%.0f");
-            changed |= ImGui::SliderFloat(softLabelInner, &soft, 0.0f, 20.0f, "%.1f");
-            if (!en)
-            {
-                ImGui::EndDisabled();
-            }
-            if (en && subsumed)
-            {
-                if (fillUses)
-                {
-                    ImGui::TextDisabled("subsumed by Glow Side - bounds the fill only");
-                }
-                else
-                {
-                    ImGui::TextDisabled("subsumed by Glow Side - no effect");
-                }
-            }
-            ImGui::Unindent();
-            if (changed)
-            {
-                setFn(effect, en ? 1 : 0, size, soft);
-            }
-        };
-        cutoffRow("Inside Cutoff", el_effect_get_inside_cutoff, el_effect_set_inside_cutoff,
-                  side == EL_GLOW_SIDE_OUTSIDE, fillUsesInside);
-        cutoffRow("Outside Cutoff", el_effect_get_outside_cutoff, el_effect_set_outside_cutoff,
-                  side == EL_GLOW_SIDE_INSIDE, fillUsesOutside);
+        // The GLOW's cutoffs. One on the side glowSide culls is ignored (see
+        // neon.frag's band-distance block and docs/glow-side-comparison.md
+        // section 4.3); neither reaches the opaque fill, which has its own
+        // pair in the opaque section.
+        DrawCutoffRow(effect, "Inside Cutoff", idSuffix, el_effect_get_inside_cutoff,
+                      el_effect_set_inside_cutoff, side == EL_GLOW_SIDE_OUTSIDE);
+        DrawCutoffRow(effect, "Outside Cutoff", idSuffix, el_effect_get_outside_cutoff,
+                      el_effect_set_outside_cutoff, side == EL_GLOW_SIDE_INSIDE);
     }
 
     // Segment boost row: reads/writes one segment through capi accessors.
@@ -667,7 +500,301 @@ namespace
                                      1.0f, 1.0f, 1.0f, 1.0f);
         }
     }
+
+    const char *LayerName(uint32_t layer)
+    {
+        switch (layer)
+        {
+        case EL_RENDERER_NEON:
+        {
+            return "Neon";
+        }
+        case EL_RENDERER_DROPLETS:
+        {
+            return "Droplets";
+        }
+        case EL_RENDERER_LENS_FLARE:
+        {
+            return "Lens flare";
+        }
+        case EL_RENDERER_SPOTLIGHT:
+        {
+            return "Spotlight";
+        }
+        case EL_RENDERER_PARTICLES:
+        {
+            return "Particles";
+        }
+        case EL_RENDERER_DEBUG:
+        {
+            return "Debug overlays";
+        }
+        default:
+        {
+            return "Unknown";
+        }
+        }
+    }
+
+    std::vector<uint32_t> ReadLayerOrder(el_effect_handle_t effect)
+    {
+        int32_t count = 0;
+        el_effect_get_renderer_count(effect, &count);
+        std::vector<uint32_t> order(static_cast<size_t>(std::max(count, 0)));
+        for (int32_t i = 0; i < count; i++)
+        {
+            el_effect_get_renderer_at(effect, i, &order[static_cast<size_t>(i)]);
+        }
+        return order;
+    }
 } // namespace
+
+// ---------------------------------------------------------------------------
+// Lifecycle
+// ---------------------------------------------------------------------------
+
+DebugUI::~DebugUI()
+{
+    Shutdown();
+}
+
+bool DebugUI::Init(GLFWwindow *mainWindow, int mainW, int /*mainH*/)
+{
+    int dbgW = 420, dbgH = 700;
+    glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
+    glfwWindowHint(GLFW_FOCUSED, GLFW_FALSE);
+    mWindow = glfwCreateWindow(dbgW, dbgH, "Debug Controls", nullptr, mainWindow);
+    if (!mWindow)
+    {
+        std::fprintf(stderr, "Failed to create debug window\n");
+        return false;
+    }
+    glfwSetWindowPos(mWindow, mainW + 20, 40);
+    glfwSetWindowAttrib(mWindow, GLFW_FLOATING, GLFW_TRUE);
+
+    mMainWindow = mainWindow;
+    glfwMakeContextCurrent(mainWindow);
+
+    IMGUI_CHECKVERSION();
+    mContext = ImGui::CreateContext();
+    ImGui::SetCurrentContext(mContext);
+    ImGuiIO &io = ImGui::GetIO();
+    io.IniFilename = nullptr;
+    ImGui::StyleColorsDark();
+    ImGui_ImplGlfw_InitForOpenGL(mWindow, true);
+    ImGui_ImplOpenGL3_Init(GLSL_VERSION);
+    return true;
+}
+
+void DebugUI::Shutdown()
+{
+    for (auto &e : mAnimations)
+    {
+        if (e.handle)
+        {
+            el_animation_destroy(e.handle);
+        }
+    }
+    mAnimations.clear();
+
+    if (mColorPickerTex)
+    {
+        glDeleteTextures(1, &mColorPickerTex);
+        mColorPickerTex = 0;
+    }
+
+    if (mContext)
+    {
+        ImGui::SetCurrentContext(mContext);
+        ImGui_ImplOpenGL3_Shutdown();
+        ImGui_ImplGlfw_Shutdown();
+        ImGui::DestroyContext(mContext);
+        mContext = nullptr;
+    }
+    if (mWindow)
+    {
+        glfwDestroyWindow(mWindow);
+        mWindow = nullptr;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-frame
+// ---------------------------------------------------------------------------
+
+void DebugUI::Build(el_effect_handle_t effect)
+{
+    ImGui::SetCurrentContext(mContext);
+    ImGui_ImplOpenGL3_NewFrame();
+    ImGui_ImplGlfw_NewFrame();
+    ImGui::NewFrame();
+
+    el_bool_t playing = 0;
+    el_effect_clock_is_playing(effect, &playing);
+
+    ImGui::Begin("Debug Controls");
+
+    const ImGuiIO &io = ImGui::GetIO();
+    ImGui::Text("FPS: %.1f  |  %.2f ms (frame)  |  %.2f ms (render)",
+                io.Framerate, 1000.0f / io.Framerate, mLastRenderTimeMs);
+    ImGui::Separator();
+
+    buildGeometrySection(effect);
+    buildLayerOrderSection(effect);
+    buildNeonSection(effect);
+    buildDebugSection(effect);
+    buildDropletsSection(effect);
+    buildLensFlareSection(effect);
+    buildSpotlightSection(effect);
+    buildColorPickerSection(effect);
+    buildAnimationSection(effect);
+    buildBackgroundSection();
+
+    ImGui::Separator();
+    ImGui::Text("Clock: %s", playing ? "PLAYING" : "PAUSED");
+    if (ImGui::Button(playing ? "Pause" : "Play"))
+    {
+        if (playing)
+            el_effect_clock_pause(effect);
+        else
+            el_effect_clock_play(effect);
+    }
+    ImGui::End();
+}
+
+void DebugUI::Render()
+{
+    ImGui::Render();
+    glfwMakeContextCurrent(mWindow);
+    int fbW = 0, fbH = 0;
+    glfwGetFramebufferSize(mWindow, &fbW, &fbH);
+    glViewport(0, 0, fbW, fbH);
+    glClearColor(0.12f, 0.12f, 0.14f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+    glfwSwapBuffers(mWindow);
+}
+
+// ---------------------------------------------------------------------------
+// Geometry
+// ---------------------------------------------------------------------------
+
+void DebugUI::buildGeometrySection(el_effect_handle_t effect)
+{
+    if (!ImGui::CollapsingHeader("Geometry", ImGuiTreeNodeFlags_DefaultOpen))
+    {
+        return;
+    }
+
+    float w = 0, h = 0, x = 0, y = 0, r = 0;
+    el_effect_get_geometry(effect, &w, &h, &x, &y, &r);
+    bool changed = false;
+    changed |= ImGui::SliderFloat("Width", &w, 100.0f, 1600.0f, "%.0f");
+    changed |= ImGui::SliderFloat("Height", &h, 100.0f, 1200.0f, "%.0f");
+    changed |= ImGui::SliderFloat("Pos X", &x, 0.0f, 1600.0f, "%.0f");
+    changed |= ImGui::SliderFloat("Pos Y", &y, 0.0f, 1200.0f, "%.0f");
+    changed |= ImGui::SliderFloat("Corner Radius", &r, 0.0f, 200.0f, "%.0f");
+    if (changed)
+    {
+        el_effect_set_geometry(effect, w, h, x, y, r);
+    }
+
+    el_winding_e winding = EL_WINDING_CLOCKWISE;
+    el_effect_get_winding(effect, &winding);
+    const char *items[] = {"CW", "CCW"};
+    int idx = static_cast<int>(winding);
+    if (ImGui::Combo("Winding", &idx, items, IM_ARRAYSIZE(items)))
+    {
+        el_effect_set_winding(effect, static_cast<el_winding_e>(idx));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Layer order
+// ---------------------------------------------------------------------------
+
+void DebugUI::buildLayerOrderSection(el_effect_handle_t effect)
+{
+    std::vector<uint32_t> order = ReadLayerOrder(effect);
+    if (mDefaultLayerOrder.empty())
+    {
+        mDefaultLayerOrder = order;
+    }
+
+    if (!ImGui::CollapsingHeader("Layer order"))
+    {
+        return;
+    }
+
+    ImGui::TextDisabled("Top of the list draws last, over everything below it.");
+
+    const int count = static_cast<int>(order.size());
+    int swapWith = -1;
+    int swapAt = -1;
+
+    // Listed TOP first, the way a layer stack reads; the ABI's order is
+    // bottom first, so row r shows index count - 1 - r.
+    for (int row = 0; row < count; row++)
+    {
+        const int i = count - 1 - row;
+        ImGui::PushID(i);
+        ImGui::BeginDisabled(i == count - 1);
+        if (ImGui::ArrowButton("##Up", ImGuiDir_Up))
+        {
+            swapAt = i;
+            swapWith = i + 1;
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::BeginDisabled(i == 0);
+        if (ImGui::ArrowButton("##Down", ImGuiDir_Down))
+        {
+            swapAt = i;
+            swapWith = i - 1;
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::Text("%d  %s%s", i, LayerName(order[static_cast<size_t>(i)]),
+                    i == 0 ? "  (bottom)" : (i == count - 1 ? "  (top)" : ""));
+        ImGui::PopID();
+    }
+
+    // Applied after the loop so the rows above all read the same order.
+    // Swapping two neighbours always leaves a valid order to hand back whole.
+    if (swapAt >= 0)
+    {
+        std::swap(order[static_cast<size_t>(swapAt)], order[static_cast<size_t>(swapWith)]);
+        el_effect_set_renderer_order(effect, order.data(), static_cast<int32_t>(order.size()));
+    }
+
+    if (ImGui::Button("Default##LayerOrder"))
+    {
+        el_effect_set_renderer_order(effect, mDefaultLayerOrder.data(),
+                                     static_cast<int32_t>(mDefaultLayerOrder.size()));
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Spotlight at bottom##LayerOrder"))
+    {
+        // The spotlight first, everything else in its current order. Nothing to
+        // do if the spotlight layer was not registered.
+        auto spot = std::find(order.begin(), order.end(), static_cast<uint32_t>(EL_RENDERER_SPOTLIGHT));
+        if (spot != order.end())
+        {
+            std::rotate(order.begin(), spot, spot + 1);
+            el_effect_set_renderer_order(effect, order.data(), static_cast<int32_t>(order.size()));
+        }
+    }
+    if (ImGui::IsItemHovered())
+    {
+        ImGui::SetTooltip("Draws the cones first, so the neon composites over them by its own\n"
+                          "coverage instead of the cones adding onto the neon. The neon's opaque\n"
+                          "fill, if on, then covers any cone inside the rect.");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Neon
+// ---------------------------------------------------------------------------
 
 void DebugUI::buildNeonSection(el_effect_handle_t effect)
 {
@@ -691,8 +818,8 @@ void DebugUI::buildNeonSection(el_effect_handle_t effect)
     // --- Performance ------------------------------------------------------
     // These reach the one neon layer through the el_effect_*_optimized_*
     // entry points, which are deprecated in name only - the half-res path is
-    // a resolution scale on this renderer now, not a second one. Res Scale 1.0
-    // is the full-resolution path.
+    // a resolution scale on this renderer now, not a second one. Res Scale is
+    // the size of the buffer the glow is shaded into (1.0 = full size).
     if (ImGui::TreeNodeEx("Performance##Neon", ImGuiTreeNodeFlags_DefaultOpen))
     {
         float scale = 0.0f;
@@ -737,11 +864,25 @@ void DebugUI::buildNeonSection(el_effect_handle_t effect)
         {
             el_effect_set_opaque_color(effect, col[0], col[1], col[2], col[3]);
         }
-        float opaqueSoftness = 0.0f;
-        el_effect_get_opaque_softness(effect, &opaqueSoftness);
-        if (ImGui::SliderFloat("Opaque Softness##Neon", &opaqueSoftness, 0.0f, 20.0f, "%.1f"))
+        // The fill's OWN cutoffs, independent of the glow's. Only the sides
+        // the current mode fills are shown - ALL has neither.
+        auto fillRow = [&](const char *base, el_cutoff_side_e cutSide)
         {
-            el_effect_set_opaque_softness(effect, opaqueSoftness);
+            DrawCutoffRow(
+                effect, base, "Neon",
+                [cutSide](el_effect_handle_t e, el_bool_t *en, float *size, float *soft)
+                { return el_effect_get_opaque_cutoff(e, cutSide, en, size, soft); },
+                [cutSide](el_effect_handle_t e, el_bool_t en, float size, float soft)
+                { return el_effect_set_opaque_cutoff(e, cutSide, en, size, soft); },
+                false);
+        };
+        if (opaqueMode == EL_OPAQUE_MODE_INSIDE || opaqueMode == EL_OPAQUE_MODE_BOTH)
+        {
+            fillRow("Fill Inside Cutoff", EL_CUTOFF_SIDE_INSIDE);
+        }
+        if (opaqueMode == EL_OPAQUE_MODE_OUTSIDE || opaqueMode == EL_OPAQUE_MODE_BOTH)
+        {
+            fillRow("Fill Outside Cutoff", EL_CUTOFF_SIDE_OUTSIDE);
         }
     }
 
@@ -819,7 +960,6 @@ void DebugUI::buildDebugSection(el_effect_handle_t effect)
         ImGui::TextDisabled("Neon is off - LUT / stops have nothing to annotate.");
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Droplets

@@ -15,8 +15,8 @@ or [`core/config.h`](../lib/include/core/config.h), the headers win.
 ## 1. What the layer is
 
 **Freely placed and aimed cones of light, and nothing else.** No backdrop, no
-fixture housings, no floor, no framebuffer capture. The layer composites
-additively over whatever is already there.
+fixture housings, no floor, no framebuffer capture. The layer SCREENS over
+whatever is already there - `dst + src * (1 - dst)`.
 
 It is the odd one out in this library. Every other renderer parameterises its
 look by position along the rect's perimeter; this one does not touch the rect
@@ -30,10 +30,19 @@ at all:
   freely. There is no shadow model and no rect gating. The one way to stop
   light is `spotlight.clipArea` (section 4.6) - an explicit area, opted into per
   lamp, that cuts the light off rather than casting a shadow from anything.
-- **Light only adds.** The pass is fully additive - `glBlendFuncSeparate(GL_ONE,
-  GL_ONE, GL_ONE, GL_ONE)` - in the alpha channel as well as in colour, which
-  also makes the layer order-independent. The order of
-  `SpotlightConfig::lamps` cannot change the image.
+- **Light only adds, but never past full scale.** The pass SCREENS -
+  `glBlendFuncSeparate(GL_ONE_MINUS_DST_COLOR, GL_ONE, GL_ONE_MINUS_DST_ALPHA,
+  GL_ONE)` - in the alpha channel as well as in colour. A lamp never darkens
+  what is under it, but overlapping lamps approach 1.0 instead of summing past
+  it, which is what stops two crossing beams clipping to a flat white disc (V12a
+  in [`review-findings.md`](review-findings.md)). The screen is symmetric and
+  associative, so the layer is still order-independent: the order of
+  `SpotlightConfig::lamps` cannot change the image. It costs what the add did.
+  What it gives up: a lamp adds less over anything already lit (up to 9 levels
+  at a default lamp's core over the demo's dark clear; nothing over a
+  transparent one), and it works per channel, so a coloured overlap drifts
+  towards white. It also assumes a destination in [0, 1] - a host float
+  framebuffer holding values above 1 turns `1 - dst` negative.
 - **It writes a coverage alpha**, the same max-of-channels rule neon and the
   flare use. It did not always: the shader emitted a literal `0.0`, which is
   invisible on a desktop window (opaque, nobody reads the alpha back) and
@@ -118,9 +127,12 @@ field is unchanged at every one of them. The cost is the pinpoint hotspot at low
 intensity: a default lamp's core reads 156 rather than 211, and nothing from 100
 px out is affected.
 
-It is per LAMP, though, and the pass is additive - two beams overlapping
-brightly can still clip their sum. See **V12**, **V12a** and **V12b** in
-[`review-findings.md`](review-findings.md).
+It is per LAMP, though: it cannot see the other lamps, so it does not bound
+their sum. The blend does - lamps screen rather than add, so two beams
+overlapping brightly approach full scale instead of clipping. See **V12**,
+**V12a** and **V12b** in [`review-findings.md`](review-findings.md); V12a also
+records why the shoulder was not moved onto the sum instead (2.5x to 9.3x the
+GPU time, and a crease where differently coloured beams cross).
 
 ---
 
@@ -365,8 +377,8 @@ holding its colour instead of clipping channel by channel and walking up
 amber -> yellow -> white. See V12 in [`review-findings.md`](review-findings.md)
 for the before/after, V12b for why the knee then had to come down to 0.30 to
 stop the EMITTER growing as well as staying coloured, and V12a for the case
-neither covers: the shoulder is per lamp, so two beams overlapping brightly can
-still clip their sum.
+neither covers: the shoulder is per lamp, so it is the blend - a screen, not an
+add - that keeps two beams overlapping brightly from clipping their sum.
 
 **So this is now the lever for a stronger beam**, which it was not before.
 Because the shoulder compresses above the knee and is exactly linear below it,
@@ -610,10 +622,22 @@ the way animating a pure shader uniform is.
 
 ## 6. Resolution and cost
 
-`SpotlightConfig::resolutionScale` behaves exactly as the neon's and the
-flare's do - same two paths, same blit - and **not one uniform differs between
-them**, so a scaled frame is the same picture at lower resolution rather than a
-differently shaped one.
+`SpotlightConfig::resolutionScale` behaves as the flare's does - two paths,
+direct at 1.0 and a bilinear blit below it - and **no uniform that shapes the
+light differs between them**, so a scaled frame is the same picture at lower
+resolution rather than a differently shaped one.
+
+The one thing that moves is **where the output is dithered**. At 1.0 the strips
+dither their own write to the caller's 8-bit target. Below it they write a
+**half-float** buffer undithered, and the layer's own blit
+(`spotlight-blit.frag`) dithers once per destination pixel after its bilinear
+read. That split is the neon's (R7) and for the same reason: dithered into an
+RGBA8 buffer, the tail - one level every 13 to 50 px - was already rounded to
+plateaus before the blit read it, and the filter averaged the per-texel noise
+into blotches, so at 0.25 and 0.125 the dark tail came back as blocky contours
+(V27 in `review-findings.md`). A driver that will not render to half float
+gets RGBA8 with the old in-pass dither, plus the blit's. The buffer costs twice
+the memory for it: 4.1 MB at 1080p and 0.5.
 
 One exception, and it is a hard gate rather than a caveat: **an enabled clipped
 lamp holds the scale at 1.0**, so everything in this section describes an

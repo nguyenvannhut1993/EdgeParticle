@@ -94,17 +94,34 @@ extern "C"
 
     /** @brief Where the opaque-mode fill covers pixels.
      *  @details Mirrors @c EdgeLighting::OpaqueMode. The fill is a rounded
-     *           band sized by @ref el_effect_set_inside_cutoff /
-     *           @ref el_effect_set_outside_cutoff; the neon emission still
+     *           band sized by its OWN cutoffs, set with
+     *           @ref el_effect_set_opaque_cutoff - not by the glow's
+     *           @ref el_effect_set_inside_cutoff /
+     *           @ref el_effect_set_outside_cutoff. The neon emission still
      *           composites on top inside the glow band. */
     typedef enum el_opaque_mode_e
     {
         EL_OPAQUE_MODE_NONE = 0,    /**< No opaque pass; effect composites transparently. */
-        EL_OPAQUE_MODE_OUTSIDE = 1, /**< Fill outer half of the band: 0 <= d <= outsideCutoff. */
-        EL_OPAQUE_MODE_INSIDE = 2,  /**< Fill inner half of the band: -insideCutoff <= d <= 0. */
-        EL_OPAQUE_MODE_BOTH = 3,    /**< Fill the whole band: -insideCutoff <= d <= +outsideCutoff. */
+        EL_OPAQUE_MODE_OUTSIDE = 1, /**< Fill outer half of the band: 0 <= d <= fill outside cutoff. */
+        EL_OPAQUE_MODE_INSIDE = 2,  /**< Fill inner half of the band: -fill inside cutoff <= d <= 0. */
+        EL_OPAQUE_MODE_BOTH = 3,    /**< Fill the whole band: -fill inside cutoff <= d <= +fill outside cutoff. */
         EL_OPAQUE_MODE_ALL = 4      /**< Fill the whole viewport. */
     } el_opaque_mode_e;
+
+    /** @brief Which side of the rect edge a cutoff bounds.
+     *  @details Addresses one of a layer's two cutoffs in
+     *           @ref el_effect_set_opaque_cutoff /
+     *           @ref el_effect_get_opaque_cutoff. Unlike the enums around it
+     *           this has no C++ enum to mirror - on that side the two cutoffs
+     *           are separate fields (@c NeonConfig::opaqueInsideCutoff /
+     *           @c opaqueOutsideCutoff) - so there is no parity assert to keep
+     *           in step. Any other value is rejected with
+     *           @ref EL_ERROR_INVALID_PARAMETER. */
+    typedef enum el_cutoff_side_e
+    {
+        EL_CUTOFF_SIDE_INSIDE = 0, /**< Rect interior side: boundary at d = -size. */
+        EL_CUTOFF_SIDE_OUTSIDE = 1 /**< Rect exterior side: boundary at d = +size. */
+    } el_cutoff_side_e;
 
     /** @brief Colour space used when interpolating between colour stops.
      *  @details Mirrors @c EdgeLighting::BlendSpace. HSV/HSL avoid the muddy
@@ -307,13 +324,17 @@ extern "C"
 
     /** @brief Bitmask selecting which renderer layers @ref el_effect_init_with_renderers
      *         registers on the effect.
-     *  @details OR the flags for the layers you want. Registration always
-     *           happens in the fixed compositing order the list below is
+     *  @details OR the flags for the layers you want. With a mask, registration
+     *           happens in the default compositing order the list below is
      *           written in, regardless of how the bits are combined - the mask
-     *           decides inclusion, not order. A layer that is not included is
-     *           never constructed, so it pays no GL cost (no shader compile, no
-     *           FBO allocation); its @c el_effect_set_*_renderer_enabled flag
-     *           still writes to the staging config but has no visual effect.
+     *           decides inclusion, not order. To choose the order, pass the
+     *           flags one per entry, bottom first, to
+     *           @ref el_effect_init_with_renderer_order, or reorder an
+     *           initialised effect with @ref el_effect_set_renderer_order. A
+     *           layer that is not included is never constructed, so it pays
+     *           no GL cost (no shader compile, no FBO allocation); its
+     *           @c el_effect_set_*_renderer_enabled flag still writes to the
+     *           staging config but has no visual effect.
      *
      *           The bits run in that same order: the content layers are dense
      *           from 0, and the debug layer holds the TOP bit - bit 30, the
