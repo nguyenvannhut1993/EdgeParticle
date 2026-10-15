@@ -7,7 +7,8 @@ hold the detail.
 
 ## 2026-10-15 - The particle layer, ported from `OldSource/`
 
-Uncommitted. AMD Radeon Pro 5300M.
+Uncommitted. AMD Radeon Pro 5300M. Every hunk that differs from the old tree,
+file by file, is in [`particle-port-plan.md`](particle-port-plan.md).
 
 - **What changed.** `ParticleManager` / `ParticleEmitter`
   (`renderer/particle-renderer.{h,cpp}`), `particle{,-latch}.{vert,frag}`,
