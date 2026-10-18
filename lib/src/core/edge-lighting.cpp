@@ -4,6 +4,7 @@
 #include "renderer/droplets-renderer.h"
 #include "renderer/lens-flare-renderer.h"
 #include "renderer/spotlight-renderer.h"
+#include "renderer/particle-renderer.h"
 #include "renderer/debug-renderer.h"
 #include "util/log-util.h"
 #include "util/gl-utils.h"
@@ -166,6 +167,10 @@ namespace EdgeLighting
         {
             return std::make_shared<SpotlightRenderer>();
         }
+        case RendererLayer::PARTICLES:
+        {
+            return std::make_shared<ParticleManager>();
+        }
         case RendererLayer::DEBUG:
         {
             return std::make_shared<DebugRenderer>();
@@ -189,6 +194,9 @@ namespace EdgeLighting
             RendererLayer::DROPLETS,
             RendererLayer::LENS_FLARE,
             RendererLayer::SPOTLIGHT,
+            // After every light layer: newborn particles copy the glow the
+            // neon drew THIS frame, so they have to follow it.
+            RendererLayer::PARTICLES,
             RendererLayer::DEBUG,
         };
         return ORDER;
@@ -238,7 +246,15 @@ namespace EdgeLighting
         const size_t before = mRenderers.size();
         AddRenderer(renderer);
         // AddRenderer(ptr) drops a late registration that fails to initialise.
-        return mRenderers.size() > before;
+        if (mRenderers.size() == before)
+        {
+            return false;
+        }
+        if (layer == RendererLayer::NEON || layer == RendererLayer::PARTICLES)
+        {
+            connectParticleSource();
+        }
+        return true;
     }
 
     std::vector<RendererLayer> EdgeLightingEffect::GetLayerOrder() const
@@ -335,6 +351,29 @@ namespace EdgeLighting
         for (auto &renderer : mRenderers)
         {
             renderer->OnConfigChanged(mActiveConfig);
+        }
+    }
+
+    void EdgeLightingEffect::connectParticleSource()
+    {
+        // By layer, then by type: a host's own renderer could claim either
+        // layer without being the class this wires.
+        std::shared_ptr<NeonRenderer> neon;
+        std::shared_ptr<ParticleManager> particles;
+        for (const auto &renderer : mRenderers)
+        {
+            if (renderer->GetLayer() == RendererLayer::NEON)
+            {
+                neon = std::dynamic_pointer_cast<NeonRenderer>(renderer);
+            }
+            else if (renderer->GetLayer() == RendererLayer::PARTICLES)
+            {
+                particles = std::dynamic_pointer_cast<ParticleManager>(renderer);
+            }
+        }
+        if (neon && particles)
+        {
+            particles->SetNeonSource(neon);
         }
     }
 

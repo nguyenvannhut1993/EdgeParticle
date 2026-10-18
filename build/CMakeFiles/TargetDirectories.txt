@@ -1,0 +1,13 @@
+/Users/nguyenvannhut/Desktop/LearningCode/EdgeLightingEffect/build/CMakeFiles/glad.dir
+/Users/nguyenvannhut/Desktop/LearningCode/EdgeLightingEffect/build/CMakeFiles/edit_cache.dir
+/Users/nguyenvannhut/Desktop/LearningCode/EdgeLightingEffect/build/CMakeFiles/rebuild_cache.dir
+/Users/nguyenvannhut/Desktop/LearningCode/EdgeLightingEffect/build/lib/CMakeFiles/edge-lighting.dir
+/Users/nguyenvannhut/Desktop/LearningCode/EdgeLightingEffect/build/lib/CMakeFiles/edge-lighting-c.dir
+/Users/nguyenvannhut/Desktop/LearningCode/EdgeLightingEffect/build/lib/CMakeFiles/edit_cache.dir
+/Users/nguyenvannhut/Desktop/LearningCode/EdgeLightingEffect/build/lib/CMakeFiles/rebuild_cache.dir
+/Users/nguyenvannhut/Desktop/LearningCode/EdgeLightingEffect/build/demo/CMakeFiles/edge-lighting-demo.dir
+/Users/nguyenvannhut/Desktop/LearningCode/EdgeLightingEffect/build/demo/CMakeFiles/edit_cache.dir
+/Users/nguyenvannhut/Desktop/LearningCode/EdgeLightingEffect/build/demo/CMakeFiles/rebuild_cache.dir
+/Users/nguyenvannhut/Desktop/LearningCode/EdgeLightingEffect/build/demo-capi/CMakeFiles/edge-lighting-capi-demo.dir
+/Users/nguyenvannhut/Desktop/LearningCode/EdgeLightingEffect/build/demo-capi/CMakeFiles/edit_cache.dir
+/Users/nguyenvannhut/Desktop/LearningCode/EdgeLightingEffect/build/demo-capi/CMakeFiles/rebuild_cache.dir

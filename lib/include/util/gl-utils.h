@@ -45,20 +45,34 @@ namespace EdgeLighting
             return false;
         }
 
-        /// @p src with `#define @p define` spliced in after its first line.
+        /// @p src with `#define NAME` spliced in after its first line for each
+        /// space-separated NAME in @p defines.
         ///
         /// How one shader file yields several programs. Every embedded source
         /// starts with the @GLSL_VERSION@ line, which must stay first, so the
-        /// define goes immediately after it - ahead of everything else, any
-        /// injected tuning header or shared chunk included. Used for neon.frag's
-        /// NEON_READS_GATHER variant (NeonRenderer::ensurePathPrograms) and
-        /// spotlight.frag's SPOT_FILL variant.
-        inline std::string WithDefine(const char *src, const char *define)
+        /// defines go immediately after it - ahead of everything else, the
+        /// injected tuning header and shared chunk included. Used for
+        /// neon.frag's field bake, NEON_FIELD_BAKE (see
+        /// NeonRenderer::ensureFieldPrograms), and spotlight.frag's SPOT_FILL
+        /// (SpotlightRenderer::setupShaders).
+        inline std::string WithDefine(const char *src, const char *defines)
         {
+            std::string lines;
+            const std::string names(defines);
+            size_t start = 0;
+            while (start < names.size())
+            {
+                const size_t end = names.find(' ', start);
+                const std::string name = names.substr(start, end == std::string::npos ? std::string::npos : end - start);
+                if (!name.empty())
+                {
+                    lines += "#define " + name + "\n";
+                }
+                start = (end == std::string::npos) ? names.size() : end + 1;
+            }
             std::string out(src);
             const size_t eol = out.find('\n');
-            out.insert(eol == std::string::npos ? out.size() : eol + 1,
-                       std::string("#define ") + define + "\n");
+            out.insert(eol == std::string::npos ? out.size() : eol + 1, lines);
             return out;
         }
 
@@ -197,9 +211,9 @@ namespace EdgeLighting
         /// draw that composites the buffer back onto the caller's framebuffer,
         /// which is the one draw that IS in the caller's coordinate space and
         /// so the only place the box means what it says. Passes that draw
-        /// straight onto the caller's framebuffer - the opaque fill, the
-        /// unscaled gather, every debug overlay - must NOT use this; their
-        /// clipping is exactly what the host asked for. (@c renderOpaqueFill
+        /// straight onto the caller's framebuffer - the opaque fill, the blit,
+        /// the edge ring, every debug overlay - must NOT use this; their
+        /// clipping is exactly what the host asked for. (@c renderFillPass
         /// goes further and intersects its clear box with the host's, because
         /// a clear is not clipped by the viewport the way its draw was.)
         ///

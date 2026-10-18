@@ -1575,36 +1575,6 @@ el_result_e el_effect_get_spotlight_casts_shadow(el_effect_handle_t effect, int3
     return EL_SUCCESS;
 }
 
-el_result_e el_effect_set_spotlight_wall_distance(el_effect_handle_t effect, int32_t index, float wallDistance)
-{
-    VALIDATE_EFFECT_PTR(effect, "el_effect_set_spotlight_wall_distance");
-    auto *l = SpotlightSlot(effect, index, "el_effect_set_spotlight_wall_distance");
-    if (!l)
-    {
-        return EL_ERROR_INVALID_PARAMETER;
-    }
-    if (l->wallDistance == wallDistance)
-    {
-        return EL_SUCCESS;
-    }
-    LOG_I("effect=%p, index=%d, wallDistance=%f", (void *)effect, index, wallDistance);
-    l->wallDistance = wallDistance;
-    return EL_SUCCESS;
-}
-
-el_result_e el_effect_get_spotlight_wall_distance(el_effect_handle_t effect, int32_t index, float *outWallDistance)
-{
-    VALIDATE_EFFECT_PTR(effect, "el_effect_get_spotlight_wall_distance");
-    VALIDATE_OUT_PTR(outWallDistance, "el_effect_get_spotlight_wall_distance");
-    auto *l = SpotlightSlot(effect, index, "el_effect_get_spotlight_wall_distance");
-    if (!l)
-    {
-        return EL_ERROR_INVALID_PARAMETER;
-    }
-    *outWallDistance = l->wallDistance;
-    return EL_SUCCESS;
-}
-
 el_result_e el_effect_clear_spotlights(el_effect_handle_t effect)
 {
     VALIDATE_EFFECT_PTR(effect, "el_effect_clear_spotlights");
@@ -1810,6 +1780,45 @@ el_result_e el_effect_get_spotlight_shadow_fill(el_effect_handle_t effect, float
     VALIDATE_OUT_PTR(outFill, "el_effect_get_spotlight_shadow_fill");
     *outFill = effect->config.spotlight.shadowCaster.fill;
     LOG_D("effect=%p, fill=%f", (void *)effect, *outFill);
+    return EL_SUCCESS;
+}
+
+el_result_e el_effect_set_spotlight_shadow_darkness(el_effect_handle_t effect, float darkness)
+{
+    VALIDATE_EFFECT_PTR(effect, "el_effect_set_spotlight_shadow_darkness");
+    SET_AND_LOG(effect->config.spotlight.shadowCaster.darkness, darkness,
+                "effect=%p, darkness=%f", (void *)effect, darkness);
+}
+
+el_result_e el_effect_get_spotlight_shadow_darkness(el_effect_handle_t effect, float *outDarkness)
+{
+    VALIDATE_EFFECT_PTR(effect, "el_effect_get_spotlight_shadow_darkness");
+    VALIDATE_OUT_PTR(outDarkness, "el_effect_get_spotlight_shadow_darkness");
+    *outDarkness = effect->config.spotlight.shadowCaster.darkness;
+    LOG_D("effect=%p, darkness=%f", (void *)effect, *outDarkness);
+    return EL_SUCCESS;
+}
+
+el_result_e el_effect_set_spotlight_shadow_color(el_effect_handle_t effect, float r, float g, float b)
+{
+    VALIDATE_EFFECT_PTR(effect, "el_effect_set_spotlight_shadow_color");
+    const glm::vec3 v(r, g, b);
+    SET_AND_LOG(effect->config.spotlight.shadowCaster.color, v,
+                "effect=%p, color=(%f, %f, %f)", (void *)effect, r, g, b);
+}
+
+el_result_e el_effect_get_spotlight_shadow_color(el_effect_handle_t effect,
+                                                 float *outR, float *outG, float *outB)
+{
+    VALIDATE_EFFECT_PTR(effect, "el_effect_get_spotlight_shadow_color");
+    VALIDATE_OUT_PTR(outR, "el_effect_get_spotlight_shadow_color");
+    VALIDATE_OUT_PTR(outG, "el_effect_get_spotlight_shadow_color");
+    VALIDATE_OUT_PTR(outB, "el_effect_get_spotlight_shadow_color");
+    const glm::vec3 &c = effect->config.spotlight.shadowCaster.color;
+    *outR = c.r;
+    *outG = c.g;
+    *outB = c.b;
+    LOG_D("effect=%p, color=(%f, %f, %f)", (void *)effect, *outR, *outG, *outB);
     return EL_SUCCESS;
 }
 

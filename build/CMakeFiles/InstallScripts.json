@@ -1,0 +1,10 @@
+{
+	"InstallScripts" : 
+	[
+		"/Users/nguyenvannhut/Desktop/LearningCode/EdgeLightingEffect/build/cmake_install.cmake",
+		"/Users/nguyenvannhut/Desktop/LearningCode/EdgeLightingEffect/build/lib/cmake_install.cmake",
+		"/Users/nguyenvannhut/Desktop/LearningCode/EdgeLightingEffect/build/demo/cmake_install.cmake",
+		"/Users/nguyenvannhut/Desktop/LearningCode/EdgeLightingEffect/build/demo-capi/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

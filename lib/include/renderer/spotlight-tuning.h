@@ -5,8 +5,9 @@
 // Shared spotlight constants - single source of truth.
 //
 // Consumed by BOTH:
-//   - the spotlight shader (spotlight.frag), where CMake text-injects this
-//     file via @SPOTLIGHT_TUNING@ in shaders.h.in, and
+//   - the spotlight shaders (spotlight.frag, and spotlight-blit.frag for
+//     SPOT_DITHER_STEPS), where CMake text-injects this file via
+//     @SPOTLIGHT_TUNING@ in shaders.h.in, and
 //   - the C++ renderer (spotlight-renderer.cpp), which #includes it to solve
 //     each lamp's support and size the strip it draws.
 //
@@ -20,6 +21,9 @@
 //     SPOT_SOLID_SEARCH_STEPS                   shader only - a solid caster
 //                                               only removes light, like the
 //                                               panel.
+//     SPOT_SHADOW_FULL_REACH                    shader only - the darkening
+//                                               only writes where its lamp's
+//                                               light does, inside the strip.
 //     SPOT_FILL_FULL_RATIO                      shader only - the fill only
 //                                               ever restores light the lamp
 //                                               had before its shadow, so it
@@ -44,6 +48,10 @@
 //                                               as an attribute.
 //     SPOT_MAX_LAMPS, SPOT_STRIP_SEGMENTS,
 //     SPOT_VISIBILITY_FLOOR                     CPU only - geometry sizing.
+//     SPOT_LAMP_WALL_DISTANCE                   CPU only - folded with the
+//                                               caster's distance into a
+//                                               per-lamp ratio before the
+//                                               shader sees it.
 //
 //   They all live here anyway because they describe ONE falloff, and a
 //   maintainer changing the shape needs to see the whole shape in one place.
@@ -152,7 +160,7 @@
 /// attributes rather than in a uniform block. Entries past it are ignored.
 ///
 /// Raising it costs one recompile and a larger (still small) buffer:
-/// SPOT_MAX_LAMPS * SPOT_STRIP_SEGMENTS * 6 * 88 bytes.
+/// SPOT_MAX_LAMPS * SPOT_STRIP_SEGMENTS * 6 * 96 bytes.
 #define SPOT_MAX_LAMPS            8
 
 /// Quads per lamp along the beam. The strip approximates a curved support with
@@ -172,8 +180,10 @@
 /// and re-run it before shipping a lower value.
 #define SPOT_STRIP_SEGMENTS       12
 
-/// Width of the ordered dither spotlight.frag adds before the framebuffer
-/// quantises its output, peak to peak, in destination steps. 1.0 is therefore
+/// Width of the ordered dither added before the framebuffer quantises the
+/// layer's output, peak to peak, in destination steps - by spotlight.frag at
+/// resolutionScale 1.0, and by spotlight-blit.frag below it (see
+/// spotlight-dither.glsl for why never into the reduced buffer). 1.0 is therefore
 /// a rectangular +/- HALF a step - the classic dither for an 8-bit target: it
 /// decorrelates the rounding error from the signal without adding visible
 /// noise, and its peak is exactly the rounding threshold, so it cannot round
@@ -261,6 +271,41 @@
 ///
 /// 1.0 disables the shoulder and restores per-channel clipping of a lone lamp.
 #define SPOT_HIGHLIGHT_KNEE       0.30
+
+// ---------------------------------------------------------------------------
+// The shadow caster's constants: the lamps' distance from the wall (CPU
+// only), then three the shader alone reads. The rest of the
+// shadow is in two places: the "THE SHADOW" section of spotlight.frag, and
+// the "THE SHADOW CASTER" blocks of spotlight-renderer.{h,cpp}.
+// ---------------------------------------------------------------------------
+
+/// How far every shadow-casting lamp stands off the wall, in px - the length
+/// ShadowCaster::wallDistance is measured against, `t = caster / this`.
+///
+/// One constant rather than a field per lamp, because only that ratio (and
+/// frameDepth / this) reaches the picture: the shadow's scale, its penumbra,
+/// the solid caster's grazing case and the rails' shadow are all functions
+/// of the distances divided by one another, so scaling every one of them by
+/// a factor changes no pixel. The caster's own distance is therefore the
+/// whole control. What a fixed value gives up is lamps at DIFFERENT
+/// distances in one rig - each still throws its shadow away from its own
+/// position, but at the same scale.
+///
+/// 150 is the default the per-lamp field (SpotLight::wallDistance, removed
+/// 2026-10-16) had, so a rig that never set it renders as before.
+#define SPOT_LAMP_WALL_DISTANCE   150.0
+
+/// The lamp light - peak channel, after the highlight shoulder, in [0, 1] of
+/// full scale - at which ShadowCaster::darkness reaches its full value. The
+/// darkening is `darkness * (1 - visibility) * smoothstep(0, this, peak)`:
+/// no light, no shadow, and the shadow fades out with the beam rather than
+/// ending where the lamp's strip does.
+///
+/// That fade is also what keeps the strip bound free: outside the strip the
+/// lamp is under half an 8-bit step (0.002), where the smoothstep is
+/// 3 * (0.002 / this)^2 - under 2e-4 at this value, so the darkening there
+/// stays far under half a step of any backdrop. Do not lower it below ~0.02.
+#define SPOT_SHADOW_FULL_REACH    0.25
 
 /// Where ShadowCaster::fill finishes washing a shadow out, as a ratio: the
 /// light the OTHER lamps put on a point in lamp A's shadow, over the light A

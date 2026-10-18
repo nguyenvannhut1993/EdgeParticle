@@ -49,10 +49,11 @@ precision highp float;
 //   and there is no finite strip to draw. See spotlight-tuning.h.
 //
 // This shader never reads gl_FragCoord: everything arrives interpolated in the
-// lamp's frame - or, for the clip area and the shadow, in app space through
-// vApp. That is why the y-flip in Render is free, why
-// SpotlightConfig::resolutionScale still needs no uniform of its own, and why
-// the sub-viewport caveat in BaseRenderer's doc comment does not apply here.
+// lamp's frame - or, for the clip area and the shadow caster, in app space
+// through vApp. That is why the y-flip in Render is free, why SpotlightConfig::resolutionScale needs no
+// uniform to shape the light (uDither below only says whether THIS pass
+// dithers), and why the sub-viewport caveat in BaseRenderer's doc comment does
+// not apply here.
 //
 // One caveat of its own, shared by the clip and the shadow: reading app space
 // rather than gl_FragCoord keeps a mask's GEOMETRY identical at any scale, but
@@ -77,12 +78,101 @@ precision highp float;
 // speckle. Dithering after the mask also means the clip's own soft edge - one
 // more shallow gradient - gets the same treatment as the falloff it crosses.
 //
+// THE SHADOW - a picture standing off the wall that blocks the lamps opted
+// into it - is a coverage multiply in the same place as the clip. All of it -
+// the model, its varyings and uniforms, its functions and the SPOT_FILL
+// variant - lives in the THE SHADOW section below, between its two banners,
+// and main() reaches it through one call, spotShadowCover.
+//
+// Output is premultiplied colour plus a COVERAGE ALPHA, the same
+// max-of-channels rule neon.frag and lens-flare.frag use. The renderer pairs
+// it with a separate-alpha SCREEN (GL_ONE_MINUS_DST_COLOR / GL_ONE, and the
+// same on alpha): light only adds, lamp order still cannot change the image,
+// and the alpha channel accumulates a record of where light was written - but
+// overlapping lamps approach full scale instead of summing past it. The
+// highlight shoulder below keeps ONE lamp under 1.0; it cannot see the others,
+// and the screen is what stops two of them clipping where they cross.
+//
+// That alpha is NOT decoration and this shader is the reason the whole layer
+// once vanished on a device. Every other layer here writes a coverage alpha;
+// this one wrote a literal 0.0, which is invisible on a desktop demo (the
+// window is opaque, so nothing ever reads the framebuffer's alpha back) and
+// fatal on an embedded surface that a compositor or hardware video plane
+// blends: `out = ui.rgb * ui.a + video * (1 - ui.a)` multiplies every lit
+// spotlight pixel by zero. Measured offscreen at 640x360 over a transparent
+// clear, a single lamp lit 72,615 pixels of colour and exactly 0 pixels of
+// alpha, and composited to nothing at all over a background. See
+// SpotlightRenderer::Render.
+
+in vec2 vLocal;      ///< (along, across) px in this lamp's frame.
+in vec2 vApp;        ///< App px, top-left origin, +y down. Clip area and shadow.
+flat in vec4 vP0;    ///< tanHalfBeam, throwLength, softK, intensity.
+flat in vec4 vP1;    ///< apertureWidth, bloom, bloomRadius, bloomWindow.
+flat in vec3 vColor; ///< Linear RGB.
+flat in float vClipWeight; ///< 1 where this lamp honours the clip area, else 0.
+flat in float vSpreadFalloff; ///< Exponent on the spread term, already clamped.
+
+/// The clip area, in APP coordinates: centre.xy, half extent.xy. Already
+/// collapsed from ClipArea's top-left + size on the CPU, because a
+/// rounded-box SDF wants a centred box and the conversion is the same two
+/// adds every fragment would otherwise repeat.
+uniform vec4 uClipRect;
+
+/// cornerRadius px, edgeSoftness px, and 1 for KEEP_INSIDE / 0 for
+/// KEEP_OUTSIDE. The mode is a LERP WEIGHT rather than a branch: the two
+/// answers are each other's complement, so mixing between them is one
+/// instruction and costs nothing in divergence.
+uniform vec3 uClipParams;
+
+out vec4 fragColor;
+
+/// Signed distance to a rounded box centred at the origin, negative inside.
+/// @p b is the half extent, @p r the corner radius (already clamped on the CPU
+/// to at most the shorter half extent, so the `- r` below cannot invert the
+/// box).
+///
+/// Byte-identical to the sdRoundBox in black-rect.frag, neon.frag,
+/// neon-blit.frag and droplets.frag, and named the same on purpose: it is a
+/// generic primitive, not a clip-specific one. spotClipMask below is the part
+/// that knows about the clip area.
+float sdRoundBox(vec2 p, vec2 b, float r) {
+    vec2 q = abs(p) - b + r;
+    return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - r;
+}
+
+/// Coverage the clip area leaves at @p app, in [0, 1].
+///
+/// Independent of vClipWeight on purpose - the caller mixes this against 1.0
+/// with that weight, so an unclipped lamp costs the same arithmetic instead of
+/// a branch that would diverge inside a draw call covering both kinds of lamp.
+float spotClipMask(vec2 app) {
+    float d = sdRoundBox(app - uClipRect.xy, uClipRect.zw, uClipParams.x);
+    // Half the feather either side of the boundary, so edgeSoftness is the
+    // full width of the fade and 0 collapses to a hard step. The floor keeps
+    // smoothstep's two edges apart at edgeSoftness 0, where equal edges are
+    // undefined rather than a step on some drivers.
+    float h = max(uClipParams.y, 1.0e-4) * 0.5;
+    float inside = 1.0 - smoothstep(-h, h, d);
+    return mix(1.0 - inside, inside, uClipParams.z);
+}
+
+// ===========================================================================
+// THE SHADOW - everything about SpotlightConfig::shadowCaster, from here to
+// the closing banner: the model, the per-lamp varyings, the caster's
+// uniforms, the functions and the SPOT_FILL and SPOT_SHADOW_DARKEN variants.
+// main() calls into it once, beside the clip. The CPU half is the THE SHADOW
+// CASTER blocks of spotlight-renderer.{h,cpp}; its two constants are in
+// spotlight-tuning.h. docs/spotlight-shadow-plan.md and
+// docs/spotlight-solid-frame-plan.md are the measured record.
+// ===========================================================================
+//
 // THE SHADOW, and why it is a line test rather than anything that looks at the
 // scene. A lamp with SpotLight::castsShadow set is blocked by one flat rounded
 // rectangle, SpotlightConfig::shadowCaster, standing off the wall. Put the
 // wall at z = 0, the caster's face at z = d and the lamp at z = h over its app
-// position L: the line from a wall fragment p to the lamp crosses the caster's
-// plane at
+// position L - h is SPOT_LAMP_WALL_DISTANCE, the same for every lamp, since
+// only d / h reaches the picture: the line from a wall fragment p to the lamp
+// crosses the caster's plane at
 //
 //   q = mix(p, L, t),   t = d / h
 //
@@ -162,33 +252,28 @@ precision highp float;
 // It only ever raises a coverage that is below 1, so outside every shadow this
 // program writes exactly what the plain one does.
 //
-// Output is premultiplied colour plus a COVERAGE ALPHA, the same
-// max-of-channels rule neon.frag and lens-flare.frag use. The renderer pairs
-// it with a separate-alpha SCREEN (GL_ONE_MINUS_DST_COLOR / GL_ONE, and the
-// same on alpha): light only adds, lamp order still cannot change the image,
-// and the alpha channel accumulates a record of where light was written - but
-// overlapping lamps approach full scale instead of summing past it. The
-// highlight shoulder below keeps ONE lamp under 1.0; it cannot see the others,
-// and the screen is what stops two of them clipping where they cross.
+// THE DARKENING VARIANT (SPOT_SHADOW_DARKEN), ShadowCaster::darkness. Light
+// only, a shadow is this lamp's light taken away, and the screen leaves
+// little light to take over a bright backdrop: the contrast is
+// L * (1 - backdrop), and the umbra writes alpha 0. This program runs
+// FIRST, over the casting lamps' strips only, and writes no light at all -
+// it writes the shadow, as premultiplied colour over the destination:
 //
-// That alpha is NOT decoration and this shader is the reason the whole layer
-// once vanished on a device. Every other layer here writes a coverage alpha;
-// this one wrote a literal 0.0, which is invisible on a desktop demo (the
-// window is opaque, so nothing ever reads the framebuffer's alpha back) and
-// fatal on an embedded surface that a compositor or hardware video plane
-// blends: `out = ui.rgb * ui.a + video * (1 - ui.a)` multiplies every lit
-// spotlight pixel by zero. Measured offscreen at 640x360 over a transparent
-// clear, a single lamp lit 72,615 pixels of colour and exactly 0 pixels of
-// alpha, and composited to nothing at all over a background. See
-// SpotlightRenderer::Render.
+//   D = darkness * (1 - cover) * smoothstep(0, SPOT_SHADOW_FULL_REACH, peak(lit))
+//   out = (uShadowColor * D, D)   under GL_ONE / GL_ONE_MINUS_SRC_ALPHA
+//
+// so the destination becomes dst * (1 - D) + colour * D, colour and alpha
+// alike: the backdrop darkens under the shadow and the umbra records
+// coverage. `cover` is the light pass's own (fill lift included under
+// SPOT_FILL), and `lit` the lamp's unshadowed light - no light, no shadow,
+// and the shadow fades out with the beam inside the strip, which is what
+// keeps the strip bound free (see SPOT_SHADOW_FULL_REACH). One colour for
+// every lamp makes the chain of OVERs commutative, so lamp order cannot
+// change it. The light pass then screens every lamp on top, so another
+// lamp's light still lands inside the shadow. Outside a shadow D is an
+// exact 0 and the fragment writes an exact 0 - the blend leaves the
+// destination bit for bit.
 
-in vec2 vLocal;      ///< (along, across) px in this lamp's frame.
-in vec2 vApp;        ///< App px, top-left origin, +y down. Clip, shadow and fill.
-flat in vec4 vP0;    ///< tanHalfBeam, throwLength, softK, intensity.
-flat in vec4 vP1;    ///< apertureWidth, bloom, bloomRadius, bloomWindow.
-flat in vec3 vColor; ///< Linear RGB.
-flat in float vClipWeight; ///< 1 where this lamp honours the clip area, else 0.
-flat in float vSpreadFalloff; ///< Exponent on the spread term, already clamped.
 /// Lamp app position (xy), t = caster / lamp wall distance (z), penumbra half
 /// width on the caster's plane in px (w, never 0 - the CPU floors it).
 flat in vec4 vShadow;
@@ -227,50 +312,6 @@ uniform float uFillAmount;
 uniform float uFillHeight;
 #endif
 
-/// The clip area, in APP coordinates: centre.xy, half extent.xy. Already
-/// collapsed from ClipArea's top-left + size on the CPU, because a
-/// rounded-box SDF wants a centred box and the conversion is the same two
-/// adds every fragment would otherwise repeat.
-uniform vec4 uClipRect;
-
-/// cornerRadius px, edgeSoftness px, and 1 for KEEP_INSIDE / 0 for
-/// KEEP_OUTSIDE. The mode is a LERP WEIGHT rather than a branch: the two
-/// answers are each other's complement, so mixing between them is one
-/// instruction and costs nothing in divergence.
-uniform vec3 uClipParams;
-
-out vec4 fragColor;
-
-/// Signed distance to a rounded box centred at the origin, negative inside.
-/// @p b is the half extent, @p r the corner radius (already clamped on the CPU
-/// to at most the shorter half extent, so the `- r` below cannot invert the
-/// box).
-///
-/// Byte-identical to the sdRoundBox in black-rect.frag, neon.frag,
-/// neon-blit.frag and droplets.frag, and named the same on purpose: it is a
-/// generic primitive, not a clip-specific one. spotClipMask below is the part
-/// that knows about the clip area.
-float sdRoundBox(vec2 p, vec2 b, float r) {
-    vec2 q = abs(p) - b + r;
-    return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - r;
-}
-
-/// Coverage the clip area leaves at @p app, in [0, 1].
-///
-/// Independent of vClipWeight on purpose - the caller mixes this against 1.0
-/// with that weight, so an unclipped lamp costs the same arithmetic instead of
-/// a branch that would diverge inside a draw call covering both kinds of lamp.
-float spotClipMask(vec2 app) {
-    float d = sdRoundBox(app - uClipRect.xy, uClipRect.zw, uClipParams.x);
-    // Half the feather either side of the boundary, so edgeSoftness is the
-    // full width of the fade and 0 collapses to a hard step. The floor keeps
-    // smoothstep's two edges apart at edgeSoftness 0, where equal edges are
-    // undefined rather than a step on some drivers.
-    float h = max(uClipParams.y, 1.0e-4) * 0.5;
-    float inside = 1.0 - smoothstep(-h, h, d);
-    return mix(1.0 - inside, inside, uClipParams.z);
-}
-
 /// u(s) of the solid search: the caster's SDF at the point a fraction @p s of
 /// the way from @p p to @p lamp, over the emitter's window there - @p feather
 /// at the wall, @p aperture * s once the window is the emitter's projection.
@@ -281,7 +322,7 @@ float spotSolidRatio(vec2 p, vec2 lamp, float s, float aperture, float feather) 
 
 /// Visibility of wall point @p p past a SOLID caster, for a lamp at @p lamp
 /// whose line is inside the block for s in [0, @p tMax] - see THE SOLID BLOCK
-/// at the top of this file.
+/// at the top of this section.
 ///
 /// Golden-section search for the minimum of the quasiconvex u(s): a FIXED
 /// number of steps, so no loop runs longer for some fragments than others.
@@ -337,11 +378,11 @@ float spotSolidWall(vec2 p, vec2 lamp, float tMax, float aperture) {
 }
 
 /// Light the shadow caster leaves at @p app for one lamp, in [0, 1] - see THE
-/// SHADOW and THE SOLID BLOCK at the top of this file.
+/// SHADOW and THE SOLID BLOCK at the top of this section.
 ///
-/// Called only for a lamp whose weight is above 0 (a branch on a flat value,
-/// coherent per lamp): with the solid search in it this is a dozen SDFs, and a
-/// lamp that casts nothing has no use for any of them. The CPU still writes
+/// Called only through spotShadowCover, so only for a lamp whose weight is
+/// above 0: with the solid search in it this is a dozen SDFs, and a lamp that
+/// casts nothing has no use for any of them. The CPU still writes
 /// well-formed values for such lamps - t 0 and floored half widths - so a
 /// smoothstep with equal edges cannot produce a NaN if one ever is evaluated.
 float spotShadowMask(vec2 app, vec4 shadow, vec2 recess, float aperture) {
@@ -375,29 +416,89 @@ float spotShadowMask(vec2 app, vec4 shadow, vec2 recess, float aperture) {
     return mix(wallVis, faceVis, onFace);
 }
 
-/// Interleaved gradient noise, in [-0.5, 0.5]. One fract, one dot: the whole
-/// dither costs about as much as the bloom's sqrt.
+/// What the shadow caster leaves of this lamp's light here, in [0, 1] - the
+/// ONE entry point main() calls, and only for a lamp whose vShadowWeight is
+/// above 0 (a branch on a flat value, so coherent per lamp: with the solid
+/// search in it the mask is a dozen SDFs, and a lamp that casts nothing pays
+/// none of them and stays byte-identical to the renderer before the caster).
+/// The weight is ShadowCaster::opacity, so a translucent caster lets that much
+/// through.
 ///
-/// Deliberately NOT the fract(sin(dot(...))) hash. That one feeds sin an
-/// argument in the tens of thousands, and how much of it survives is a
-/// precision question every GPU answers differently - on a part that rounds
-/// it coarsely the "noise" degenerates into a second set of bands, which is
-/// the artefact this function exists to remove.
+/// @p lit is the lamp's light BEFORE the shadow - after the shoulder and the
+/// clip - which the fill variant needs as the light this lamp would have put
+/// here unshadowed.
 ///
-/// @p p is in PIXELS, and vLocal is the right pixel-valued thing to hand it:
-/// the lamp frame is a rotation plus a translation of the framebuffer, so a
-/// step of one fragment is a step of one unit here too, whatever the lamp's
-/// angle. That also keeps the promise below - the pattern is anchored to the
-/// lamp, so under an animation it travels WITH the beam instead of crawling
-/// across it, and gl_FragCoord still never appears in this shader.
-///
-/// NOT vApp, which is also in pixels but is anchored to the SCREEN: feeding it
-/// here would give every lamp the same pattern in the same place, so two
-/// overlapping beams would dither in lockstep and correlate exactly where the
-/// noise is meant to be independent.
-float spotDither(vec2 p) {
-    return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))) - 0.5;
+/// Under SPOT_FILL the coverage is then lifted by the other lamps' light - see
+/// THE FILL VARIANT above. A lamp that casts nothing skips this whole function
+/// there too, which is exact: with a coverage of 1 the lift is (1 - 1) times a
+/// finite value, so the light would be multiplied by exactly 1.0.
+float spotShadowCover(vec3 lit, float apertureWidth) {
+    float cover = mix(1.0, spotShadowMask(vApp, vShadow, vRecess, apertureWidth), vShadowWeight);
+#ifdef SPOT_FILL
+    // THE FILL - see THE FILL VARIANT above.
+    vec3 own = lit * cover;
+    // vApp is at the fragment's centre, so truncation lands on its own texel.
+    vec3 reaching = texelFetch(uFillSource, ivec2(vApp.x, uFillHeight - vApp.y), 0).rgb;
+    // The screen undone for this lamp. Clamped: the buffer is 8 bits and
+    // dithered, so where nothing else lights the pixel this can land a hair
+    // under zero.
+    vec3 others = clamp(1.0 - (1.0 - reaching) / max(1.0 - own, 1.0e-3), 0.0, 1.0);
+    float ownPeak = max(max(lit.r, lit.g), lit.b);
+    // A DEAD ZONE the size of the buffer's own error. Each lamp's write into
+    // it was dithered by up to half a step and rounded, so with nothing else
+    // lighting the pixel `reaching` still differs from `own` by a step or two -
+    // which the division above amplifies by 1 / (1 - own). Without this a lone
+    // lamp read its own rounding as light from elsewhere and nudged its own
+    // penumbra.
+    float noise = (2.0 / 255.0) / max(1.0 - max(max(own.r, own.g), own.b), 1.0e-3);
+    float othersPeak = max(max(max(others.r, others.g), others.b) - noise, 0.0);
+    float ratio = othersPeak / max(ownPeak, 1.0e-4);
+    cover += (1.0 - cover) * uFillAmount * smoothstep(0.0, SPOT_FILL_FULL_RATIO, ratio);
+#endif
+    return cover;
 }
+
+#ifdef SPOT_SHADOW_DARKEN
+/// ShadowCaster::darkness, clamped to [0, 1].
+uniform float uShadowDarkness;
+/// ShadowCaster::color, linear RGB clamped to [0, 1].
+uniform vec3 uShadowColor;
+
+/// The darkening variant's output for this fragment - see THE DARKENING
+/// VARIANT above. @p lit is the lamp's light after the shoulder and the clip,
+/// before the shadow; @p dither the output dither main() computes.
+///
+/// An exact 0 wherever the lamp casts nothing, the fragment is outside its
+/// shadow or the lamp puts no light there, so the dither cannot speckle the
+/// rest of the strip: under GL_ONE / GL_ONE_MINUS_SRC_ALPHA a 0 leaves the
+/// destination exactly as it was.
+vec4 spotShadowDarken(vec3 lit, float apertureWidth, float dither) {
+    if (vShadowWeight <= 0.0) {
+        return vec4(0.0);
+    }
+    float cover = spotShadowCover(lit, apertureWidth);
+    float reach = smoothstep(0.0, SPOT_SHADOW_FULL_REACH, max(max(lit.r, lit.g), lit.b));
+    float d = uShadowDarkness * (1.0 - cover) * reach;
+    if (d <= 0.0) {
+        return vec4(0.0);
+    }
+    // The same half-step dither as the light, on the coverage: the colour is
+    // premultiplied by it, so the two move together.
+    d = clamp(d + dither, 0.0, 1.0);
+    return vec4(uShadowColor * d, d);
+}
+#endif
+
+// ===========================================================================
+// End of THE SHADOW.
+// ===========================================================================
+
+/// 1 where this pass writes the caller's framebuffer (resolutionScale 1.0) or
+/// an RGBA8 reduced buffer, 0 where it writes the half-float reduced buffer -
+/// whose dither spotlight-blit.frag adds instead, after its bilinear read. The
+/// ONE uniform the two paths set differently; see SpotlightRenderer::Render
+/// and spotlight-dither.glsl.
+uniform float uDither;
 
 void main() {
     float along = vLocal.x;
@@ -493,43 +594,17 @@ void main() {
     // so this is one lerp against a value constant across the triangle.
     lit *= mix(1.0, spotClipMask(vApp), vClipWeight);
 
-    // The shadow, in the same place: a lerp against a flat weight - but
-    // behind a BRANCH on that weight, unlike the clip, because the solid
-    // caster's search makes the mask a dozen SDFs and a lamp that casts
-    // nothing should not pay them. The branch is on a flat value, so it is
-    // coherent per lamp, and this shader calls no derivative. A lamp that
-    // skips it is multiplied by nothing at all, which is what keeps it
-    // byte-identical to the renderer before the caster. The weight is
-    // ShadowCaster::opacity, so a translucent caster lets that much through.
-    float shadowCover = 1.0;
-    if (vShadowWeight > 0.0) {
-        shadowCover = mix(1.0, spotShadowMask(vApp, vShadow, vRecess, apertureWidth), vShadowWeight);
-    }
-#ifndef SPOT_FILL
-    if (vShadowWeight > 0.0) {
-        lit *= shadowCover;
-    }
+    // THE SHADOW, in the same place - after the shoulder, before the coverage
+    // alpha and the dither, for the clip's reasons. Behind a branch on the
+    // flat weight rather than a lerp: see spotShadowCover. The darkening
+    // variant writes the shadow instead of the light, and stops here.
+#ifdef SPOT_SHADOW_DARKEN
+    fragColor = spotShadowDarken(lit, apertureWidth, spotDitherOffset(vLocal) * uDither);
+    return;
 #else
-    // THE FILL - see the block at the top of this file.
-    vec3 own = lit * shadowCover;
-    // vApp is at the fragment's centre, so truncation lands on its own texel.
-    vec3 reaching = texelFetch(uFillSource, ivec2(vApp.x, uFillHeight - vApp.y), 0).rgb;
-    // The screen undone for this lamp. Clamped: the buffer is 8 bits and
-    // dithered, so where nothing else lights the pixel this can land a hair
-    // under zero.
-    vec3 others = clamp(1.0 - (1.0 - reaching) / max(1.0 - own, 1.0e-3), 0.0, 1.0);
-    float ownPeak = max(max(lit.r, lit.g), lit.b);
-    // A DEAD ZONE the size of the buffer's own error. Each lamp's write into
-    // it was dithered by up to half a step and rounded, so with nothing else
-    // lighting the pixel `reaching` still differs from `own` by a step or two -
-    // which the division above amplifies by 1 / (1 - own). Without this a lone
-    // lamp read its own rounding as light from elsewhere and nudged its own
-    // penumbra.
-    float noise = (2.0 / 255.0) / max(1.0 - max(max(own.r, own.g), own.b), 1.0e-3);
-    float othersPeak = max(max(max(others.r, others.g), others.b) - noise, 0.0);
-    float ratio = othersPeak / max(ownPeak, 1.0e-4);
-    shadowCover += (1.0 - shadowCover) * uFillAmount * smoothstep(0.0, SPOT_FILL_FULL_RATIO, ratio);
-    lit *= shadowCover;
+    if (vShadowWeight > 0.0) {
+        lit *= spotShadowCover(lit, apertureWidth);
+    }
 #endif
 
     // Coverage = brightest channel, exactly as in neon.frag and
@@ -574,7 +649,18 @@ void main() {
     //
     // Same offset on all three channels and on the coverage, so the dither
     // moves the value and never the hue or the premultiplication.
-    float dither = spotDither(vLocal) * (SPOT_DITHER_STEPS / 255.0);
+    //
+    // vLocal, not vApp or gl_FragCoord: the lamp frame is a rotation plus a
+    // translation of the framebuffer, so one fragment is one unit of it
+    // whatever the lamp's angle, and the pattern is anchored to the lamp - it
+    // travels WITH the beam under an animation instead of crawling across it,
+    // and two overlapping beams dither independently rather than in lockstep.
+    //
+    // Scaled by uDither, which is 0 on the scaled path's half-float buffer:
+    // one fragment there is 1 / scale destination pixels, and the blit's
+    // bilinear read would average this noise into blotches that wide. The blit
+    // dithers instead (spotlight-blit.frag).
+    float dither = spotDitherOffset(vLocal) * uDither;
 
     fragColor = vec4(max(lit + dither, 0.0), max(cov + dither, 0.0));
 }

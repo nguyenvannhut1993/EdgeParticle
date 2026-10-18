@@ -26,6 +26,7 @@ namespace EdgeLighting
         DROPLETS = 1 << 1,
         LENS_FLARE = 1 << 2,
         SPOTLIGHT = 1 << 3,
+        PARTICLES = 1 << 4,
         DEBUG = 1 << 30
     } RendererLayer;
 

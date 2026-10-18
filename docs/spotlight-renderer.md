@@ -34,8 +34,10 @@ at all:
 - **Light only adds, but never past full scale.** The pass SCREENS -
   `glBlendFuncSeparate(GL_ONE_MINUS_DST_COLOR, GL_ONE, GL_ONE_MINUS_DST_ALPHA,
   GL_ONE)` - in the alpha channel as well as in colour. A lamp never darkens
-  what is under it, but overlapping lamps approach 1.0 instead of summing past
-  it, which is what stops two crossing beams clipping to a flat white disc (V12a
+  what is under it (the one opt-in exception is a shadow with
+  `shadowCaster.darkness` above 0, section 4.7), but overlapping lamps approach
+  1.0 instead of summing past it, which is what stops two crossing beams
+  clipping to a flat white disc (V12a
   in [`review-findings.md`](review-findings.md)). The screen is symmetric and
   associative, so the layer is still order-independent: the order of
   `SpotlightConfig::lamps` cannot change the image. It costs what the add did.
@@ -593,8 +595,9 @@ A picture hung slightly off the wall, lit from above by a lamp close to that
 wall, throws a shadow: a band under the picture, thinner bands down both sides,
 nothing over the top. That is what this section adds. **`ShadowCaster`** is one
 rounded rectangle in app coordinates, standing `wallDistance` px in front of the
-wall the cones are drawn on; each lamp that opts in with **`castsShadow`**
-stands its own `SpotLight::wallDistance` px off the same wall.
+wall the cones are drawn on; every lamp that opts in with **`castsShadow`**
+stands `SPOT_LAMP_WALL_DISTANCE` (150) px off the same wall - one distance for
+the whole rig, so the caster's is the only one to set.
 
 **The model is one line test per fragment.** Wall at z = 0, the caster's face at
 z = d, the lamp at z = h over its app position L. The line from a wall fragment
@@ -604,6 +607,17 @@ and p is in shadow when q is inside the caster. What falls out is the caster
 reference photograph, the band under the frame and the bands beside it both
 give a scale of about 1.21 (t about 0.18), which is how the demo preset's
 distances were chosen.
+
+**Why the lamps carry no distance.** Everything the shadow draws is a function
+of the distances divided by one another - `t = d / h` for the scale, the
+penumbra and the solid caster's grazing case, `frameDepth / (h - d +
+frameDepth)` for the rails - so scaling every distance by one factor changes no
+pixel, and holding `h` at 150 loses nothing a single lamp could do. Each lamp
+had its own `wallDistance` until 2026-10-16; with it fixed at its old default,
+a rig that never set it renders byte-identically, and so do the demo presets
+rescaled to the same ratios (caster 29 of 160 -> 27.1875 of 150). What it gives
+up is lamps at different distances in one rig: each still throws its shadow
+away from its own position, at the same scale.
 
 **The penumbra is the lamp's own size.** The emitter is taken as a disc of
 radius `apertureWidth`; seen from p it covers a disc of radius
@@ -617,21 +631,23 @@ stands off the wall relative to the lamp, the longer and softer the shadow.
 the wall around it loses light. A host draws its picture into that rectangle,
 under the effect, and gets both the lit picture and its shadow from this layer.
 
-**LIGHT ONLY.** A shadow is this layer's light taken away - a coverage multiply
-after the highlight shoulder, exactly where the clip's is - not a darkening of
-what the host drew. Over a backdrop darker than the lamp it reads as a shadow
-(the umbra shows the bare backdrop, alpha 0 over a transparent clear); over a
-backdrop already brighter than the lamp there is little light to remove.
+**Light only by default.** A shadow is this layer's light taken away - a
+coverage multiply after the highlight shoulder, exactly where the clip's is -
+not a darkening of what the host drew. Over a backdrop darker than the lamp it
+reads as a shadow (the umbra shows the bare backdrop, alpha 0 over a
+transparent clear); over a backdrop already brighter than the lamp there is
+little light to remove. `darkness` (below) darkens the backdrop too.
 
 | Field | Default | Effect |
 | ----- | ------- | ------ |
 | `shadowCaster.position`, `.width`, `.height`, `.cornerRadius` | 0, 0 x 0, 0 | The picture's rectangle. 0 x 0 casts nothing. |
-| `shadowCaster.wallDistance` | 0 | How far the picture stands off the wall. 0 is flush: the shadow lies behind it. |
+| `shadowCaster.wallDistance` | 0 | How far the picture stands off the wall, against lamps 150 px out. 0 is flush: the shadow lies behind it. Larger throws it further and softer; near 150 a panel's shadow leaves the view (at or past it, none), a solid caster's never ends. |
 | `shadowCaster.softness` | 1.0 | Extra feather on the wall, px, on top of the lamp's penumbra. |
 | `shadowCaster.opacity` | 1.0 | Fraction of the light the picture stops. Below 1 lets some through. |
 | `shadowCaster.fill` | 0 | How far the other lamps' light washes a lamp's shadow out. 0 is physical. See "Two lamps" below. |
+| `shadowCaster.darkness` | 0 | How far the shadow darkens what is behind the layer. 0 is light only. See "Over a bright backdrop" below. |
+| `shadowCaster.color` | black | The colour `darkness` paints the shadow with, linear RGB. |
 | `SpotLight::castsShadow` | `false` | Per-lamp opt-in. The only gate. |
-| `SpotLight::wallDistance` | 150 | The lamp's distance off the wall. Read by the shadow only. A lamp no further off than the caster casts nothing off a panel; off a solid caster it grazes the side and its shadow never ends (see "Solid frame" below). |
 
 **Inert by default, and not a trap.** Unlike a zero-size `KEEP_INSIDE` clip,
 which blanks an opted-in lamp, a 0 x 0 or flush caster blocks nothing, so
@@ -654,20 +670,38 @@ renders as if it cast nothing.
 
 **It costs nothing in geometry.** A shadow only removes light, so the strips
 solved for the lamp still bound it, and none of section 6's numbers move. Per
-fragment it adds two rounded-box SDFs and two `smoothstep`s, for every lamp in
-the draw - a lamp that casts nothing evaluates the mask too and weights it to
-zero, for the reason the clip does.
+fragment of a casting lamp a panel adds two rounded-box SDFs and two
+`smoothstep`s. A lamp that casts nothing skips the mask altogether, behind a
+branch on its flat shadow weight, and renders byte-identically to the plain
+lamp.
 
 **It pins `resolutionScale` to 1.0** while a drawn lamp casts, like the clip and
 by the same predicate (`HasMaskedLamp`): where the lit face meets its own shadow
 the mask steps across one pixel, which a reduced buffer would smear exactly as
 it smears the clip's edge.
 
+**Where the code lives.** All of it in four marked places, so a change to the
+shadow touches only those: the THE SHADOW section of `spotlight.frag` (the
+model, the per-lamp varyings, the caster's uniforms, the panel, solid and
+recess tests, the `SPOT_FILL` lift and the `SPOT_SHADOW_DARKEN` output),
+entered from `main()` at one place (`spotShadowCover`, or `spotShadowDarken` in
+the darkening variant); the three shadow attributes at the end of
+`spotlight.vert`'s inputs and of `StripVertex`; the THE SHADOW CASTER block of
+`spotlight-renderer.cpp`'s anonymous namespace (`ShadowSolve`, `DeriveShadow`,
+`LampCastsShadow`, `DeriveLampShadow`, `AnyDrawnLampCasts`, `UsesFillPass`,
+`UsesDarkenPass`); and the THE SHADOW CASTER group of `SpotlightRenderer`
+(`uploadShadowUniforms`, `bindFillTarget`, `renderFillPass`,
+`uploadFillUniforms`, `ensureDarkenPrograms`, `renderShadowDarkenPass`,
+`mFillShader`, `mFillBuffer`, `mDarkenShader`, `mDarkenFillShader`,
+`mCasterRanges`), declared last in the header and defined last in the .cpp.
+Its four constants are in `spotlight-tuning.h`.
+`Render`, `buildStrips` and `ensureBuffer` only call into them.
+
 **The demo preset.** "Picture Light", under Spotlights > Shadow Caster in both
 demos, matches the caster to the rect and replaces the lamp list with one warm
 downlight a rect-height above it (beam 64 deg, throw 1400, spread falloff 0.6,
-aperture 22, intensity 4, 2900 K, lamp 160 px off the wall, caster 29, softness
-6). To light a real picture, load one in the Border Color Picker and tick "Show
+aperture 22, intensity 4, 2900 K, caster 27.1875 px off the wall - the 29 of a
+160 px lamp it was tuned at - softness 6, `darkness` 0.6). To light a real picture, load one in the Border Color Picker and tick "Show
 as backdrop".
 
 #### Two lamps, and `fill`
@@ -761,6 +795,44 @@ from the front, the rails do not shadow each other, no shadows of other layers,
 and no animatable `wallDistance` (`SpotlightField` has no entry for it yet -
 moving the lamp already moves the shadow).
 
+#### Over a bright backdrop: `darkness`, `color`
+
+Light only, the contrast between the lit wall and the umbra is
+`L * (1 - backdrop)`: it vanishes as the backdrop brightens, and over a
+transparent surface the umbra writes alpha 0, so a compositor shows what is
+behind it untouched. Measured with one lamp over a caster, red channel, the
+lit wall under the shadow against the umbra:
+
+| backdrop | lit wall | umbra, `darkness` 0 | 0.6 | 1.0 |
+| -------- | -------- | ------------------- | --- | --- |
+| 0.10 | 53 | 25 | 15 | 9 |
+| 0.50 | 143 | 128 | 78 | 44 |
+| 0.85 | 222 | 217 (5 levels of contrast) | 132 | 75 |
+| transparent | 31, alpha 31 | 0, alpha 0 | 0, alpha 100 | 0, alpha 166 |
+
+(On the brighter "Picture Light" preset the umbra over 0.85 reads 217, 87 and 0:
+its beam is past the full reach there.)
+
+**How.** With `darkness` above 0, a pass BEFORE the light draws the casting
+lamps' strips through a `SPOT_SHADOW_DARKEN` variant of `spotlight.frag`,
+which writes `(color * D, D)` under premultiplied OVER, `D = darkness * (1 -
+visibility) * smoothstep(0, SPOT_SHADOW_FULL_REACH, lamp light)`: the backdrop
+under the shadow becomes `backdrop * (1 - D) + color * D`, and its alpha gains
+`D`, so a video plane behind the surface darkens as well. The lamp's own light
+weights it - no light, no shadow, and the shadow fades out with the beam
+(`SPOT_SHADOW_FULL_REACH` 0.25, which also keeps it inside the strip). The
+light pass then screens every lamp on top as before, so a second lamp still
+lightens the first one's shadow, and `fill` lifts the darkening with the
+shadow. It darkens whatever the framebuffer already holds there.
+
+Verified offscreen: `darkness` 0 is byte-identical to before on every scene
+(no pass runs); at 0.6, no pixel outside a shadow changes on any backdrop; a
+lone lamp at `fill` 1 equals `fill` 0; scale 0.5 is pinned to 1.0; a lamp with
+`castsShadow` off equals no caster; swapping two lamps moves at most 2 levels
+(1 at `darkness` 0 - the 8-bit rounding between draws). Costs one more raster
+of the casting lamps' strips; its two programs are compiled the first frame it
+is used.
+
 ---
 
 ## 5. Animating a lamp
@@ -797,10 +869,22 @@ the way animating a pure shader uniform is.
 
 ## 6. Resolution and cost
 
-`SpotlightConfig::resolutionScale` behaves exactly as the neon's and the
-flare's do - same two paths, same blit - and **not one uniform differs between
-them**, so a scaled frame is the same picture at lower resolution rather than a
-differently shaped one.
+`SpotlightConfig::resolutionScale` behaves as the flare's does - two paths,
+direct at 1.0 and a bilinear blit below it - and **no uniform that shapes the
+light differs between them**, so a scaled frame is the same picture at lower
+resolution rather than a differently shaped one.
+
+The one thing that moves is **where the output is dithered**. At 1.0 the strips
+dither their own write to the caller's 8-bit target. Below it they write a
+**half-float** buffer undithered, and the layer's own blit
+(`spotlight-blit.frag`) dithers once per destination pixel after its bilinear
+read. That split is the neon's (R7) and for the same reason: dithered into an
+RGBA8 buffer, the tail - one level every 13 to 50 px - was already rounded to
+plateaus before the blit read it, and the filter averaged the per-texel noise
+into blotches, so at 0.25 and 0.125 the dark tail came back as blocky contours
+(V27 in `review-findings.md`). A driver that will not render to half float
+gets RGBA8 with the old in-pass dither, plus the blit's. The buffer costs twice
+the memory for it: 4.1 MB at 1080p and 0.5.
 
 One exception, and it is a hard gate rather than a caveat: **an enabled clipped
 lamp holds the scale at 1.0**, so everything in this section describes an
@@ -861,12 +945,13 @@ one function per scalar, mirroring the arc family:
 | `el_effect_set_spotlight_clip_softness` | `clipArea.edgeSoftness` |
 | `el_effect_set_spotlight_clip_mode` | `clipArea.mode` (`el_clip_mode_e`) |
 | `el_effect_set_spotlight_casts_shadow` | per-lamp `castsShadow` |
-| `el_effect_set_spotlight_wall_distance` | per-lamp `wallDistance` |
 | `el_effect_set_spotlight_shadow_rect` | `shadowCaster.width`, `.height`, `.position.x`, `.position.y`, `.cornerRadius` |
 | `el_effect_set_spotlight_shadow_distance` | `shadowCaster.wallDistance` |
 | `el_effect_set_spotlight_shadow_softness` | `shadowCaster.softness` |
 | `el_effect_set_spotlight_shadow_opacity` | `shadowCaster.opacity` |
 | `el_effect_set_spotlight_shadow_fill` | `shadowCaster.fill` |
+| `el_effect_set_spotlight_shadow_darkness` | `shadowCaster.darkness` |
+| `el_effect_set_spotlight_shadow_color` | `shadowCaster.color` |
 | `el_effect_set_spotlight_shadow_solid` | `shadowCaster.solid` |
 | `el_effect_set_spotlight_shadow_frame` | `shadowCaster.frameWidth`, `.frameDepth` |
 
@@ -879,8 +964,8 @@ parameter: it is not part of the shape, and retuning it should not re-send four
 numbers that did not change. `el_effect_set_spotlight_shadow_rect` takes the
 same five in the same order, for the same reason; the caster's other three
 fields are scalar setters of their own. The naming follows the clip's split:
-`..._shadow_<noun>` is the caster (no index), `..._casts_shadow` and
-`..._wall_distance` are a lamp's (indexed).
+`..._shadow_<noun>` is the caster (no index), `..._casts_shadow` is a lamp's
+(indexed).
 
 Each has a matching `el_effect_get_*`. The tint and `spreadFalloff` are calls of
 their own rather than extra parameters on `el_effect_set_spotlight_look` and
@@ -918,11 +1003,12 @@ then calls only `el_effect_render` renders the previous frame's rig.
 | Confine light to a region | `clipArea.mode = KEEP_INSIDE` (the default) |
 | Soften or sharpen the cut | `clipArea.edgeSoftness` (0 aliases; 1.0 is one pixel) |
 | A picture that throws a shadow | `SpotLight::castsShadow` + `spotlight.shadowCaster.*` (set `wallDistance` > 0) |
-| A longer, softer shadow | raise `shadowCaster.wallDistance`, or lower the lamp's `wallDistance` |
+| A longer, softer shadow | raise `shadowCaster.wallDistance` |
 | A softer shadow edge only | `apertureWidth` (the emitter's size), or `shadowCaster.softness` |
 | A shadow that is not fully dark | `shadowCaster.opacity` below 1 |
 | No shadow where a second lamp shines | `shadowCaster.fill` (1 = gone where the others give half the light; two passes) |
-| A solid frame light cannot pass through | `shadowCaster.solid`; for "nothing behind it is lit", lamp `wallDistance` at or under the caster's |
+| A shadow that shows over a bright backdrop or a video | `shadowCaster.darkness` (0.6 is a natural start), `shadowCaster.color` |
+| A solid frame light cannot pass through | `shadowCaster.solid`; for "nothing behind it is lit", `shadowCaster.wallDistance` 150 or more |
 | Rails that shade the picture inside | `shadowCaster.frameWidth` + `shadowCaster.frameDepth` |
 | Turn the whole layer off | `spotlight.enable` |
 | Trade quality for speed (large rigs only) | `spotlight.resolutionScale` |

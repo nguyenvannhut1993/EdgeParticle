@@ -209,7 +209,7 @@ summed in HDR and tone-mapped together. Also owns the opaque fill pass
 | Field | Unit | Default | Range | Effect |
 |---|---|---|---|---|
 | `enable` | bool | `false` | - | Master switch. Nothing draws when false |
-| `resolutionScale` | fraction `(0, 1]` | `1.0` | `[0.001, 1.0]`, useful `0.25-1.0` | `1.0` = direct to caller framebuffer. Below = the gather runs alone into a small buffer at its own coarse scale (about 2 texels per colour kernel, `GetGatherScale`), the glow is shaded from it into an offscreen buffer at that fraction, then bilinear-blitted (`neon-blit.frag`) everywhere except a thin ring around the edge, which is re-shaded at full res from the same gather result (`neon.frag` built with `NEON_READS_GATHER`). Buys the gather loop (~95% of the cost) almost entirely, and the rest of the shading on (1 - scale^2) of the glow. Clamped at draw time; `>= 1.0` all identical, `<= 0.001` all identical (a 1 px buffer). Within 2/255 of `1.0` down to `0.125` on the comparison page's scenes, except a 160 x 96 rect (4 at `0.25`, 10 at `0.125`) - the error grows as the rect shrinks (20 x 17: 18 / 53 / 93 at `0.5` / `0.25` / `0.125`), so keep small rects at `1.0`; before the edge ring the defaults sat 7/255 away at `0.5` and 25 at `0.25`. NOT a guaranteed saving: the ring and the blit are a fixed cost, so a tight cutoff band rendered ~2x SLOWER below `1.0` on an AMD 5300M (before the ring and blit were bounded to the lit band, which took 44% off that scene at `0.25` on llvmpipe), and a soft filament (`filamentFalloff` < ~0.3) widens the ring. Memory below `1.0`: an RGBA8 buffer over what the blit reads, never more than the whole viewport at that fraction, plus an RGBA16F gather buffer (two attachments with segments) over the glow - at 1920 x 1080 and `0.5`, 2.15 MB for a full-screen rect, 1.8 MB for a 900 x 540 one, against 4.1 MB before `neon-resolution-scale-plan.md` section 13. See `neon-resolution-scale-comparison.html` |
+| `resolutionScale` | fraction `(0, 1]` | `0.5` | `[0.001, 1.0]`, useful `0.25-1.0` | One path at every scale (the direct path at `1.0` was removed in I57; `1.0` is the same passes with a full-size buffer). The gather runs alone into a small buffer at its own coarse scale (about 2 texels per colour kernel, `GetGatherScale`), the glow is shaded from it into an offscreen buffer at that fraction, then bilinear-blitted (`neon-blit.frag`) everywhere except a thin ring around the edge, which is re-shaded at full res from the same gather result (`neon.frag`, second program object). Buys the gather loop (~95% of the cost) almost entirely, and the rest of the shading on (1 - scale^2) of the glow. Clamped at draw time; `>= 1.0` all identical, `<= 0.001` all identical (a 1 px buffer). Within 2/255 of `1.0` down to `0.125` on the comparison page's scenes, except a 160 x 96 rect (4 at `0.25`, 10 at `0.125`) - the error grows as the rect shrinks (20 x 17: 18 / 53 / 93 at `0.5` / `0.25` / `0.125`), so keep small rects at `1.0`; before the edge ring the defaults sat 7/255 away at `0.5` and 25 at `0.25`. NOT a guaranteed saving: the ring and the blit are a fixed cost, so a tight cutoff band rendered ~2x SLOWER below `1.0` on an AMD 5300M (before the ring and blit were bounded to the lit band, which took 44% off that scene at `0.25` on llvmpipe), and a soft filament (`filamentFalloff` < ~0.3) widens the ring. Memory below `1.0`: an RGBA8 buffer over what the blit reads, never more than the whole viewport at that fraction, plus an RGBA16F gather buffer (two attachments with segments) over the glow - at 1920 x 1080 and `0.5`, 2.15 MB for a full-screen rect, 1.8 MB for a 900 x 540 one, against 4.1 MB before `neon-resolution-scale-plan.md` section 13. See `neon-resolution-scale-comparison.html` |
 | `numSamples` | int | `128` (`NEON_MAX_LOOP_SAMPLES`) | `[1, 128]`, converged `>= 96` | Gather samples per fragment. Lower = faster + grainier halo. `128`, `129` and `512` are identical; so are `0` and `1`. Against `128`: `96` is 1/255, `64` is 3/255, `32` is 12/255, `16` is 29/255 |
 | `gradientLutSize` | texels | `256` | `>= 4`, no cap; converged `>= 128` | Baked ring LUT width. Size change snaps, never cross-fades. Floored at 4 (`1` through `4` identical, `5` is the first that differs); there is NO upper clamp - the demo's `32-256` slider is a UI choice, and `512`/`4096` do render (3/255 and 5/255 past `256`) |
 | `opaqueMode` | enum | `NONE` | - | Fill geometry (see `OpaqueMode`) |
@@ -369,7 +369,8 @@ is undefined).
 
 Freely placed cones of light. Not a perimeter effect: reads only
 `Config::spotlight`. Light only (no backdrop/fixtures/occlusion), one
-additive pass (`GL_ONE, GL_ONE` color + alpha, coverage = max channel).
+screened pass (`GL_ONE_MINUS_DST_COLOR, GL_ONE` colour, `GL_ONE_MINUS_DST_ALPHA,
+GL_ONE` alpha, i.e. `dst + src * (1 - dst)`; coverage = max channel).
 Per-lamp solved strips (`SPOT_STRIP_SEGMENTS = 12` quads) in one VBO, one
 `glDrawArrays`. VBO holds app coords verbatim; y-flip in ortho.
 
@@ -442,7 +443,7 @@ bound render the same pixels, so the slider past it is dead.
 | `neon.filamentFalloff` | `>= 0.001` | `neon-renderer.cpp:887` | `0` = `0.0005` = `0.001` |
 | `neon.lineWidth` | `>= 0` | shader gate | `-8` = `-1` = `0` (no filament) |
 | `neon.glowRadius` | `>= 0` | shader gate | `-20` = `-1` = `0` |
-| `neon.glowSideSoftness` | `>= 1 px` | one destination px (`fwidth` floor, in `neon.frag` or `neon-blit.frag`) | `0` through `1.0` identical; `1.05` differs |
+| `neon.glowSideSoftness` | `>= 1 px` | one destination px (the pixel-width floor, `sdRoundBoxFwidth`, in `neon.frag` or `neon-blit.frag`) | `0` through `1.0` identical; `1.05` differs |
 | `ColorStop.color.a` | `[0, 1]` | LUT bake | `1.0` = `1.5` = `4.0` |
 | `Arc.length` | `[0, 1]` | perimeter walk | `1.0` = `1.5` = `2.0` |
 | `Arc.intensity` | `>= 0` | mask fold | `-4` = `-1` = `0` |
@@ -466,8 +467,8 @@ bound render the same pixels, so the slider past it is dead.
 `Cutoff.softness` - the glow's `insideCutoff` / `outsideCutoff` and the fill's
 `opaqueInsideCutoff` / `opaqueOutsideCutoff` alike - looks like a `>= 1 px`
 clamp and is NOT one, which is why it is not in the table above. Only the
-feather's WIDTH is floored at one destination pixel, by the shader's `fwidth`
-floor on every path (below `resolutionScale` 1.0 the glow's cutoffs are drawn
+feather's WIDTH is floored at one destination pixel, by the shader's
+pixel-width floor (`sdRoundBoxFwidth`) on every path (below `resolutionScale` 1.0 the glow's cutoffs are drawn
 by `neon-blit.frag`, at destination resolution). Its POSITION is
 not: the fade's midpoint is always `size + softness/2`, and the floored width is
 laid symmetrically about it. At or above the floor the fade therefore runs

@@ -388,24 +388,28 @@ namespace EdgeLighting
 
         // --- Resolution and cost knobs ---
         //
-        // The renderer draws either straight onto the framebuffer it was handed
-        // (@c resolutionScale 1.0) or into a scaled offscreen buffer that is
-        // bilinear-blitted back, with a full-resolution ring around the edge
-        // (below 1.0). The defaults here are the full-res path, so a config
-        // left untouched renders as it always has.
+        // The renderer shades the glow into an offscreen buffer at
+        // @c resolutionScale of the viewport, bilinear-blits it back, and
+        // re-shades a ring around the edge at full resolution - at every scale,
+        // 1.0 included. The default is 0.5.
 
-        /// Resolution scale for the internal neon buffer. 1.0 draws the gather
-        /// directly onto the caller's framebuffer - no offscreen buffer and no
-        /// blit. Below 1.0 the gather - the sample loop that is most of the
-        /// cost - runs once into a small buffer at its own, coarser
-        /// resolution, set by how smooth its result is rather than by this
-        /// value; the glow is shaded from that result into a buffer of this
-        /// fraction of the viewport (0.5 = half-res, 0.25 = quarter) and
-        /// composited back with bilinear filtering everywhere except a thin
-        /// ring around the rect edge, which is re-shaded at FULL resolution
-        /// from the same result - so the filament, the one-sided cut and the
-        /// cutoffs near the line come out as the direct path draws them.
-        /// Clamped to (0, 1] at draw time.
+        /// Resolution scale for the internal neon buffer. The gather - the
+        /// sample loop that is most of the cost - runs once into a small buffer
+        /// at its own, coarser resolution, set by how smooth its result is
+        /// rather than by this value; the glow is shaded from that result into
+        /// a buffer of this fraction of the viewport (0.5 = half-res, 0.25 =
+        /// quarter, 1.0 = full size) and composited back with bilinear
+        /// filtering everywhere except a thin ring around the rect edge, which
+        /// is re-shaded at FULL resolution from the same result - so the
+        /// filament, the one-sided cut and the cutoffs near the line come out
+        /// at full resolution whatever this value. Clamped to (0, 1] at draw
+        /// time.
+        ///
+        /// Default 0.5 (I57). There used to be a separate path at 1.0 that
+        /// shaded straight onto the target with no buffer, blit or ring; it was
+        /// removed once no shipped config used 1.0, which now takes the same
+        /// path with a full-size buffer - within a couple of levels of what the
+        /// old path drew, and slower than it on a still frame.
         ///
         /// Quality: within 2/255 of the 1.0 render at every scale down to
         /// 0.125 on every scene in docs/neon-resolution-scale-comparison.html
@@ -414,37 +418,24 @@ namespace EdgeLighting
         /// The error GROWS as the rect shrinks, because the halo just outside
         /// the edge ring changes faster than a reduced buffer can follow round
         /// a small rect: a 20 x 17 rect reads 18 / 53 / 93 at 0.5 / 0.25 /
-        /// 0.125 (measured on Mesa llvmpipe; the same as before the edge ring,
-        /// which fixed the pixels next to the line). Keep small rects at 1.0 -
-        /// they are cheap there anyway.
+        /// 0.125 (measured on Mesa llvmpipe).
         ///
-        /// Cost: what this buys is the gather's fragment work, which dominates
-        /// the effect - the glow quad is large and every fragment inside it
-        /// walks the sample loop. Below 1.0 the loop runs on a few thousand
-        /// texels whatever this value is, so 0.5 now saves nearly as much as
-        /// 0.25 did. It is NOT a guaranteed saving. The ring, the composite
-        /// and the extra pass are a fixed cost, so a scene that is already
-        /// cheap at 1.0 - a tight cutoff band, a one-sided glow - can render
-        /// SLOWER below 1.0; a soft filament (filamentFalloff below ~0.3)
-        /// widens the ring and loses most of the gain; and a rect small enough
-        /// to gather at this value itself gains nothing from the split.
-        /// Measure. See docs/neon-resolution-scale-plan.md sections 7, 12 and
-        /// 13.
+        /// Cost: the reduced shading pass is the only one this value scales;
+        /// the gather, the coverage table, the edge ring and the blit do not.
+        /// So it pays on frames whose config animates (an intensity pulse, an
+        /// arc wipe, a travelling segment), where the shading reruns, and
+        /// barely on still or hue-rotating frames, which the renderer mostly
+        /// serves from cached buffers and fields. Below ~0.35 the passes it
+        /// does not scale are most of an animated frame. See
+        /// docs/neon-reduced-scale-plan.md.
         ///
-        /// Memory: below 1.0 the renderer holds an RGBA8 buffer at the reduced
-        /// scale over the part of the frame the glow can reach - never more
-        /// than the whole viewport at that scale - and an RGBA16F gather buffer
-        /// (two attachments with segments) over the same area at the gather's
-        /// scale. At 1920 x 1080: 2.15 MB at 0.5 and 0.6 MB at 0.25 for a
-        /// full-screen rect, 1.8 / 0.54 MB for a 900 x 540 one. Nothing at
-        /// 1.0, and released when the scale returns to 1.0 or the layer is
-        /// disabled.
-        ///
-        /// The two paths draw with different shader programs, built the first
-        /// frame each path renders: a host that stays on one never compiles
-        /// the other's, and switching costs a one-time compile on the first
-        /// frame after the switch.
-        float resolutionScale = 1.0f;
+        /// Memory: an RGBA8 buffer at this scale over the part of the frame
+        /// the glow can reach - never more than the whole viewport at it - and
+        /// an RGBA16F gather buffer (two attachments with segments) over the
+        /// same area at the gather's scale. At 1920 x 1080: 2.15 MB at 0.5 and
+        /// 0.6 MB at 0.25 for a full-screen rect, 1.8 / 0.54 MB for a
+        /// 900 x 540 one. Released when the layer is disabled.
+        float resolutionScale = 0.5f;
 
         /// Number of perimeter gather samples per fragment. Capped at
         /// @c NEON_MAX_LOOP_SAMPLES - the UBO and the shader's array are both
@@ -987,13 +978,14 @@ namespace EdgeLighting
     ///
     /// The spotlight layer draws its cones on one plane, the wall. This puts a
     /// second plane between the wall and the lamps: the caster's face sits
-    /// @c wallDistance px off the wall, and each lamp opted in with
-    /// @c SpotLight::castsShadow sits @c SpotLight::wallDistance px off it. A
+    /// @c wallDistance px off the wall, and every lamp opted in with
+    /// @c SpotLight::castsShadow is taken to stand SPOT_LAMP_WALL_DISTANCE
+    /// (150) px off it - one distance for the whole rig, because only the
+    /// ratio of the two reaches the picture (see @ref wallDistance). A
     /// fragment on the wall is in shadow when the straight line from it to the
     /// lamp crosses the caster - so the shadow is the caster's rectangle
-    /// scaled up about the lamp's position by
-    /// `lamp.wallDistance / (lamp.wallDistance - caster.wallDistance)`, pushed
-    /// AWAY from the lamp. A lamp above a picture puts a thick band under it
+    /// scaled up about the lamp's position by `150 / (150 - wallDistance)`,
+    /// pushed AWAY from the lamp. A lamp above a picture puts a thick band under it
     /// and thin bands down both sides, and nothing above it, because the top
     /// of the shadow lands behind the picture itself.
     ///
@@ -1002,12 +994,13 @@ namespace EdgeLighting
     /// lets a host draw its picture into this rectangle, under the effect, and
     /// get both a lit picture and its shadow from one layer.
     ///
-    /// **LIGHT ONLY, like the rest of the layer.** A shadow here is this
-    /// layer's own light taken away - a coverage multiply on the lamp's
+    /// **LIGHT ONLY by default, like the rest of the layer.** A shadow here is
+    /// this layer's own light taken away - a coverage multiply on the lamp's
     /// shading, as @ref ClipArea is - not a darkening of what the host drew.
     /// Over a dark backdrop that reads exactly as a shadow; over a backdrop
     /// already brighter than the lamp, there is little light to take away and
-    /// so little shadow to see.
+    /// so little shadow to see. @ref darkness is the opt-in that darkens the
+    /// backdrop as well.
     ///
     /// **Inert by default.** A 0 x 0 caster, or one at @c wallDistance 0 (flush
     /// with the wall, where its shadow lies entirely behind it), blocks nothing
@@ -1030,10 +1023,24 @@ namespace EdgeLighting
         float cornerRadius = 0.0f;
 
         /// How far the caster's face stands off the wall, in px - the depth
-        /// that turns a flat rectangle into something with a shadow. 0 is
-        /// flush and casts nothing visible. The larger it is against a lamp's
-        /// @c SpotLight::wallDistance, the further the shadow is thrown and the
-        /// softer its edge: see @c SpotLight::wallDistance for the ratio.
+        /// that turns a flat rectangle into something with a shadow, and the
+        /// ONE distance the shadow has. 0 is flush and casts nothing visible.
+        ///
+        /// It is measured against lamps SPOT_LAMP_WALL_DISTANCE (150) px off
+        /// the wall, the same for every lamp, as `t = wallDistance / 150`:
+        /// the shadow is the caster scaled by `1 / (1 - t)` about each
+        /// casting lamp's position, and its penumbra is
+        /// `2 * apertureWidth * t / (1 - t)` px wide plus @ref softness. So a
+        /// larger value throws the shadow further and softens its edge. Only
+        /// that ratio reaches the picture - scaling every distance by one
+        /// factor changes nothing - which is why the lamps carry no distance
+        /// of their own.
+        ///
+        /// As it nears 150 a PANEL's shadow grows out of view, and at or
+        /// past it the panel casts nothing (the lamps are behind its face).
+        /// A SOLID caster that deep throws a shadow that never ends: the
+        /// lamps graze its side, and light along the wall stops at the block
+        /// - except a lamp inside the block's footprint, which casts nothing.
         float wallDistance = 0.0f;
 
         /// Extra feather across the shadow's edge, in px ON THE WALL, on top
@@ -1070,6 +1077,34 @@ namespace EdgeLighting
         /// second pass and no buffer.
         float fill = 0.0f;
 
+        /// How far the shadow darkens what is BEHIND this layer, in [0, 1].
+        /// **0 - the default - is light only**: a shadow is just the lamp's
+        /// light taken away, so over a backdrop brighter than the lamp it all
+        /// but disappears (5 levels over 0.85 grey where it is 28 over 0.1),
+        /// and over a transparent surface the umbra writes alpha 0, so a
+        /// compositor shows what is behind it at full brightness.
+        ///
+        /// Above 0 each casting lamp also darkens the destination inside its
+        /// shadow, BEFORE the light is screened on, by
+        /// `darkness * (1 - visibility) * reach`: reach rises from 0 where the
+        /// lamp puts no light to 1 where it puts SPOT_SHADOW_FULL_REACH of
+        /// full scale, so there is no shadow where there is no light and the
+        /// shadow fades out with the beam. It is written as premultiplied
+        /// @ref color over the destination, alpha included, so the umbra
+        /// carries coverage and a video plane behind the surface darkens too.
+        /// The other lamps' light still lands on top, and @ref fill lifts the
+        /// darkening with the shadow. It darkens whatever the framebuffer
+        /// already holds there.
+        ///
+        /// Costs one more pass over the casting lamps' strips while above 0.
+        float darkness = 0.0f;
+
+        /// The colour @ref darkness paints the shadow with, linear RGB in
+        /// [0, 1]. Black - the default - scales the backdrop down; a dark warm
+        /// tone reads as a shadow on a lit warm wall. Exact under a
+        /// premultiplied compositor; black is exact under any.
+        glm::vec3 color = glm::vec3(0.0f, 0.0f, 0.0f);
+
         /// Whether the caster is a SOLID BLOCK from the wall out to
         /// @c wallDistance - a framed picture - rather than a flat panel
         /// floating that far in front of it. Default false: the panel.
@@ -1077,10 +1112,11 @@ namespace EdgeLighting
         /// A block's shadow is everything its whole depth projects, so it is
         /// attached to the caster (under a lamp above it, the side shadows
         /// start at its top corners and widen downward) where a panel's is a
-        /// detached copy. And a lamp no further from the wall than the block
-        /// is deep throws a shadow that never ends - light along the wall
-        /// stops at the block - where a panel drops that lamp's shadow. The
-        /// caster's face stays lit either way. See
+        /// detached copy. And a block at least SPOT_LAMP_WALL_DISTANCE deep -
+        /// as deep as the lamps are far from the wall - throws a shadow that
+        /// never ends: light along the wall stops at the block, where a
+        /// panel that deep casts nothing. The caster's face stays lit either
+        /// way. See
         /// docs/spotlight-solid-frame-plan.md.
         ///
         /// Costs a short fixed search per fragment of each casting lamp
@@ -1096,7 +1132,7 @@ namespace EdgeLighting
 
         /// How far the picture sits behind the rails' front, in px. Lit from
         /// above, the top rail then casts a band of shadow across the top of
-        /// the picture, deeper as this grows or the lamp nears the wall. 0 -
+        /// the picture, deeper as this grows. 0 -
         /// the default - is flush: no rail shadow. Clamped to
         /// @c wallDistance. Works for a panel or a block.
         float frameDepth = 0.0f;
@@ -1111,6 +1147,8 @@ namespace EdgeLighting
                    softness == o.softness &&
                    opacity == o.opacity &&
                    fill == o.fill &&
+                   darkness == o.darkness &&
+                   color == o.color &&
                    solid == o.solid &&
                    frameWidth == o.frameWidth &&
                    frameDepth == o.frameDepth;
@@ -1257,25 +1295,6 @@ namespace EdgeLighting
         /// blanks the lamp. Set the rectangle first.
         bool clipped = false;
 
-        /// How far the lamp stands off the wall, in px. **Only the shadow
-        /// reads it** - the cone is drawn on the wall's plane whatever this
-        /// holds, so it changes nothing until @ref castsShadow is set.
-        ///
-        /// What decides the shadow is its ratio to
-        /// @c ShadowCaster::wallDistance, `t = caster / lamp`: the shadow is
-        /// the caster scaled by `1 / (1 - t)` about this lamp's position, and
-        /// its penumbra is `2 * apertureWidth * t / (1 - t)` px wide - the
-        /// aperture standing in for the size of the emitter. A lamp close to
-        /// the wall over a picture well off it throws a long, soft shadow; a
-        /// lamp far out throws a short, hard one hugging the picture.
-        ///
-        /// A lamp NOT further from the wall than the caster casts nothing off
-        /// a PANEL: it sits behind the picture's face, and the renderer drops
-        /// its shadow rather than project through it. Off a SOLID caster
-        /// (@c ShadowCaster::solid) the same lamp grazes the block's side and
-        /// throws a shadow that never ends - unless it is inside the block.
-        float wallDistance = 150.0f;
-
         /// Whether @c SpotlightConfig::shadowCaster throws a shadow of THIS
         /// lamp's light. Per lamp for the reason @ref clipped is: a key light
         /// over a picture should cast one, a fill lamp washing the scene may
@@ -1306,7 +1325,6 @@ namespace EdgeLighting
                    tint == o.tint &&
                    enable == o.enable &&
                    clipped == o.clipped &&
-                   wallDistance == o.wallDistance &&
                    castsShadow == o.castsShadow;
         }
         bool operator!=(const SpotLight &o) const { return !(*this == o); }
@@ -1357,7 +1375,10 @@ namespace EdgeLighting
         /// fragment stage works entirely in full-res lamp-local pixels that
         /// arrive interpolated, so drawing into a smaller buffer reproduces
         /// the same picture at lower resolution rather than a differently
-        /// shaped one - not one uniform differs between the two paths.
+        /// shaped one. The buffer is half float (RGBA8 where the driver will
+        /// not render to it) and the blit dithers at full resolution, so the
+        /// dark tail stays as smooth as at 1.0 rather than banding into
+        /// blocky contours.
         ///
         /// But this layer does NOT shade the whole viewport: its strips are
         /// bounded to what each lamp lights, so a scale that quarters them
@@ -1395,6 +1416,214 @@ namespace EdgeLighting
         bool operator!=(const SpotlightConfig &o) const { return !(*this == o); }
     } SpotlightConfig;
 
+    /// How one arc's emitter spawns its particles - set per arc, in
+    /// @c ParticleArcConfig::mode.
+    ///
+    /// Every mode launches its motes with an initial velocity and lets drag
+    /// slow them - the motion the GPU evaluates in closed form - so a mode
+    /// differs in WHERE motes are born, which way and how fast they leave,
+    /// and how long they live, never in what moves them afterwards.
+    typedef enum class ParticleMode
+    {
+        /// Motes scattered along the whole of the arc, dense at its head and
+        /// thinning toward its tail, drifting the way the arc is sweeping and
+        /// settling back onto the line.
+        MOVEMENT,
+        /// Sparks shot from the arc's LEADING edge - the end moving into new
+        /// ground as it sweeps - between the sweep direction and straight out
+        /// (@c ParticleArcConfig::outwardBias), inside a cone of
+        /// @c ParticleArcConfig::spreadDeg. A point source: @c emissionRate is
+        /// sparks per second.
+        HEAD_SPARKS
+    } ParticleMode;
+
+    /// One arc's particle settings. Each arc has its own - see
+    /// @c ParticleConfig::arcs for which arc an entry drives.
+    ///
+    /// Read at SPAWN and captured into each mote (launch velocity, lifetime,
+    /// size, drag, colour), so a change leaves the motes already in flight
+    /// as they were born.
+    typedef struct ParticleArcConfig
+    {
+        /// This arc's emitter. Off stops the arc outright: its motes are
+        /// cleared at once, and its emitter starts fresh when switched back
+        /// on. Not the same as a DARK arc (zero length or intensity), whose
+        /// motes live out their lives - which is what lets a trail fade
+        /// behind an arc an animation winds down.
+        bool enable = true;
+
+        // --- Own arc: read only while ParticleConfig::useNeonArc is false ---
+
+        /// Tail of the arc, as a perimeter position in [0, 1) - the space of
+        /// @c Arc::start, so 0 is the rect's top-left corner and
+        /// @c RectGeometry::winding sets the direction round.
+        float arcStart = 0.0f;
+        /// Fraction of the perimeter the arc covers, from @c arcStart toward
+        /// increasing position. At or below 0.001 the arc emits nothing.
+        float arcLength = 0.25f;
+
+        // --- Colour ---
+
+        /// Paint every mote of this arc @c customColor, whatever the neon is
+        /// doing. Off, the colour comes from the neon as described on
+        /// @ref ParticleConfig - for an own arc too, so without this an own
+        /// arc's motes vanish where the neon draws nothing.
+        bool useCustomColor = false;
+        /// Straight (not premultiplied) RGBA; alpha is the motes' opacity.
+        /// Read only with @c useCustomColor.
+        glm::vec4 customColor = glm::vec4(1.0f);
+
+        // --- Emission ---
+
+        /// Emission strategy. See @ref ParticleMode.
+        ParticleMode mode = ParticleMode::MOVEMENT;
+
+        /// MOVEMENT: spawn DENSITY along the arc - the arc spawns
+        /// arcPixelLength * 2 * emissionRate / 100 motes per second, so a
+        /// longer arc spawns proportionally more and the trail stays equally
+        /// dense per px. HEAD_SPARKS spawns from one point, so there it is a
+        /// plain rate - sparks per second. Clamped by @c maxParticles in both
+        /// modes.
+        float emissionRate = 400.0f;
+        /// Lifetime in seconds - the longest any mote of this arc lives. Each
+        /// mode randomises its motes' lifetimes below this (MOVEMENT into
+        /// [0.1, 1.0] x this), and never above it: the arc's cap and its
+        /// block of the manager's ring are both sized on this being the
+        /// maximum. Arcs may differ - each has a ring block of its own.
+        float lifetime = 0.7f;
+        /// MOVEMENT: a multiplier on the slow drift, not a speed in px/s - the
+        /// along-line speed is [1.0, 1.5] x this x @c scatterRadius x
+        /// 1.5 / 1000 px/s. HEAD_SPARKS: launch speed in px/s, randomised
+        /// into [0.5, 1.0] x this.
+        float speed = 90.0f;
+        /// Exponential drag coefficient (1/s). Larger = slows down faster.
+        /// Captured per mote at spawn, so changing it leaves the motes
+        /// already in flight on the paths they started.
+        float drag = 2.5f;
+        /// Point size in px at spawn. The vertex shader shrinks it with the
+        /// remaining life, floored at 1 px.
+        float sizeStart = 7.0f;
+        /// Ceiling on @c maxParticles. The manager gives every arc a ring
+        /// block and colour-latch rows of exactly this many motes.
+        static constexpr int MAX_PARTICLES_CAP = 4096;
+        /// Upper bound on this arc's live particles, clamped to
+        /// @c MAX_PARTICLES_CAP. Held as a rate: the arc spawns at most
+        /// maxParticles / @c lifetime motes per second, so it can never have
+        /// more alive - and because lifetimes are randomised into
+        /// [0.1, 1] x @c lifetime, a clamped arc typically carries about 55%
+        /// of it. The trail thins evenly at the clamp rather than in bursts.
+        int maxParticles = 4096;
+
+        /// MOVEMENT: spawn distribution along the arc, as an exponent:
+        /// t = u^headBias with t = 0 the tail and 1 the head. Below 1 crowds
+        /// motes toward the head, 1 is uniform, above 1 crowds them toward
+        /// the tail. HEAD_SPARKS: unused.
+        float headBias = 1.0f;
+        /// How far from the line a mote may be born, in px. MOVEMENT: a disc
+        /// stretched 3x along the line, whose radius also scales the drift
+        /// speed. HEAD_SPARKS: a disc around the leading edge.
+        float scatterRadius = 20.0f;
+        /// MOVEMENT: size at the tail as a fraction of @c sizeStart (the head
+        /// is 1.0), before each mote's own random size factor.
+        float tailSizeFraction = 1.0f;
+
+        // --- HEAD_SPARKS ---
+
+        /// Full cone angle in degrees around the launch direction. 0 = every
+        /// spark flies the same way; 360 = any direction.
+        float spreadDeg = 50.0f;
+        /// Launch direction between the arc's sweep direction (0) and
+        /// straight out of the rect along the edge normal (1).
+        float outwardBias = 0.6f;
+
+        bool operator==(const ParticleArcConfig &o) const
+        {
+            return enable == o.enable &&
+                   arcStart == o.arcStart &&
+                   arcLength == o.arcLength &&
+                   useCustomColor == o.useCustomColor &&
+                   customColor == o.customColor &&
+                   mode == o.mode &&
+                   emissionRate == o.emissionRate &&
+                   lifetime == o.lifetime &&
+                   speed == o.speed &&
+                   drag == o.drag &&
+                   sizeStart == o.sizeStart &&
+                   maxParticles == o.maxParticles &&
+                   headBias == o.headBias &&
+                   scatterRadius == o.scatterRadius &&
+                   tailSizeFraction == o.tailSizeFraction &&
+                   spreadDeg == o.spreadDeg &&
+                   outwardBias == o.outwardBias;
+        }
+        bool operator!=(const ParticleArcConfig &o) const { return !(*this == o); }
+    } ParticleArcConfig;
+
+    /// Point-sprite particle configuration: one switch for where the arcs
+    /// come from, and one @ref ParticleArcConfig per arc.
+    ///
+    /// Motion is an initial velocity under exponential drag, evaluated in
+    /// closed form on the GPU from each mote's age, and ages on the effect
+    /// CLOCK, not wall time: pausing the clock freezes the particles, while
+    /// @c Clock::Stop and switching the layer off clear them. Particles live
+    /// in the same rect-local space as the neon quad and are drawn as
+    /// GL_POINTS with premultiplied-alpha "over" blending. The layer does not
+    /// read @c NeonConfig::enable - the sparks still fly with the glow
+    /// switched off.
+    ///
+    /// WHAT COLOUR is taken ONCE, at spawn, and kept for the particle's whole
+    /// life. An arc with @c ParticleArcConfig::useCustomColor takes its own
+    /// colour; every other arc takes the neon's:
+    ///   - the glow of the @ref NeonRenderer attached with
+    ///     @c ParticleManager::SetNeonSource, as DRAWN into its scaled buffer
+    ///     at the spawn point - colour and coverage as stored, so a particle
+    ///     copies the glow it was born on, faint where it is faint and strong
+    ///     where it is strong, and vanishes where the neon drew nothing. That
+    ///     buffer holds the glow around the line, not the line (the neon's
+    ///     edge ring draws it), so a particle is dimmer than the line on
+    ///     screen, and a line with no glow round it
+    ///     (@c NeonConfig::glowRadius near 0) leaves it nothing to copy. At
+    ///     every @c NeonConfig::resolutionScale.
+    ///   - otherwise (neon off, @c DebugConfig::opaqueOnly, no source
+    ///     attached), the hue-rotated @c NeonConfig::colorStops ring.
+    typedef struct ParticleConfig
+    {
+        /// Enable or disable the particle renderer. Off stops it outright:
+        /// every mote is cleared at once and the layer gives back its ring,
+        /// colour latch and scratch memory, so switching it on again starts
+        /// from nothing, exactly as the first time.
+        bool enable = false;
+
+        /// Where the arcs come from - one switch for the whole layer.
+        ///   - true: the neon's. One emitter per @c NeonConfig::arcs entry,
+        ///     emitting from that arc, so an arc animation (Outline Tracer,
+        ///     Arc Wipe, ...) is what moves the emission and a dark neon arc
+        ///     emits nothing. Entry i of @c arcs configures neon arc i; a neon
+        ///     arc past the end of the list takes the LAST entry, so a single
+        ///     entry configures every neon arc alike. @c arcStart and
+        ///     @c arcLength are not read.
+        ///   - false: the layer's own. One emitter per @c arcs entry, each on
+        ///     its own @c arcStart / @c arcLength, whatever the neon's arcs
+        ///     are doing.
+        bool useNeonArc = true;
+
+        /// One entry per arc - see @c useNeonArc for how they pair up. Empty
+        /// emits nothing either way.
+        std::vector<ParticleArcConfig> arcs = {ParticleArcConfig{}};
+
+        /// Ceiling on the emitter count, whichever way the arcs come; entries
+        /// and neon arcs past it are ignored rather than rejected.
+        static constexpr int MAX_ARCS_CAP = MAX_ARCS;
+
+        bool operator==(const ParticleConfig &o) const
+        {
+            return enable == o.enable &&
+                   useNeonArc == o.useNeonArc &&
+                   arcs == o.arcs;
+        }
+        bool operator!=(const ParticleConfig &o) const { return !(*this == o); }
+    } ParticleConfig;
+
     /// Top-level configuration for the EdgeLightingEffect pipeline.
     ///
     /// Holds one sub-config per renderer. Renderers are independent - enable
@@ -1407,6 +1636,7 @@ namespace EdgeLighting
         DropletsConfig droplets;   ///< Rain-on-glass droplets settings
         LensFlareConfig lensFlare; ///< Sun + lens flare (rays, chromatic ghosts)
         SpotlightConfig spotlight; ///< Freely placed and aimed cones of light
+        ParticleConfig particle;   ///< Point-sprite sparks / motes, from the neon's arcs or the layer's own
 
         bool operator==(const Config &o) const
         {
@@ -1415,7 +1645,8 @@ namespace EdgeLighting
                    debug == o.debug &&
                    droplets == o.droplets &&
                    lensFlare == o.lensFlare &&
-                   spotlight == o.spotlight;
+                   spotlight == o.spotlight &&
+                   particle == o.particle;
         }
         bool operator!=(const Config &o) const { return !(*this == o); }
     } Config;

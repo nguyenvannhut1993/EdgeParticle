@@ -474,6 +474,15 @@ extern "C"
      *           18 / 53 / 93 levels off at 0.5 / 0.25 / 0.125. Keep small rects
      *           at 1.0.
      *
+     *           At 1.0, with no segments and colour stops whose alpha a
+     *           rotating hue cannot move, the layer bakes the glow's
+     *           hue-invariant field once the config holds and only composites
+     *           the hue after that: there 1.0 is the CHEAPEST scale on still
+     *           frames and with the hue rotating, and a reduced scale pays
+     *           only on frames whose config animates, with segments, or for a
+     *           very small rect. The field costs ~3.3 MB at 1920 x 1080 for a
+     *           960 x 540 rect.
+     *
      *           Each path compiles its own shaders the first frame it renders,
      *           so the first frame after switching to or from 1.0 pays a
      *           one-time compile. Below 1.0 the layer holds an RGBA8 buffer
@@ -657,15 +666,6 @@ extern "C"
     EL_API el_result_e el_effect_set_spotlight_casts_shadow(el_effect_handle_t effect, int32_t index, el_bool_t castsShadow);
     EL_API el_result_e el_effect_get_spotlight_casts_shadow(el_effect_handle_t effect, int32_t index, el_bool_t *outCastsShadow);
 
-    /** @brief How far lamp @p index stands off the wall, in px. Default 150.
-     *  @details Read by the shadow ONLY - the cone is drawn on the wall
-     *           whatever this holds. With t = caster distance / this, the
-     *           shadow is the caster scaled by 1 / (1 - t) about the lamp and
-     *           its penumbra is 2 * apertureWidth * t / (1 - t) px wide. A lamp
-     *           no further off the wall than the caster casts nothing. */
-    EL_API el_result_e el_effect_set_spotlight_wall_distance(el_effect_handle_t effect, int32_t index, float wallDistance);
-    EL_API el_result_e el_effect_get_spotlight_wall_distance(el_effect_handle_t effect, int32_t index, float *outWallDistance);
-
     /** @brief Drop every lamp. Any index-bound animation becomes a no-op until
      *         the list is re-created via @ref el_effect_set_spotlight_count. */
     EL_API el_result_e el_effect_clear_spotlights(el_effect_handle_t effect);
@@ -766,9 +766,14 @@ extern "C"
                                                            float *outCornerRadius);
 
     /** @brief How far the caster's face stands off the wall, in px. Default 0
-     *         (flush - no visible shadow). See
-     *         @ref el_effect_set_spotlight_wall_distance for how it combines
-     *         with each lamp's own distance. */
+     *         (flush - no visible shadow). The shadow's ONE distance.
+     *  @details Measured against lamps 150 px off the wall, the same for
+     *           every lamp: with t = this / 150 the shadow is the caster
+     *           scaled by 1 / (1 - t) about each casting lamp and its
+     *           penumbra 2 * apertureWidth * t / (1 - t) px wide, so a larger
+     *           value throws it further and softer. Near 150 a panel's
+     *           shadow grows out of view (at or past it, none); a solid
+     *           caster's that deep never ends. */
     EL_API el_result_e el_effect_set_spotlight_shadow_distance(el_effect_handle_t effect, float wallDistance);
     EL_API el_result_e el_effect_get_spotlight_shadow_distance(el_effect_handle_t effect, float *outWallDistance);
 
@@ -795,13 +800,34 @@ extern "C"
     EL_API el_result_e el_effect_set_spotlight_shadow_fill(el_effect_handle_t effect, float fill);
     EL_API el_result_e el_effect_get_spotlight_shadow_fill(el_effect_handle_t effect, float *outFill);
 
+    /** @brief How far the shadow darkens what is behind the layer, in [0, 1].
+     *         Default 0 (light only: the shadow is the lamp's light taken
+     *         away, so over a bright backdrop it all but disappears and its
+     *         umbra writes alpha 0).
+     *  @details Above 0 each casting lamp also darkens the destination inside
+     *           its shadow, before its light: by darkness * (1 - visibility),
+     *           faded out with the lamp's own light, written as premultiplied
+     *           shadow colour OVER the destination - alpha included, so a
+     *           video plane behind the surface darkens too.
+     *  @note  Costs one more pass over the casting lamps' strips while above
+     *         0. */
+    EL_API el_result_e el_effect_set_spotlight_shadow_darkness(el_effect_handle_t effect, float darkness);
+    EL_API el_result_e el_effect_get_spotlight_shadow_darkness(el_effect_handle_t effect, float *outDarkness);
+
+    /** @brief The colour the darkening paints the shadow with, linear RGB in
+     *         [0, 1]. Default black. */
+    EL_API el_result_e el_effect_set_spotlight_shadow_color(el_effect_handle_t effect, float r, float g, float b);
+    EL_API el_result_e el_effect_get_spotlight_shadow_color(el_effect_handle_t effect,
+                                                            float *outR, float *outG, float *outB);
+
     /** @brief Whether the caster is a SOLID block from the wall out to its
      *         distance (a framed picture) rather than a flat panel floating
      *         that far in front of it. Default off.
-     *  @details A block's shadow is attached to it, and a lamp no further from
-     *           the wall than the block is deep throws a shadow that never ends
-     *           - the light stops at the frame. Costs a short search per
-     *           fragment of each casting lamp. See
+     *  @details A block's shadow is attached to it, and a block at least
+     *           150 px deep - as deep as the lamps are far from the wall -
+     *           throws a shadow that never ends: the light stops at the
+     *           frame. Costs a short search per fragment of each casting
+     *           lamp. See
      *           docs/spotlight-solid-frame-plan.md. */
     EL_API el_result_e el_effect_set_spotlight_shadow_solid(el_effect_handle_t effect, el_bool_t solid);
     EL_API el_result_e el_effect_get_spotlight_shadow_solid(el_effect_handle_t effect, el_bool_t *outSolid);
@@ -821,7 +847,8 @@ extern "C"
     /** @brief Fraction of the viewport the lamps render at before being
      *         bilinear-blitted back. 1.0 (default) draws direct - no offscreen
      *         buffer, no blit. Clamped to [0.125, 1.0] at draw time.
-     *  @note  Lossless in shape: not one uniform differs between the paths.
+     *  @note  Lossless in shape: the same falloff, shaded into a half-float
+     *         buffer and dithered at full resolution by the blit.
      *         But unlike the neon and flare scales this one is NOT
      *         automatically a saving - this layer already bounds its geometry
      *         to what the lamps light, so the blit's full viewport of
@@ -1095,7 +1122,7 @@ extern "C"
      *  @details Convenience wrapper for @ref el_effect_init_with_renderers with
      *           @ref EL_RENDERER_ALL - registers the full stack in the default
      *           order, bottom first: neon, droplets, lens flare, spotlight,
-     *           debug.
+     *           particles, debug.
      *  @returns @ref EL_ERROR_INIT_FAILED if a renderer fails to initialise
      *           (usually a shader compile / link error - see native log). */
     EL_API el_result_e el_effect_init(el_effect_handle_t effect);
@@ -1109,7 +1136,8 @@ extern "C"
      *                      stack.
      *  @details The mask decides which layers are registered, not their order:
      *           they go in the default order (neon, droplets, lens flare,
-     *           spotlight, debug - bottom first) whatever bits are combined.
+     *           spotlight, particles, debug - bottom first) whatever bits are
+     *           combined.
      *           To choose the order, use @ref el_effect_init_with_renderer_order
      *           instead, or reorder afterwards with
      *           @ref el_effect_set_renderer_order. An omitted

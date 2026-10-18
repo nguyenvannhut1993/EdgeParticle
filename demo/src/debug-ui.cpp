@@ -4,6 +4,7 @@
 #include "core/config.h"
 #include "core/edge-lighting.h"
 #include "renderer/neon-tuning.h"
+#include "renderer/particle-renderer.h"
 #include "ui-controls.h"
 #include "util/log-util.h"
 
@@ -21,6 +22,9 @@
 namespace
 {
     /// Upper bound the debug UI enforces on colour-stop lists.
+    /// ShadowCaster::darkness the Picture Light / Solid Frame presets set, so
+    /// their shadow keeps its depth over a bright backdrop too.
+    constexpr float PRESET_SHADOW_DARKNESS = 0.6f;
     constexpr int MAX_COLOR_STOPS = 128;
     /// Max value for the neon "LUT Size" slider. Matches the LUT
     /// width baked by NeonRenderer (256), which is more than enough for any
@@ -388,6 +392,10 @@ namespace
         {
             return "Spotlight";
         }
+        case EdgeLighting::RendererLayer::PARTICLES:
+        {
+            return "Particles";
+        }
         case EdgeLighting::RendererLayer::DEBUG:
         {
             return "Debug overlays";
@@ -708,6 +716,7 @@ void DebugUI::Build(EdgeLighting::Config &cfg, EdgeLighting::EdgeLightingEffect 
     buildDropletsSection(cfg);
     buildLensFlareSection(cfg);
     buildSpotlightSection(cfg);
+    buildParticleSection(cfg);
     buildColorPickerSection(cfg);
     buildAnimationSection(cfg, effect.GetAnimationManager());
     buildBackgroundSection();
@@ -911,19 +920,19 @@ void DebugUI::buildNeonSection(EdgeLighting::Config &cfg,
 
     // --- Performance ------------------------------------------------------
     // Was its own "Optimized Neon" section back when the half-res path was a
-    // second renderer. It is one renderer now, so these are just knobs on it:
-    // Res Scale 1.0 is the full-resolution path (no offscreen buffer, no
-    // blit), anything lower renders scaled and composites back.
+    // second renderer. It is one renderer, one path, so these are just knobs
+    // on it: Res Scale is the size of the buffer the glow is shaded into
+    // before it is composited back (1.0 = full size; the default is 0.5).
     if (ImGui::TreeNodeEx("Performance##Neon", ImGuiTreeNodeFlags_DefaultOpen))
     {
         SliderWithInput("Res Scale##Neon", cfg.neon.resolutionScale, 0.125f, 1.0f, "%.3f");
         if (ImGui::IsItemHovered())
         {
-            ImGui::SetTooltip("1.0 draws straight onto the target at full resolution.\n"
-                              "Below that the glow renders into a scaled buffer and is\n"
+            ImGui::SetTooltip("The glow renders into a buffer this fraction of the\n"
+                              "frame (1.0 = full size, default 0.5) and is\n"
                               "bilinear-blitted back, with a thin ring around the edge\n"
                               "re-shaded at full resolution - the line stays sharp.\n"
-                              "Not always cheaper: a tight cutoff band can get slower.");
+                              "Pays mostly on frames whose config animates.");
         }
         SliderIntWithInput("Samples##Neon", cfg.neon.numSamples, 8, NEON_MAX_LOOP_SAMPLES);
         SliderIntWithInput("LUT Size##Neon", cfg.neon.gradientLutSize, 32, MAX_GRADIENT_LUT_SIZE);
@@ -1336,11 +1345,18 @@ void DebugUI::buildSpotlightSection(EdgeLighting::Config &cfg)
         SliderWithInput("Width##SpotShadow", caster.width, 0.0f, 2400.0f, "%.0f px");
         SliderWithInput("Height##SpotShadow", caster.height, 0.0f, 1600.0f, "%.0f px");
         SliderWithInput("Corner Radius##SpotShadow", caster.cornerRadius, 0.0f, 400.0f, "%.0f px");
-        // How far the picture stands off the wall. Against each lamp's own
-        // Wall Distance this sets how far the shadow is thrown and how soft
-        // its edge is: the shadow is the picture scaled by
-        // lamp / (lamp - caster) about the lamp.
+        // How far the picture stands off the wall - the shadow's one
+        // distance. Every lamp is taken to stand 150 px off the wall
+        // (SPOT_LAMP_WALL_DISTANCE), so this sets how far the shadow is
+        // thrown and how soft its edge is: the picture scaled by
+        // 150 / (150 - this) about the lamp.
         SliderWithInput("Wall Distance##SpotShadow", caster.wallDistance, 0.0f, 200.0f, "%.0f px");
+        if (ImGui::IsItemHovered())
+        {
+            ImGui::SetTooltip("How far the picture stands off the wall, against lamps 150 px out.\n"
+                              "Larger throws a longer, softer shadow. Near 150 a panel's shadow\n"
+                              "grows out of view; a solid caster's that deep never ends.");
+        }
         SliderWithInput("Softness##SpotShadow", caster.softness, 0.0f, 40.0f, "%.1f px");
         SliderWithInput("Opacity##SpotShadow", caster.opacity, 0.0f, 1.0f, "%.2f");
         // 0 is physical: a second lamp only adds its own light inside the
@@ -1354,6 +1370,18 @@ void DebugUI::buildSpotlightSection(EdgeLighting::Config &cfg)
                               "1 = gone wherever the others give half the shadowed lamp's light.\n"
                               "Above 0 the layer draws twice.");
         }
+        // Light only at 0: the shadow is the lamp's light taken away, so over
+        // a bright backdrop it all but disappears. Above 0 it also darkens
+        // what is behind the layer - one more pass.
+        SliderWithInput("Darkness##SpotShadow", caster.darkness, 0.0f, 1.0f, "%.2f");
+        if (ImGui::IsItemHovered())
+        {
+            ImGui::SetTooltip("How far the shadow darkens what is behind the layer.\n"
+                              "0 = light only (over a bright backdrop the shadow all but vanishes).\n"
+                              "Above 0 the shadow keeps its depth on any backdrop, and its alpha\n"
+                              "darkens a surface composited over video.");
+        }
+        ImGui::ColorEdit3("Shadow Color##SpotShadow", &caster.color.x, ImGuiColorEditFlags_NoInputs);
 
         // A solid block (a framed picture standing out from the wall) rather
         // than a flat panel floating in front of it. See
@@ -1362,8 +1390,8 @@ void DebugUI::buildSpotlightSection(EdgeLighting::Config &cfg)
         if (ImGui::IsItemHovered())
         {
             ImGui::SetTooltip("The caster fills everything from the wall to its Wall Distance.\n"
-                              "Its shadow is attached to it, and a lamp no further from the\n"
-                              "wall than it is deep throws a shadow that never ends.");
+                              "Its shadow is attached to it, and at 150 px or deeper (as far\n"
+                              "out as the lamps) its shadow never ends.");
         }
         // The frame's rails, and how far the picture sits behind them: with
         // both above 0 the top rail shades the top of the picture.
@@ -1383,13 +1411,14 @@ void DebugUI::buildSpotlightSection(EdgeLighting::Config &cfg)
         // A downlight over the rect throwing its shadow, after the reference
         // photo this feature was built against: the caster matched to the
         // rect, one warm lamp a rect-height above it, the lamp about five and a
-        // half times further off the wall than the picture. Replaces the lamp
+        // half times further off the wall than the picture (27.2 of the
+        // lamps' 150 px - the 29 of 160 it was tuned at). Replaces the lamp
         // list - it is a starting point, not an addition to a rig.
         //
         // "Solid Frame" is the same rig with the caster made a solid framed
         // picture: rails 4% of the shorter side, the picture 10 px behind
-        // them. Lower the lamp's Wall Distance under the caster's to see the
-        // light stop at the frame.
+        // them (9.4 px, the 10 of 160 it was tuned at). Raise Wall Distance to
+        // 150 or more to see the light stop at the frame.
         const bool pictureLight = ImGui::SmallButton("Picture Light##SpotShadow");
         ImGui::SameLine();
         const bool solidFrame = ImGui::SmallButton("Solid Frame##SpotShadow");
@@ -1400,13 +1429,15 @@ void DebugUI::buildSpotlightSection(EdgeLighting::Config &cfg)
             caster.width = g.width;
             caster.height = g.height;
             caster.cornerRadius = g.cornerRadius;
-            caster.wallDistance = 29.0f;
+            caster.wallDistance = 27.1875f;
             caster.softness = 6.0f;
             caster.opacity = 1.0f;
             caster.fill = 0.0f;
+            caster.darkness = PRESET_SHADOW_DARKNESS;
+            caster.color = glm::vec3(0.0f);
             caster.solid = solidFrame;
             caster.frameWidth = solidFrame ? 0.04f * std::min(g.width, g.height) : 0.0f;
-            caster.frameDepth = solidFrame ? 10.0f : 0.0f;
+            caster.frameDepth = solidFrame ? 9.375f : 0.0f;
 
             EdgeLighting::SpotLight l;
             l.position = glm::vec2(g.position.x + g.width * 0.5f,
@@ -1421,7 +1452,6 @@ void DebugUI::buildSpotlightSection(EdgeLighting::Config &cfg)
             l.bloom = 0.6f;
             l.bloomRadius = 22.0f;
             l.colorTemp = 2900.0f;
-            l.wallDistance = 160.0f;
             l.castsShadow = true;
 
             cfg.spotlight.lamps.clear();
@@ -1429,7 +1459,7 @@ void DebugUI::buildSpotlightSection(EdgeLighting::Config &cfg)
             mSpotlightSelected = 0;
         }
         ImGui::TextDisabled("copy once - it does not follow the rect");
-        ImGui::TextDisabled("Light only: the shadow shows over a dark backdrop.");
+        ImGui::TextDisabled("Darkness 0 is light only: over a bright backdrop raise it.");
         ImGui::TextDisabled("For a picture in the rect: Border Color Picker > Show as backdrop.");
 
         ImGui::Unindent();
@@ -1512,18 +1542,9 @@ void DebugUI::buildSpotlightSection(EdgeLighting::Config &cfg)
 
     ImGui::Checkbox("Clip This Lamp##Spot", &l.clipped);
 
-    // The shadow caster's per-lamp half. Wall Distance is read by the shadow
-    // only - the cone does not change with it - so it sits here with the
-    // switch rather than among the beam controls.
+    // The shadow caster's per-lamp half: the switch alone. How far the
+    // shadow is thrown is the caster's Wall Distance, the same for every lamp.
     ImGui::Checkbox("Cast Shadow##Spot", &l.castsShadow);
-    SliderWithInput("Wall Distance##Spot", l.wallDistance, 1.0f, 1000.0f, "%.0f px");
-    if (ImGui::IsItemHovered())
-    {
-        ImGui::SetTooltip("How far the lamp stands off the wall. Shadow only.\n"
-                          "Closer to the wall (relative to the caster) throws\n"
-                          "a longer, softer shadow. At or under the caster's\n"
-                          "distance the lamp casts nothing.");
-    }
 
     // App coordinates, top-left origin, +y down - the same space as
     // Geometry > Position, which is why the ranges here are viewport-sized
@@ -1591,6 +1612,262 @@ void DebugUI::buildSpotlightSection(EdgeLighting::Config &cfg)
 
     ImGui::TextDisabled("Positions are app coords (0,0 = top-left).");
     ImGui::TextDisabled("Lamps do not follow the rect when it moves.");
+}
+
+void DebugUI::buildParticleSection(EdgeLighting::Config &cfg)
+{
+    if (!ImGui::CollapsingHeader("Particles", ImGuiTreeNodeFlags_DefaultOpen))
+    {
+        return;
+    }
+
+    auto &pc = cfg.particle;
+    ImGui::Checkbox("Enable##Particle", &pc.enable);
+    if (ImGui::IsItemHovered())
+    {
+        ImGui::SetTooltip("Off clears every particle and frees the layer's memory;\n"
+                          "on starts again from nothing.");
+    }
+    // Live count against the ring - one block of MAX_PARTICLES_CAP slots per
+    // arc. Each arc clamps its own spawn RATE to its Max Alive / Lifetime, so
+    // a thinning trail is the clamp at work rather than a full block. Reads
+    // 0 / 0 while the layer is off: it holds no ring then.
+    if (mParticleManager)
+    {
+        ImGui::SameLine();
+        ImGui::Text("alive %zu / %zu", mParticleManager->GetParticleCount(),
+                    mParticleManager->GetCapacity());
+    }
+    if (!pc.enable)
+    {
+        return;
+    }
+
+    // --- Where the arcs come from: ONE switch for the whole layer. ---
+    ImGui::Checkbox("Use Neon Arcs##Particle", &pc.useNeonArc);
+    if (ImGui::IsItemHovered())
+    {
+        ImGui::SetTooltip("On: one emitter per Neon > Arcs entry, moving with it.\n"
+                          "Off: one emitter per arc below, each at its own Start / Length.");
+    }
+
+    auto &arcs = pc.arcs;
+    const int maxArcs = EdgeLighting::ParticleConfig::MAX_ARCS_CAP;
+    int listed = 0; // arcs shown - and editable - below
+    if (pc.useNeonArc)
+    {
+        // One entry per neon arc, so each has settings of its own to edit.
+        // The library already gives a neon arc past the end of the list the
+        // LAST entry's settings, so growing the list with copies of that entry
+        // changes nothing on screen - it only makes them editable one by one.
+        listed = std::min(static_cast<int>(cfg.neon.arcs.size()), maxArcs);
+        if (static_cast<int>(arcs.size()) < listed)
+        {
+            const EdgeLighting::ParticleArcConfig last =
+                arcs.empty() ? EdgeLighting::ParticleArcConfig{} : arcs.back();
+            arcs.resize(static_cast<size_t>(listed), last);
+        }
+        ImGui::TextDisabled("%d arc(s) - one per Neon > Arcs entry", listed);
+    }
+    else
+    {
+        ImGui::Text("%d / %d arcs", static_cast<int>(arcs.size()), maxArcs);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("+ Add##Particle") && static_cast<int>(arcs.size()) < maxArcs)
+        {
+            // A copy of the arc being edited, moved on past its end so the
+            // two do not start out on top of each other.
+            EdgeLighting::ParticleArcConfig added;
+            if (!arcs.empty())
+            {
+                const int from = std::clamp(mParticleSelected, 0, static_cast<int>(arcs.size()) - 1);
+                added = arcs[static_cast<size_t>(from)];
+                added.arcStart = std::fmod(added.arcStart + added.arcLength, 1.0f);
+            }
+            arcs.push_back(added);
+            mParticleSelected = static_cast<int>(arcs.size()) - 1;
+        }
+        listed = std::min(static_cast<int>(arcs.size()), maxArcs);
+    }
+
+    if (listed == 0)
+    {
+        ImGui::TextDisabled(pc.useNeonArc ? "No neon arcs. Add one under Neon > Arcs."
+                                          : "No arcs. Add one to emit.");
+        return;
+    }
+    mParticleSelected = std::clamp(mParticleSelected, 0, listed - 1);
+
+    // Order matches EdgeLighting::ParticleMode.
+    const char *modeItems[] = {"Movement (trail)", "Head Sparks"};
+
+    // Arc picker: one row each, so the arc an entry drives - neon arc i, or
+    // the i-th own arc - is always visible.
+    for (int i = 0; i < listed; i++)
+    {
+        const auto &a = arcs[static_cast<size_t>(i)];
+        char label[64];
+        std::snprintf(label, sizeof(label), "arc %d  %s%s##ParticlePick%d", i,
+                      modeItems[static_cast<int>(a.mode)], a.enable ? "" : "  (off)", i);
+        if (ImGui::RadioButton(label, mParticleSelected == i))
+        {
+            mParticleSelected = i;
+        }
+        // Own arcs only: with neon arcs the list follows Neon > Arcs.
+        if (!pc.useNeonArc)
+        {
+            ImGui::SameLine();
+            char killLabel[32];
+            std::snprintf(killLabel, sizeof(killLabel), "x##ParticleKill%d", i);
+            if (ImGui::SmallButton(killLabel))
+            {
+                arcs.erase(arcs.begin() + i);
+                mParticleSelected = std::max(0, std::min(mParticleSelected, static_cast<int>(arcs.size()) - 1));
+                return;
+            }
+        }
+    }
+
+    EdgeLighting::ParticleArcConfig &p = arcs[static_cast<size_t>(mParticleSelected)];
+
+    ImGui::Separator();
+    ImGui::Checkbox("Arc Enabled##Particle", &p.enable);
+    if (ImGui::IsItemHovered())
+    {
+        ImGui::SetTooltip("Off clears this arc's particles at once;\n"
+                          "on starts its emitter again from nothing.");
+    }
+    if (!pc.useNeonArc)
+    {
+        // Perimeter space, as in Neon > Arcs: 0 is the rect's top-left corner.
+        SliderWithInput("Arc Start##Particle", p.arcStart, 0.0f, 1.0f, "%.3f");
+        SliderWithInput("Arc Length##Particle", p.arcLength, 0.0f, 1.0f, "%.3f");
+    }
+
+    ImGui::Checkbox("Custom Colour##Particle", &p.useCustomColor);
+    if (p.useCustomColor)
+    {
+        ImGui::SameLine();
+        ImGui::ColorEdit4("##ParticleCustomColour", &p.customColor.x,
+                          ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_AlphaBar);
+    }
+    else if (mParticleManager)
+    {
+        // Where this arc's newborns took the neon's colour from last frame.
+        // It moves with settings that live in OTHER sections - the drawn glow
+        // needs the neon drawing (not off, not Debug > Opaque only) - so it is
+        // worth seeing here.
+        switch (mParticleManager->GetColorSource())
+        {
+        case EdgeLighting::ParticleColorSource::NEON_OUTPUT:
+        {
+            ImGui::TextDisabled(pc.useNeonArc ? "Colour: neon as drawn (latched at spawn)"
+                                              : "Colour: neon as drawn (latched at spawn) -\n"
+                                                "invisible where the neon draws nothing");
+            break;
+        }
+        case EdgeLighting::ParticleColorSource::COLOR_RING:
+        {
+            ImGui::TextDisabled("Colour: CPU colour ring - no drawn glow to copy\n"
+                                "(needs Neon on and not Debug > Opaque only)");
+            break;
+        }
+        }
+    }
+
+    int modeIdx = static_cast<int>(p.mode);
+    if (ImGui::Combo("Mode##Particle", &modeIdx, modeItems, IM_ARRAYSIZE(modeItems)))
+    {
+        p.mode = static_cast<EdgeLighting::ParticleMode>(modeIdx);
+    }
+    const EdgeLighting::ParticleMode mode = p.mode;
+
+    // HEAD_SPARKS spawns from one point, so its emissionRate is a plain rate;
+    // MOVEMENT reads it as a density along the arc.
+    if (mode == EdgeLighting::ParticleMode::HEAD_SPARKS)
+    {
+        SliderWithInput("Rate##Particle", p.emissionRate, 0.0f, 1000.0f, "%.0f sparks/s");
+        if (ImGui::IsItemHovered())
+        {
+            ImGui::SetTooltip("Sparks/s, clamped to Max Alive / Lifetime");
+        }
+    }
+    else
+    {
+        SliderWithInput("Density##Particle", p.emissionRate, 0.0f, 200.0f, "%.1f");
+        if (ImGui::IsItemHovered())
+        {
+            ImGui::SetTooltip("Motes/s = arc length (px) x 2 x Density / 100,\n"
+                              "clamped to Max Alive / Lifetime");
+        }
+    }
+    SliderWithInput("Lifetime##Particle", p.lifetime, 0.05f, 3.0f, "%.2f s");
+    // Speed means something different per mode - see ParticleArcConfig::speed.
+    switch (mode)
+    {
+    case EdgeLighting::ParticleMode::MOVEMENT:
+    {
+        SliderWithInput("Drift##Particle", p.speed, 0.0f, 400.0f, "%.0f");
+        break;
+    }
+    case EdgeLighting::ParticleMode::HEAD_SPARKS:
+    {
+        SliderWithInput("Speed##Particle", p.speed, 0.0f, 400.0f, "%.0f px/s");
+        break;
+    }
+    }
+    SliderWithInput("Drag##Particle", p.drag, 0.0f, 10.0f);
+    SliderWithInput("Size##Particle", p.sizeStart, 1.0f, 30.0f, "%.1f px");
+    SliderIntWithInput("Max Alive##Particle", p.maxParticles, 32,
+                       EdgeLighting::ParticleArcConfig::MAX_PARTICLES_CAP);
+    SliderWithInput("Scatter Radius##Particle", p.scatterRadius, 0.0f, 40.0f, "%.1f px");
+
+    // The knobs only one mode reads.
+    switch (mode)
+    {
+    case EdgeLighting::ParticleMode::MOVEMENT:
+    {
+        SliderWithInput("Head Bias##Particle", p.headBias, 0.05f, 4.0f);
+        SliderWithInput("Tail Size##Particle", p.tailSizeFraction, 0.0f, 1.0f);
+        break;
+    }
+    case EdgeLighting::ParticleMode::HEAD_SPARKS:
+    {
+        SliderWithInput("Spread##Particle", p.spreadDeg, 0.0f, 360.0f, "%.0f deg");
+        SliderWithInput("Outward Bias##Particle", p.outwardBias, 0.0f, 1.0f);
+        if (ImGui::IsItemHovered())
+        {
+            ImGui::SetTooltip("0 = along the sweep, 1 = straight out of the rect");
+        }
+        break;
+    }
+    }
+
+    if (listed > 1)
+    {
+        if (ImGui::SmallButton("Copy To Every Arc##Particle"))
+        {
+            // Everything but WHERE: each own arc keeps its Start / Length.
+            const EdgeLighting::ParticleArcConfig source = p;
+            for (auto &a : arcs)
+            {
+                const float start = a.arcStart;
+                const float length = a.arcLength;
+                a = source;
+                a.arcStart = start;
+                a.arcLength = length;
+            }
+        }
+        if (ImGui::IsItemHovered())
+        {
+            ImGui::SetTooltip("This arc's settings onto every other arc, all but Start / Length");
+        }
+    }
+
+    ImGui::TextDisabled(pc.useNeonArc ? "A static neon arc keeps its emission in place -\n"
+                                        "add an Outline Tracer or Arc Wipe to move it."
+                                      : "Own arcs stay where Start / Length put them;\n"
+                                        "they do not follow the neon's arcs.");
 }
 
 void DebugUI::buildAnimationSection(EdgeLighting::Config &cfg,

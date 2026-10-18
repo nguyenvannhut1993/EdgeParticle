@@ -1,5 +1,25 @@
 # Spotlight solid frame - plan
 
+> **Ported into this tree on 2026-10-16** from `Shadow_Source/`, the older copy
+> of the repository this was built in. The measurements in sections 8 and 9 were
+> taken on that tree, and the port renders byte-identically to it (16 shadow
+> scenes; see `progress-log.md`, 2026-10-16). The code was regrouped on the
+> way in, not changed: the shader's shadow is one THE SHADOW section of
+> `spotlight.frag`, entered from `main()` through one call, `spotShadowCover`
+> (the `SPOT_FILL` lift included), and the CPU side is one THE SHADOW CASTER
+> block plus one method group of `SpotlightRenderer`. Where this document
+> names a line that has since moved, section 4.7 of
+> [`spotlight-renderer.md`](spotlight-renderer.md) - "Where the code lives" -
+> is current.
+
+> **Changed since, the same day:** lamps no longer carry a `wallDistance` of
+> their own - every lamp stands `SPOT_LAMP_WALL_DISTANCE` (150) px off the wall,
+> since only the distances' ratios reach the picture - and
+> `ShadowCaster::darkness` / `color` darken the backdrop under a shadow, the
+> answer to the light-only limitation recorded here. Mentions below of
+> `SpotLight::wallDistance` or of lowering a lamp record the tree this was
+> written on; section 4.7 of `spotlight-renderer.md` is current.
+
 A spotlight shining down onto a picture in a wooden frame. The frame is a solid
 block with real area and depth: light cannot pass through it, it lights only
 the parts of the frame the beam reaches, and what lies behind the frame (seen

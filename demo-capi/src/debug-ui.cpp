@@ -12,6 +12,9 @@
 
 namespace
 {
+    /// ShadowCaster::darkness the Picture Light / Solid Frame presets set, so
+    /// their shadow keeps its depth over a bright backdrop too.
+    constexpr float PRESET_SHADOW_DARKNESS = 0.6f;
     constexpr int MAX_COLOR_STOPS = 128;
     constexpr int MAX_SEGMENT_BOOSTS = 8;
     constexpr int MAX_ARCS = 8;
@@ -521,6 +524,10 @@ namespace
         {
             return "Spotlight";
         }
+        case EL_RENDERER_PARTICLES:
+        {
+            return "Particles";
+        }
         case EL_RENDERER_DEBUG:
         {
             return "Debug overlays";
@@ -814,8 +821,8 @@ void DebugUI::buildNeonSection(el_effect_handle_t effect)
     // --- Performance ------------------------------------------------------
     // These reach the one neon layer through the el_effect_*_optimized_*
     // entry points, which are deprecated in name only - the half-res path is
-    // a resolution scale on this renderer now, not a second one. Res Scale 1.0
-    // is the full-resolution path.
+    // a resolution scale on this renderer now, not a second one. Res Scale is
+    // the size of the buffer the glow is shaded into (1.0 = full size).
     if (ImGui::TreeNodeEx("Performance##Neon", ImGuiTreeNodeFlags_DefaultOpen))
     {
         float scale = 0.0f;
@@ -1186,9 +1193,9 @@ void DebugUI::buildSpotlightSection(el_effect_handle_t effect)
             el_effect_set_spotlight_shadow_rect(effect, sw, sh, sx, sy, sr);
         }
 
-        // How far the picture stands off the wall. Against each lamp's own
-        // Wall Distance this sets how far the shadow is thrown and how soft
-        // its edge is.
+        // How far the picture stands off the wall - the shadow's one
+        // distance, against lamps 150 px out: it sets how far the shadow is
+        // thrown and how soft its edge is.
         float casterDistance = 0.0f;
         el_effect_get_spotlight_shadow_distance(effect, &casterDistance);
         if (ImGui::SliderFloat("Wall Distance##SpotShadow", &casterDistance, 0.0f, 200.0f, "%.0f px"))
@@ -1214,6 +1221,20 @@ void DebugUI::buildSpotlightSection(el_effect_handle_t effect)
         if (ImGui::SliderFloat("Fill##SpotShadow", &shadowFill, 0.0f, 1.0f, "%.2f"))
         {
             el_effect_set_spotlight_shadow_fill(effect, shadowFill);
+        }
+        // Light only at 0; above it the shadow darkens what is behind the
+        // layer too, so it keeps its depth over a bright backdrop.
+        float shadowDarkness = 0.0f;
+        el_effect_get_spotlight_shadow_darkness(effect, &shadowDarkness);
+        if (ImGui::SliderFloat("Darkness##SpotShadow", &shadowDarkness, 0.0f, 1.0f, "%.2f"))
+        {
+            el_effect_set_spotlight_shadow_darkness(effect, shadowDarkness);
+        }
+        float shadowColor[3] = {0.0f, 0.0f, 0.0f};
+        el_effect_get_spotlight_shadow_color(effect, &shadowColor[0], &shadowColor[1], &shadowColor[2]);
+        if (ImGui::ColorEdit3("Shadow Color##SpotShadow", shadowColor, ImGuiColorEditFlags_NoInputs))
+        {
+            el_effect_set_spotlight_shadow_color(effect, shadowColor[0], shadowColor[1], shadowColor[2]);
         }
 
         // A solid block rather than a floating panel, and its frame: see
@@ -1255,14 +1276,16 @@ void DebugUI::buildSpotlightSection(el_effect_handle_t effect)
             float rw = 0.0f, rh = 0.0f, rx = 0.0f, ry = 0.0f, radius = 0.0f;
             el_effect_get_geometry(effect, &rw, &rh, &rx, &ry, &radius);
             el_effect_set_spotlight_shadow_rect(effect, rw, rh, rx, ry, radius);
-            el_effect_set_spotlight_shadow_distance(effect, 29.0f);
+            el_effect_set_spotlight_shadow_distance(effect, 27.1875f);
             el_effect_set_spotlight_shadow_softness(effect, 6.0f);
             el_effect_set_spotlight_shadow_opacity(effect, 1.0f);
             el_effect_set_spotlight_shadow_fill(effect, 0.0f);
+            el_effect_set_spotlight_shadow_darkness(effect, PRESET_SHADOW_DARKNESS);
+            el_effect_set_spotlight_shadow_color(effect, 0.0f, 0.0f, 0.0f);
             el_effect_set_spotlight_shadow_solid(effect, solidFrame ? 1 : 0);
             const float shorter = rw < rh ? rw : rh;
             el_effect_set_spotlight_shadow_frame(effect, solidFrame ? 0.04f * shorter : 0.0f,
-                                                 solidFrame ? 10.0f : 0.0f);
+                                                 solidFrame ? 9.375f : 0.0f);
 
             el_effect_clear_spotlights(effect);
             el_effect_set_spotlight_count(effect, 1);
@@ -1271,13 +1294,12 @@ void DebugUI::buildSpotlightSection(el_effect_handle_t effect)
             el_effect_set_spotlight_beam(effect, 0, 64.0f, 1400.0f, 22.0f, 0.75f);
             el_effect_set_spotlight_spread_falloff(effect, 0, 0.6f);
             el_effect_set_spotlight_look(effect, 0, 4.0f, 0.6f, 22.0f, 2900.0f);
-            el_effect_set_spotlight_wall_distance(effect, 0, 160.0f);
             el_effect_set_spotlight_casts_shadow(effect, 0, 1);
             mSpotlightSelected = 0;
             count = 1;
         }
         ImGui::TextDisabled("copy once - it does not follow the rect");
-        ImGui::TextDisabled("Light only: the shadow shows over a dark backdrop.");
+        ImGui::TextDisabled("Darkness 0 is light only: over a bright backdrop raise it.");
 
         ImGui::Unindent();
     }
@@ -1364,20 +1386,14 @@ void DebugUI::buildSpotlightSection(el_effect_handle_t effect)
         el_effect_set_spotlight_clipped(effect, sel, lampClipEn ? 1 : 0);
     }
 
-    // The shadow caster's per-lamp half. Wall Distance is read by the shadow
-    // only - the cone does not change with it.
+    // The shadow caster's per-lamp half: the switch alone. How far the
+    // shadow is thrown is the caster's Wall Distance, the same for every lamp.
     el_bool_t lampShadowOn = 0;
     el_effect_get_spotlight_casts_shadow(effect, sel, &lampShadowOn);
     bool lampShadowEn = lampShadowOn;
     if (ImGui::Checkbox("Cast Shadow##Spot", &lampShadowEn))
     {
         el_effect_set_spotlight_casts_shadow(effect, sel, lampShadowEn ? 1 : 0);
-    }
-    float lampWallDistance = 150.0f;
-    el_effect_get_spotlight_wall_distance(effect, sel, &lampWallDistance);
-    if (ImGui::SliderFloat("Wall Distance##Spot", &lampWallDistance, 1.0f, 1000.0f, "%.0f px"))
-    {
-        el_effect_set_spotlight_wall_distance(effect, sel, lampWallDistance);
     }
 
     float x = 0.0f, y = 0.0f, angle = 0.0f;

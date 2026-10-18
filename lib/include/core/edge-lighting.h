@@ -130,7 +130,10 @@ namespace EdgeLighting
         /// Takes effect on the next @ref Render. Nothing else depends on the
         /// order: @ref Update and the config notifications reach every renderer
         /// regardless, and no renderer reads another's output except through
-        /// the framebuffer, which is exactly what the order decides.
+        /// the framebuffer, which is exactly what the order decides - with one
+        /// exception, the particles, whose newborns copy the neon's glow from
+        /// its own buffer: moved under the neon, they read the previous
+        /// frame's.
         ///
         /// @returns false (and changes nothing) if @p order is not a
         ///          permutation of the registered renderers.
@@ -154,8 +157,9 @@ namespace EdgeLighting
         static std::shared_ptr<BaseRenderer> CreateRenderer(RendererLayer layer);
 
         /// The default compositing order, bottom first: neon, droplets, lens
-        /// flare, spotlight, debug. The debug overlays go last because they
-        /// annotate the layers under them.
+        /// flare, spotlight, particles, debug. The particles follow the neon
+        /// because newborns copy the glow it drew THIS frame; the debug
+        /// overlays go last because they annotate the layers under them.
         static const std::vector<RendererLayer> &GetDefaultLayerOrder();
 
         /// Whether @p order is a well-formed layer list: every entry a named
@@ -165,6 +169,12 @@ namespace EdgeLighting
 
         /// Creates the renderer for @p layer and registers it through
         /// @ref AddRenderer, with the same initialise-if-late contract.
+        ///
+        /// Also wires the two layers that talk to each other: once both
+        /// @ref RendererLayer::NEON and @ref RendererLayer::PARTICLES are
+        /// registered, in either order, the particles take the neon as their
+        /// colour source (@ref ParticleManager::SetNeonSource). A host that
+        /// registers renderers by pointer wires them itself.
         /// @returns false if @p layer names no renderer, is already
         ///          registered, or failed to initialise.
         bool AddRenderer(RendererLayer layer);
@@ -188,6 +198,10 @@ namespace EdgeLighting
 
     private:
         void refreshActiveConfig();
+        /// Hand the registered particle layer the registered neon as its
+        /// colour source, when both are there. Leaves the source alone with
+        /// no neon registered, so a source a host chose is not cleared.
+        void connectParticleSource();
 
     private:
         Config mBaseConfig;   ///< Authored config - what SetConfig sets.
