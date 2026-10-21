@@ -45,37 +45,6 @@ namespace EdgeLighting
             return false;
         }
 
-        /// @p src with `#define NAME` spliced in after its first line for each
-        /// space-separated NAME in @p defines.
-        ///
-        /// How one shader file yields several programs. Every embedded source
-        /// starts with the @GLSL_VERSION@ line, which must stay first, so the
-        /// defines go immediately after it - ahead of everything else, the
-        /// injected tuning header and shared chunk included. Used for
-        /// neon.frag's field bake, NEON_FIELD_BAKE (see
-        /// NeonRenderer::ensureFieldPrograms), and spotlight.frag's SPOT_FILL
-        /// (SpotlightRenderer::setupShaders).
-        inline std::string WithDefine(const char *src, const char *defines)
-        {
-            std::string lines;
-            const std::string names(defines);
-            size_t start = 0;
-            while (start < names.size())
-            {
-                const size_t end = names.find(' ', start);
-                const std::string name = names.substr(start, end == std::string::npos ? std::string::npos : end - start);
-                if (!name.empty())
-                {
-                    lines += "#define " + name + "\n";
-                }
-                start = (end == std::string::npos) ? names.size() : end + 1;
-            }
-            std::string out(src);
-            const size_t eol = out.find('\n');
-            out.insert(eol == std::string::npos ? out.size() : eol + 1, lines);
-            return out;
-        }
-
         /// Log all available extensions (optionally filtered by substring match).
         /// Pass an empty string to log every extension.
         inline void LogExtensions(const char *filter = "")

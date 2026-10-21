@@ -1,9 +1,12 @@
 #include "renderer/debug-renderer.h"
+#include "core/shared-buffer.h"
+#include "animation/clock.h"
 #include "util/geometry-utils.h"
 #include "shaders.h"
 #include "util/log-util.h"
 #include <glm/gtc/matrix_transform.hpp>
 #include <algorithm>
+#include <cmath>
 
 namespace EdgeLighting
 {
@@ -21,6 +24,17 @@ namespace EdgeLighting
         /// keeps the discs inside the rect on very tall or thin geometries.
         constexpr float MARKER_RADIUS_FRAC = 0.06f;
         constexpr float MARKER_RADIUS_MAX = 12.0f;
+
+        /// The shared-buffer inset's distance from the viewport's bottom-left
+        /// corner, px, and the bounds of its width as a share of the
+        /// viewport's (DebugConfig::sharedBufferInsetSize).
+        constexpr float SHARED_BUFFER_INSET_MARGIN = 16.0f;
+        constexpr float SHARED_BUFFER_INSET_MIN = 0.1f;
+        constexpr float SHARED_BUFFER_INSET_MAX = 1.0f;
+
+        /// The inset's frame: not the bounding box's green, so the two are not
+        /// taken for one another.
+        const glm::vec4 SHARED_BUFFER_FRAME_COLOR(1.0f, 0.8f, 0.2f, 1.0f);
 
         /// Whether the LUT strip will be drawn this frame.
         ///
@@ -68,8 +82,13 @@ namespace EdgeLighting
         return true;
     }
 
-    void DebugRenderer::Update(float deltaTime, float, const Config &config)
+    void DebugRenderer::Update(float deltaTime, double time, const Config &config)
     {
+        // The strip's hue phase, every frame whether or not it is shown: the
+        // neon advances its own the same way, so a rate that moves while the
+        // strip is hidden still leaves the two agreeing when it comes back.
+        mHuePhase.AdvanceCyclePhase(time, config.neon.hueRotationRate);
+
         // Advances this renderer's own copy of the ring cross-fade. It is
         // handed the same deltaTime as the neon renderer's copy and was baked
         // from the same stops, so the two stay in step frame for frame - which
@@ -95,7 +114,7 @@ namespace EdgeLighting
         }
     }
 
-    void DebugRenderer::Render(int viewportWidth, int viewportHeight, float time, const Config &config)
+    void DebugRenderer::Render(int viewportWidth, int viewportHeight, double time, const Config &config)
     {
         if (!config.debug.enable)
         {
@@ -128,7 +147,17 @@ namespace EdgeLighting
         const bool wantMarkers = config.debug.showColorStops && glowVisible &&
                                  !config.neon.colorStops.empty();
         const bool wantBox = config.debug.showWireframe;
-        if (!wantStrip && !wantMarkers && !wantBox)
+        // The shared buffer as the effect hands it to any reader: this frame's,
+        // since the effect runs every layer's offscreen phase before any layer
+        // composites. Not ready while the neon is off or in its fill-only mode,
+        // so no glow test.
+        std::shared_ptr<const SharedBuffer> shared;
+        if (config.debug.showSharedBuffer && GetSharedBufferRegistry())
+        {
+            shared = GetSharedBufferRegistry()->Find(SharedBufferId::NEON);
+        }
+        const bool wantSharedBuffer = shared && shared->IsReady();
+        if (!wantStrip && !wantMarkers && !wantBox && !wantSharedBuffer)
         {
             return;
         }
@@ -172,9 +201,16 @@ namespace EdgeLighting
             glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
             renderColorStopMarkers(proj, center, halfRectW, halfRectH, config);
         }
+        if (wantSharedBuffer)
+        {
+            // Last, over everything: the inset is opaque and overwrites its
+            // corner, and its frame is a 1 px line.
+            glDisable(GL_BLEND);
+            renderSharedBuffer(*shared, proj, viewportWidth, viewportHeight, config);
+        }
 
-        // Restore a known blend state for following renderers (the box and
-        // strip passes disable blending).
+        // Restore a known blend state for following renderers (the box, the
+        // strip and the shared-buffer inset disable blending).
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     }
@@ -248,8 +284,13 @@ namespace EdgeLighting
         mWireframeShader = ShaderProgram(ShaderSource::WIREFRAME_VERT_SRC,
                                          ShaderSource::WIREFRAME_FRAG_SRC,
                                          "DebugRenderer.Wireframe");
+        // The shared-buffer inset reuses the neon vertex shader too: its quad
+        // is placed by uMVP and the fragment reads vPos as inset-local px.
+        mSharedBufferShader = ShaderProgram(ShaderSource::NEON_VERT_SRC,
+                                            ShaderSource::SHARED_BUFFER_DEBUG_FRAG_SRC,
+                                            "DebugRenderer.SharedBuffer");
         return mLUTDebugShader.IsValid() && mStopMarkerShader.IsValid() &&
-               mWireframeShader.IsValid();
+               mWireframeShader.IsValid() && mSharedBufferShader.IsValid();
     }
 
     void DebugRenderer::setupStopMarkerQuad()
@@ -306,7 +347,7 @@ namespace EdgeLighting
         mWireframeVertexArray.SetAttribPointer(0, 2, GL_FLOAT, 2 * sizeof(float), 0);
     }
 
-    void DebugRenderer::renderGradientLUTStrip(const glm::mat4 &mvp, float time, const Config &config)
+    void DebugRenderer::renderGradientLUTStrip(const glm::mat4 &mvp, double time, const Config &config)
     {
         // Overwrites the neon output within the strip rect so the baked ring is
         // readable regardless of the glow's tone-mapped brightness, which is
@@ -314,8 +355,9 @@ namespace EdgeLighting
         mLUTDebugShader.Use();
         mLUTDebugShader.SetUniform("uMVP", mvp);
         mLUTDebugShader.SetUniform("uStripHalfSize", mLUTStripHalfSize);
-        mLUTDebugShader.SetUniform("uTime", time);
-        mLUTDebugShader.SetUniform("uHueRotationRate", config.neon.hueRotationRate);
+        // The same phase the neon integrates the hue rate to (uHuePhase), so
+        // the strip scrolls with the ring it previews.
+        mLUTDebugShader.SetUniform("uHuePhase", mHuePhase.AdvanceCyclePhase(time, config.neon.hueRotationRate));
         mGradientLUT.Bind(0);
         mLUTDebugShader.SetUniform("uGradientLUT", 0);
         mLUTStripVertexArray.DrawArrays(GL_TRIANGLES, 6);
@@ -353,6 +395,44 @@ namespace EdgeLighting
         mWireframeShader.SetUniform("uColor", config.debug.wireframeColor);
         mWireframeVertexArray.DrawArrays(GL_LINE_LOOP, 4);
         mWireframeShader.Unuse();
+    }
+
+    void DebugRenderer::renderSharedBuffer(const SharedBuffer &buffer, const glm::mat4 &proj, int viewportWidth,
+                                           int viewportHeight, const Config &config)
+    {
+        // The inset: the asked-for share of the viewport's width, the
+        // buffer's aspect, then shrunk to fit inside the margins on both axes.
+        // Whole px, so its frame is one crisp pixel.
+        const float texelsW = static_cast<float>(buffer.GetTexels().x);
+        const float texelsH = static_cast<float>(buffer.GetTexels().y);
+        const float share = std::clamp(config.debug.sharedBufferInsetSize, SHARED_BUFFER_INSET_MIN,
+                                       SHARED_BUFFER_INSET_MAX);
+        const float roomW = std::max(static_cast<float>(viewportWidth) - 2.0f * SHARED_BUFFER_INSET_MARGIN, 1.0f);
+        const float roomH = std::max(static_cast<float>(viewportHeight) - 2.0f * SHARED_BUFFER_INSET_MARGIN, 1.0f);
+        float insetW = share * static_cast<float>(viewportWidth);
+        float insetH = insetW * texelsH / texelsW;
+        const float fit = std::min({1.0f, roomW / insetW, roomH / insetH});
+        insetW = std::max(std::floor(insetW * fit), 3.0f);
+        insetH = std::max(std::floor(insetH * fit), 3.0f);
+        // clang-format off
+        const float inset[] = {
+            0.0f,   0.0f,     insetW, 0.0f,     insetW, insetH,
+            0.0f,   0.0f,     insetW, insetH,   0.0f,   insetH,
+        };
+        // clang-format on
+        mSharedBufferInsetVertexArray.SetVertexData(inset, sizeof(inset), GL_DYNAMIC_DRAW);
+        mSharedBufferInsetVertexArray.SetAttribPointer(0, 2, GL_FLOAT, 2 * sizeof(float), 0);
+        const glm::mat4 mvp =
+            proj * glm::translate(glm::mat4(1.0f), glm::vec3(SHARED_BUFFER_INSET_MARGIN, SHARED_BUFFER_INSET_MARGIN, 0.0f));
+
+        mSharedBufferShader.Use();
+        mSharedBufferShader.SetUniform("uMVP", mvp);
+        mSharedBufferShader.SetUniform("uInsetSize", glm::vec2(insetW, insetH));
+        mSharedBufferShader.SetUniform("uFrameColor", SHARED_BUFFER_FRAME_COLOR);
+        buffer.BindTexture(0);
+        mSharedBufferShader.SetUniform("uBuffer", 0);
+        mSharedBufferInsetVertexArray.DrawArrays(GL_TRIANGLES, 6);
+        mSharedBufferShader.Unuse();
     }
 
 } // namespace EdgeLighting
