@@ -148,8 +148,8 @@ Expected as coverage on shaded output, not folded into shading.
 
 `SpotlightConfig.shadowCaster` - a picture standing `wallDistance` px off the
 wall the lamps light, throwing a shadow of every lamp with
-`SpotLight.castsShadow` set. Declared in `core/shadow-caster.h` (included by
-`config.h`). Every casting lamp stands `SPOT_LAMP_WALL_DISTANCE = 150` px off
+`SpotLight.castsShadow` set. Declared in `config.h`, between `SpotLight` and
+`SpotlightConfig`. Every casting lamp stands `SPOT_LAMP_WALL_DISTANCE = 150` px off
 the wall (`spotlight-shadow-tuning.h`); only the ratio `t = wallDistance / 150`
 reaches the picture. Reference: `spotlight-shadow.md`.
 
@@ -167,6 +167,7 @@ reaches the picture. Reference: `spotlight-shadow.md`.
 | `solid` | bool | `false` | - | A block from the wall to `wallDistance`: shadow attached, grazing lamps cast forever. A short fixed search per fragment |
 | `frameWidth` | px | `0` | `[0, min(w,h)/2]` | Rail width; the picture is the rect inset by it |
 | `frameDepth` | px | `0` | `[0, wallDistance]` | Picture recess behind the rails; with `frameWidth` the top rail shades it |
+| `lightOnPicture` | fraction | `1.0` | `[0, 1]` | Casting lamps' light on the picture (the face, rails included). `1` lit like the wall; `0` the picture as drawn, the rails' shadow on it kept as a darkening of strength `mix(1, darkness, lightOnPicture)`. The wall untouched. Applies whatever `wallDistance` and `opacity` are; below `1` over a recessed picture the darkening pass runs even at `darkness` `0` |
 
 No enable flag. The per-lamp opt-in (`SpotLight.castsShadow`) is the only gate.
 

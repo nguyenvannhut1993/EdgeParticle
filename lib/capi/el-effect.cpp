@@ -1914,6 +1914,23 @@ el_result_e el_effect_get_spotlight_shadow_frame(el_effect_handle_t effect,
     return EL_SUCCESS;
 }
 
+el_result_e el_effect_set_spotlight_shadow_light_on_picture(el_effect_handle_t effect, float lightOnPicture)
+{
+    VALIDATE_EFFECT_PTR(effect, "el_effect_set_spotlight_shadow_light_on_picture");
+    REQUIRE_FINITE("el_effect_set_spotlight_shadow_light_on_picture", EL_ERROR_INVALID_PARAMETER, lightOnPicture);
+    SET_AND_LOG(effect->config.spotlight.shadowCaster.lightOnPicture, lightOnPicture,
+                "effect=%p, lightOnPicture=%f", (void *)effect, lightOnPicture);
+}
+
+el_result_e el_effect_get_spotlight_shadow_light_on_picture(el_effect_handle_t effect, float *outLightOnPicture)
+{
+    VALIDATE_EFFECT_PTR(effect, "el_effect_get_spotlight_shadow_light_on_picture");
+    VALIDATE_OUT_PTR(outLightOnPicture, "el_effect_get_spotlight_shadow_light_on_picture");
+    *outLightOnPicture = effect->config.spotlight.shadowCaster.lightOnPicture;
+    LOG_D("effect=%p, lightOnPicture=%f", (void *)effect, *outLightOnPicture);
+    return EL_SUCCESS;
+}
+
 // --- Neon arc colour stops ---
 
 el_result_e el_effect_set_arc_color_stop_count(el_effect_handle_t effect,

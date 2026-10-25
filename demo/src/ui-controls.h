@@ -358,8 +358,9 @@ namespace EdgeLightingDemo
         const char *clipItems[] = {"KEEP_INSIDE", "KEEP_OUTSIDE"};
         size_t drawnLamps = std::min(sp.lamps.size(), static_cast<size_t>(SPOT_MAX_LAMPS));
 
-        // Mirrors SpotlightRenderer's HasMaskedLamp: the lamps that DRAW,
-        // within the ceiling. Either kind holds resolutionScale at 1.0.
+        // Mirrors the library's pin (HasClippedLamp and
+        // SpotlightShadow::PinsResolutionScale): the lamps that DRAW, within
+        // the ceiling. Either kind holds resolutionScale at 1.0.
         bool anyClippedLamp = false;
         bool anyShadowLamp = false;
         for (size_t i = 0; i < drawnLamps; ++i)
@@ -427,6 +428,10 @@ namespace EdgeLightingDemo
                   << ", frame " << std::setprecision(0) << sc.frameWidth << " px wide, picture "
                   << sc.frameDepth << " px behind the rails"
                   << ((sc.frameWidth > 0.0f && sc.frameDepth > 0.0f) ? " (rails shade the picture)" : " (no rail shadow)")
+                  << "\n";
+        std::cout << "                   light on picture " << std::setprecision(2) << sc.lightOnPicture
+                  << (sc.lightOnPicture < 1.0f ? " (casting lamps' light on the picture dimmed; the frame's shadow darkens it)"
+                                               : " (lit like the wall)")
                   << "\n";
         if (!anyShadowLamp)
         {

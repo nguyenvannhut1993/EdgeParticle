@@ -1257,8 +1257,9 @@ void DebugUI::buildSpotlightSection(EdgeLighting::Config &cfg)
         // The library holds the scale at 1.0 while a clipped or shadow-casting
         // lamp is enabled, because a mask edge has to be resolved at full
         // resolution. Say so here, or the slider reads as broken: it moves and
-        // the frame does not change. Mirrors SpotlightRenderer's own
-        // HasMaskedLamp test - the lamps that DRAW, within the ceiling.
+        // the frame does not change. Mirrors the library's pin - the light's
+        // HasClippedLamp and SpotlightShadow::PinsResolutionScale, both in
+        // GetClampedSpotScale - over the lamps that DRAW, within the ceiling.
         size_t drawnLamps = std::min(cfg.spotlight.lamps.size(), size_t(SPOT_MAX_LAMPS));
         bool anyMaskedLamp = false;
         for (size_t i = 0; i < drawnLamps; i++)
@@ -1410,6 +1411,17 @@ void DebugUI::buildSpotlightSection(EdgeLighting::Config &cfg)
         // both above 0 the top rail shades the top of the picture.
         SliderWithInput("Frame Width##SpotShadow", caster.frameWidth, 0.0f, 200.0f, "%.0f px");
         SliderWithInput("Frame Depth##SpotShadow", caster.frameDepth, 0.0f, 100.0f, "%.0f px");
+        // How much of the casting lamps' light the picture takes: the layer
+        // screens its light over the picture, so a bright lamp washes it out.
+        // The frame's shadow on the picture stays, darkening it instead.
+        SliderWithInput("Light On Picture##SpotShadow", caster.lightOnPicture, 0.0f, 1.0f, "%.2f");
+        if (ImGui::IsItemHovered())
+        {
+            ImGui::SetTooltip("How much of the casting lamps' light lands on the picture (the caster's rectangle).\n"
+                              "1 = lit like the wall. Lower it when a bright lamp washes the picture out:\n"
+                              "at 0 the picture shows as drawn, and only the frame's shadow appears on it,\n"
+                              "darkening it (Opacity lightens that shadow, Shadow Color tints it).");
+        }
 
         // Same bridge as the clip's: a one-off copy, not a binding.
         if (ImGui::SmallButton("Match Rect##SpotShadow"))
@@ -1451,6 +1463,7 @@ void DebugUI::buildSpotlightSection(EdgeLighting::Config &cfg)
             caster.solid = solidFrame;
             caster.frameWidth = solidFrame ? 0.04f * std::min(g.width, g.height) : 0.0f;
             caster.frameDepth = solidFrame ? 9.375f : 0.0f;
+            caster.lightOnPicture = 1.0f;
 
             EdgeLighting::SpotLight l;
             l.position = glm::vec2(g.position.x + g.width * 0.5f,

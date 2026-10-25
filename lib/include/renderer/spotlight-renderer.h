@@ -111,17 +111,11 @@ namespace EdgeLighting
     /// reduced-resolution buffer, which is why opting a lamp in costs the
     /// resolution scale - see the note on the two paths above.
     ///
-    /// **Light can be shadowed by a picture** - @c SpotlightConfig::shadowCaster,
-    /// opted into per lamp by @c SpotLight::castsShadow. All of it is
-    /// @ref SpotlightShadow (spotlight-shadow.h), a module of its own that
-    /// this class only calls into at marked hooks and serves through
-    /// @ref SpotShadowHost; like the clip it pins the resolution scale.
-    ///
     /// Parameters come from @c Config::spotlight. Nothing else is read - not
     /// @c Config::geometry, not @c Config::neon. The clip area is part of that
     /// sub-config rather than a reuse of @c Config::geometry for exactly this
     /// reason.
-    class SpotlightRenderer : public BaseRenderer, private SpotShadowHost
+    class SpotlightRenderer : public BaseRenderer
     {
     public:
         SpotlightRenderer() = default;
@@ -133,10 +127,8 @@ namespace EdgeLighting
         /// Phase 1: below scale 1.0, the lamps into @c mScaledBuffer - sized,
         /// bound and cleared here, under no host scissor - and nothing on the
         /// caller's framebuffer. At 1.0 (a clipped lamp pins it there), or
-        /// with the layer off, nothing but the shadow's own offscreen pass
-        /// (@ref SpotlightShadow::RenderOffscreen). Restores the framebuffer
-        /// and viewport it was handed, and leaves the blend as @ref Render
-        /// does.
+        /// with the layer off, nothing. Restores the framebuffer and viewport
+        /// it was handed, and leaves the blend as @ref Render does.
         virtual void RenderOffscreen(int viewportWidth, int viewportHeight, double time,
                                      const Config &config) override;
 
@@ -240,29 +232,13 @@ namespace EdgeLighting
         /// a pixel in any verification scene.
         void buildStrips(const SpotlightConfig &spotlight);
 
-        /// Every uniform a strip program reads, onto @p program (in use): the
+        /// The lamps' own draw, into whatever is bound: the strips through the
         /// y-flipped ortho over the @p viewportWidth x @p viewportHeight app
         /// viewport, whatever the target's size - the viewport transform alone
-        /// carries the scale - @c uDither, which @p scaled picks (the target
-        /// is the scaled buffer; see @c mScaledFormat), the clip area and the
-        /// shadow caster's. ONE function for the light's program and the
-        /// shadow's variants, so they cannot draw the strips under different
-        /// values.
-        void uploadStripUniforms(ShaderProgram &program, int viewportWidth, int viewportHeight, bool scaled,
-                                 const Config &config);
-
-        /// The lamps' own draw, into whatever is bound, through
-        /// @ref uploadStripUniforms. The caller sets the target and the blend
-        /// (UseScreenBlend in the .cpp).
+        /// carries the scale. @p scaled says the target is the scaled buffer,
+        /// which picks @c uDither (see @c mScaledFormat). The caller sets the
+        /// target and the blend (UseScreenBlend in the .cpp).
         void drawLamps(int viewportWidth, int viewportHeight, bool scaled, const Config &config);
-
-        // --- SpotShadowHost: what THE SHADOW draws through, all at full
-        // resolution (spotlight-shadow.h). Thin wrappers over the above.
-        virtual void UploadStripUniforms(ShaderProgram &program, int viewportWidth, int viewportHeight,
-                                         const Config &config) override;
-        virtual void UseLightBlend() override;
-        virtual void DrawLamps(int viewportWidth, int viewportHeight, const Config &config) override;
-        virtual void DrawStrips(int first, int count) override;
 
     private:
         ShaderProgram mShaderProgram;
@@ -314,13 +290,10 @@ namespace EdgeLighting
         /// @ref FrameState.
         FrameState mFrame;
 
-        /// Each drawn lamp's run of @c mStripVerts, recorded by
-        /// @ref buildStrips for THE SHADOW's per-lamp attributes. Reserved to
-        /// @c SPOT_MAX_LAMPS, so it allocates once.
-        std::vector<SpotLampStrip> mLampStrips;
-        /// THE SHADOW caster - every bit of it, GL objects included. See
-        /// spotlight-shadow.h.
-        SpotlightShadow mShadow{*this};
+        /// THE SHADOW caster (@c SpotlightConfig::shadowCaster), every bit of
+        /// it: a module of its own this class only calls at marked hooks.
+        /// See spotlight-shadow.h.
+        SpotlightShadow mShadow;
     };
 }
 

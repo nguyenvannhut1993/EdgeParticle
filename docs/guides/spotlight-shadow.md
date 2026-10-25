@@ -13,7 +13,7 @@ and the fill) and
 [`spotlight-solid-frame-plan.md`](../design/spotlight-solid-frame-plan.md)
 (the solid block and the frame). When either disagrees with
 [`renderer/spotlight-shadow.h`](../../lib/include/renderer/spotlight-shadow.h)
-or [`core/shadow-caster.h`](../../lib/include/core/shadow-caster.h), the
+or `ShadowCaster` in [`core/config.h`](../../lib/include/core/config.h), the
 headers win.
 
 ---
@@ -60,6 +60,40 @@ stands off the wall relative to the lamp, the longer and softer the shadow.
 the wall around it loses light. A host draws its picture into that rectangle,
 under the effect, and gets both the lit picture and its shadow from this layer.
 
+**How much light the picture takes is `lightOnPicture`** (default 1, lit like
+the wall). The layer screens its light over what the host drew, so a bright
+lamp lifts every dark part of a picture towards the lamp's own colour and the
+picture washes out: real light multiplies a surface, this adds to it. Below 1 a
+casting lamp shows only that fraction of its light on the face - the whole
+rectangle, rails included - and at 0 the face shows exactly what the host drew,
+**except the rails' shadow on the recessed picture (section 4), which stays**.
+With less light to take away, that shadow darkens the picture instead: by the
+darkening pass (section 5), at strength `mix(1, darkness, lightOnPicture)` - the
+wall's `darkness` at 1, the whole of the lamp's share at 0 - in `color`, so in a
+bright beam its umbra goes to the shadow colour. `opacity` below 1 lightens it.
+The wall, its light and its shadow are untouched. Everything the shadow is made
+of - the mask, the fill's lift, the darkening's reach - is still computed from
+the lamp's real light (the fill's source buffer is drawn with the face lit); the
+option only decides how much of that light the face shows and how the face's
+shadow is drawn. It needs only the lamp's `castsShadow`, not a caster that
+casts: a flush or transparent caster still keeps its picture out of the light.
+Below 1 over a recessed picture it runs the darkening pass even at `darkness`
+0; otherwise it costs one rounded-box SDF per fragment of an opted-in lamp. At 1
+nothing runs.
+
+Verified offscreen on 14 scenes (panel, recess, solid frame, rounded corners,
+darkness, fill on two lamps, one of two lamps casting, a transparent wall, a
+flush caster, solid casters deeper than the lamps): at 1, byte-identical to the
+build before the field, colour and alpha. At 0: off the face byte-identical to
+1; the rails and every picture pixel the rails leave fully lit byte-identical to
+the backdrop as drawn (or, beside a lamp that does not cast, to that lamp's
+light alone); and the rails' umbra byte-identical to the render at 1 with
+`darkness` 1 - the same darkening, no light. At 0.5 the umbra is byte-identical
+to `darkness` `mix(1, d, 0.5)` at 1, and the lit picture shows half the light
+within a level. With fill on two lamps at different heights the fill still
+lifts one lamp's shadow on the picture by the other's real light (a build that
+fed the fill the dimmed light lifted nothing).
+
 **Light only by default.** A shadow is this layer's light taken away - a
 coverage multiply after the highlight shoulder, exactly where the clip's is -
 not a darkening of what the host drew. Over a backdrop darker than the lamp it
@@ -79,6 +113,7 @@ little light to remove. `darkness` (below) darkens the backdrop too.
 | `shadowCaster.darkness` | 0 | How far the shadow darkens what is behind the layer. 0 is light only. See "Over a bright backdrop" below. |
 | `shadowCaster.color` | black | The colour `darkness` paints the shadow with, linear RGB. |
 | `shadowCaster.solid`, `.frameWidth`, `.frameDepth` | `false`, 0, 0 | A solid block, and a frame around a recessed picture - section 4. |
+| `shadowCaster.lightOnPicture` | 1.0 | How much of a casting lamp's light lands on the picture (the face, rails included). 1 lights it like the wall; at 0 it shows as drawn and only the rails' shadow appears on it, darkening it - section 1. |
 | `SpotLight::castsShadow` | `false` | Per-lamp opt-in. The only gate. |
 
 **Inert by default, and not a trap.** Unlike a zero-size `KEEP_INSIDE` clip,
@@ -109,9 +144,11 @@ branch on its flat shadow weight, and renders byte-identically to the plain
 lamp.
 
 **It pins `resolutionScale` to 1.0** while a drawn lamp casts, like the clip and
-by the same predicate (`HasMaskedLamp`): where the lit face meets its own shadow
-the mask steps across one pixel, which a reduced buffer would smear exactly as
-it smears the clip's edge.
+in the same place (`GetClampedSpotScale` asks
+`SpotlightShadow::PinsResolutionScale` ahead of the clip's test, and the shadow
+logs its own transitions): where the lit face meets its own shadow the mask
+steps across one pixel, which a reduced buffer would smear exactly as it smears
+the clip's edge.
 
 **Where the code lives** is section 6.
 
@@ -143,16 +180,23 @@ shadowed lamp's light (`SPOT_FILL_FULL_RATIO`, 0.5 in
 [`spotlight-shadow-tuning.h`](../../lib/include/renderer/spotlight-shadow-tuning.h), which
 explains why half and not all).
 
-How: a frame with `fill` above 0 and a lamp casting draws the strips **twice**.
-The plain program draws every lamp, shadows applied, into a viewport-sized RGBA8
-buffer; then a `SPOT_FILL` variant of the same `spotlight.frag` draws them onto
-the target, reads that buffer at its own pixel and takes its own share back out
-of the screen - `others = 1 - (1 - R) / (1 - own)` - so a lamp can never wash
+How: a frame with `fill` above 0 and a lamp casting draws the strips **three
+times**. A copy of the plain program draws every lamp, shadows applied, into a
+viewport-sized RGBA8 buffer; the light then draws as it always does; and after
+it a `SPOT_FILL` variant of the same `spotlight.frag` draws the casting lamps
+again, reads that buffer at its own pixel and takes its own share back out of
+the screen - `others = 1 - (1 - R) / (1 - own)` - so a lamp can never wash
 out its own penumbra. That is why it cannot be a post-process on the composite:
 from the total alone, a lamp's own half-lit penumbra looks like light from
 somewhere else. A dead zone of two 8-bit steps (scaled by `1 / (1 - own)`, the
 division's gain) absorbs the buffer's own rounding and dither; without it a lone
-lamp nudged its own penumbra by one level in ~500 channels.
+lamp nudged its own penumbra by one level in ~500 channels. The variant screens
+on a correction, `x = (z - y) / (1 - y)` with `y` the light the light pass drew
+and `z` the lifted light, which the screen adds up to `z` exactly; it is drawn
+after the light rather than instead of it so the light's own draw stays as
+committed. Two 8-bit roundings where there was one: against the earlier
+single pass it moves filled pixels by up to 2 levels (2026-10-24, four
+two-lamp scenes, no pixel outside what the fill changes).
 
 Verified offscreen:
 
@@ -181,7 +225,8 @@ everywhere (option 2: `opacity` 0.7):
 it does not (x 1900). Option 1 gets close at x 1500 physically, but brightens
 the whole wall and makes the second lamp's OWN shadow (above and right of the
 picture) stronger. Option 2 lightens every shadow, including ones no other lamp
-is near.
+is near. (The fill columns were measured with the single pass the correction
+replaced; it can move them by up to 2 levels.)
 
 ## 4. Solid frame: `solid`, `frameWidth`, `frameDepth`
 
@@ -207,6 +252,13 @@ beam; the panel costs about what no shadow does.
 The model, the search behind the soft edge, its exact early-out and every
 measurement are in [`spotlight-solid-frame-plan.md`](../design/spotlight-solid-frame-plan.md).
 Both demos have a "Solid Frame" preset beside "Picture Light".
+
+**The caster is the frame's OUTER edge**, rails inside it, so a caster matched
+to a rect puts the picture `frameWidth` inside the rect: the band between is
+the rails' front, lit, and the rails' shadow on the picture starts at its
+inner edge. Its length is set by `frameDepth` and how far the lamp is from
+that edge, not by `frameWidth`, so a wider frame moves it rather than
+lengthening it.
 
 What it does not do: one caster, axis aligned; no bevels, no frame sides lit
 from the front, the rails do not shadow each other, no shadows of other layers,
@@ -241,7 +293,9 @@ weights it - no light, no shadow, and the shadow fades out with the beam
 (`SPOT_SHADOW_FULL_REACH` 0.25, which also keeps it inside the strip). The
 light pass then screens every lamp on top as before, so a second lamp still
 lightens the first one's shadow, and `fill` lifts the darkening with the
-shadow. It darkens whatever the framebuffer already holds there.
+shadow. It darkens whatever the framebuffer already holds there. The same pass
+draws the rails' shadow on a picture kept out of the light (`lightOnPicture`
+below 1, section 1), at that option's strength, whatever `darkness` is.
 
 Verified offscreen: `darkness` 0 is byte-identical to before on every scene
 (no pass runs); at 0.6, no pixel outside a shadow changes on any backdrop; a
@@ -255,49 +309,67 @@ is used.
 
 ## 6. Where the code lives
 
-The spotlight renderer and its shaders are edited by several people, so the
-shadow is a module of its own and enters the light's files only at single,
-marked hooks. A change to the shadow touches only the files in the first table;
-a change to the light needs no edit to the shadow unless it moves one of the
-hooks in the second.
+The spotlight renderer and its shaders belong to other people, so the shadow
+is a module of its own that only ADDS lines to their files: against the
+committed light, `spotlight-renderer.{h,cpp}`, `spotlight.frag`,
+`spotlight.vert`, `shaders.h.in`, `lib/CMakeLists.txt` and `core/config.h`
+gain lines and lose or change none. A change to the shadow touches only the
+files in the first table; a change to the light needs no edit to the shadow
+unless it moves one of the hooks in the second, or changes what the shadow
+mirrors (below).
 
 | File | What it holds |
 | ---- | ------------- |
-| [`renderer/spotlight-shadow.h`](../../lib/include/renderer/spotlight-shadow.h), [`spotlight-shadow.cpp`](../../lib/src/renderer/spotlight-shadow.cpp) | `SpotlightShadow`: the CPU derivation (`ShadowSolve`, `DeriveShadow`, `LampCastsShadow`, `DeriveLampShadow`, `AnyDrawnLampCasts`, `UsesFillPass`, `UsesDarkenPass`) and every GL object the shadow owns - its attribute buffer, the fill buffer, the three program variants (built on the first frame that needs each), the casting lamps' vertex runs. Also `SpotShadowHost`, the contract below. |
-| [`spotlight-shadow.glsl`](../../lib/shaders/spotlight-shadow.glsl) | The fragment half: the model, the per-lamp varyings, the caster's uniforms, the panel, solid and recess tests, the `SPOT_FILL` lift and the `SPOT_SHADOW_DARKEN` output. Injected ahead of `spotlight.frag` (`@SPOTLIGHT_SHADOW@`); reaches nothing of it but `sdRoundBox`, through a prototype. |
+| [`renderer/spotlight-shadow.h`](../../lib/include/renderer/spotlight-shadow.h), [`spotlight-shadow.cpp`](../../lib/src/renderer/spotlight-shadow.cpp) | `SpotlightShadow`: the CPU derivation (`ShadowSolve`, `DeriveShadow`, `LampCastsShadow`, `LampDimsPicture`, `DeriveLampShadow`, `AnyDrawnLampCasts`, `UsesFillPass`, `UsesDarkenPass`), the mirrors of the light it needs (`uploadLightUniforms`, `UploadMirroredClip`, `UseScreenBlend`), every GL object the shadow owns - its attribute buffer, the fill buffer, its copy of the light's plain program and the three variants (all built on the first frame that needs each) - and the casting lamps' vertex runs. |
+| [`spotlight-shadow.glsl`](../../lib/shaders/spotlight-shadow.glsl) | The fragment half: the model, the per-lamp varyings, the caster's uniforms, the panel, solid and recess tests, the picture's light, the `SPOT_FILL` lift and the `SPOT_SHADOW_DARKEN` output. Injected ahead of `spotlight.frag` (`@SPOTLIGHT_SHADOW@`); reaches nothing of it but `sdRoundBox`, through a prototype. |
 | [`spotlight-shadow-vert.glsl`](../../lib/shaders/spotlight-shadow-vert.glsl) | The vertex half: the three per-lamp attributes and `spotShadowForward`. Injected ahead of `spotlight.vert` (`@SPOTLIGHT_SHADOW_VERT@`). |
 | [`spotlight-shadow-tuning.h`](../../lib/include/renderer/spotlight-shadow-tuning.h) | `SPOT_LAMP_WALL_DISTANCE`, `SPOT_SHADOW_FULL_REACH`, `SPOT_FILL_FULL_RATIO`, `SPOT_SOLID_SEARCH_STEPS`, and the attribute locations `SPOT_SHADOW_ATTRIB_*` (13-15). Injected into both spotlight shaders (`@SPOTLIGHT_SHADOW_TUNING@`). |
-| [`core/shadow-caster.h`](../../lib/include/core/shadow-caster.h) | `ShadowCaster`, included by `config.h`. |
-| [`gl/vertex-buffer.h`](../../lib/include/gl/vertex-buffer.h) | `VertexBuffer`, a VBO feeding attributes of a `VertexArray` it does not own - how the shadow's attributes reach the light's strip VAO. |
+
+The config is not a file of its own: `ShadowCaster` sits in
+[`core/config.h`](../../lib/include/core/config.h) beside `SpotLight` and
+`SpotlightConfig`, like every other layer's config.
+
+Every hook is an inserted line; the light's own code around it is as
+committed.
 
 | Hook | Where | What it calls |
 | ---- | ----- | ------------- |
 | Fragment | `spotlight.frag` `main()`, right after the clip | `spotShadowLight` (or `spotShadowDarken` under `SPOT_SHADOW_DARKEN`) |
 | Vertex | `spotlight.vert` `main()` | `spotShadowForward()` |
-| Config | `config.h` | `SpotLight::castsShadow`, `SpotlightConfig::shadowCaster`, their `operator==` lines, the `#include` |
-| Scale pin | `GetClampedSpotScale` / `LogOnClipPinTransition`, via `HasMaskedLamp` | `SpotlightShadow::PinsResolutionScale` |
-| Strip buffer | `ensureBuffer` | `AttachAttributes` |
-| Strip rebuild | `buildStrips` (records each lamp's run in `mLampStrips`) | `OnStripsBuilt` |
-| Config change | `OnConfigChanged` | `OnConfigChanged` (the fill buffer's lifetime) |
-| Strip uniforms | `uploadStripUniforms` | `UploadUniforms` |
-| Phase 1 | `RenderOffscreen` | `RenderOffscreen` (the fill's first pass) |
-| Phase 2 | `Render`, the direct path | `RenderBeforeLight` (the darkening), then `RenderLight` (the fill, in place of `drawLamps`) |
+| Config | `config.h` | `ShadowCaster`, `SpotLight::castsShadow`, `SpotlightConfig::shadowCaster`, a line in each `operator==` |
+| Member | `spotlight-renderer.h` | the `#include` and `SpotlightShadow mShadow` |
+| Scale pin | `GetClampedSpotScale`, ahead of the clip's test | `SpotlightShadow::PinsResolutionScale` |
+| Strip buffer | `ensureBuffer`, after the light's attributes | `AttachAttributes` |
+| Strip rebuild | `buildStrips`: after each lamp's vertices, and at both ends | `AddLampStrip`, then `OnStripsBuilt` |
+| Config change | `OnConfigChanged` | `OnConfigChanged` (the fill buffer's lifetime, the scale-pin log) |
+| Strip uniforms | `drawLamps`, after the clip's uniforms | `UploadUniforms` (the caster's, onto the light's program) |
+| Phase 1 | `RenderOffscreen` | `RenderOffscreen` (the fill's source) |
+| Phase 2 | `Render`, on either side of the light's draw | `RenderBeforeLight` (the darkening), `RenderAfterLight` (the fill's correction) |
 
-**The contract, `SpotShadowHost`.** What the shadow needs of the light,
-implemented privately by `SpotlightRenderer`: `UploadStripUniforms` (the
-light's own projection, dither, clip and shadow uniforms, onto any of the
-shadow's programs), `UseLightBlend` (the layer's screen), `DrawLamps` (the plain
-light pass, for the fill buffer) and `DrawStrips` (a range of the strip VAO).
-So the shadow's variants always draw the strips under exactly the light's
-values: change how the light uploads a uniform or blends, and every shadow pass
-follows with nothing in the shadow to edit.
+**What the shadow mirrors, and why.** Its own programs need the light's strip
+uniforms, and the light's files take no call that would hand them over, so the
+shadow keeps copies: `uploadLightUniforms` uploads the y-flipped ortho, `uDither`
+1 (every shadow pass runs at full resolution) and the clip area as
+`DeriveClip` builds it (`UploadMirroredClip`), and `UseScreenBlend` sets the
+layer's screen. Change any of those in the light and change the mirror. A new
+uniform in the light's shaders is caught: after building each of its programs
+the shadow logs an error naming every active uniform it does not upload.
 
-**The per-lamp attributes ride in a buffer of their own** (7 floats a vertex),
-bound into the light's strip VAO at locations 13-15 - the top of the 16 every
-target guarantees - so `StripVertex` carries none of them and the light's
-attributes can grow from 7 upwards. `buildStrips` hands the shadow each drawn
-lamp's run of vertices (`SpotLampStrip`, with the aperture the light's solve
-floored) and the shadow writes its attributes over those runs.
+**The per-lamp attributes ride in a buffer of their own** (8 floats a vertex:
+the lamp and its ratios, two weights - the shadow's and the picture's - and the
+rails' recess): a `VertexArray` used for its buffer, its own VAO never drawn.
+`AttachAttributes` binds that buffer into the light's strip VAO at locations
+13-15 - the top of the 16 every target guarantees - with
+`glVertexAttribPointer` by hand, since `VertexArray::SetAttribPointer` would
+bind the light's own buffer instead. `StripVertex` carries none of them, and
+the light's attributes can grow from 7 upwards. `buildStrips` reports each
+drawn lamp's run as it ends (`AddLampStrip`: the lamp, the vertex the run ends
+at, the aperture the light's solve floored); runs are back to back, and
+`OnStripsBuilt` logs an error and casts no shadow if they ever stop tiling the
+strips.
+
+**The fill draws after the light, as a correction**, rather than in its place
+(section 3), which is what lets the light's draw call stay as it is.
 
 **The variants are built from the light's own source** at run time
 (`#define SPOT_FILL` / `SPOT_SHADOW_DARKEN` inserted after the `#version`
@@ -328,6 +400,7 @@ its rect straight in.
 | `el_effect_set_spotlight_shadow_color` | `shadowCaster.color` |
 | `el_effect_set_spotlight_shadow_solid` | `shadowCaster.solid` |
 | `el_effect_set_spotlight_shadow_frame` | `shadowCaster.frameWidth`, `.frameDepth` |
+| `el_effect_set_spotlight_shadow_light_on_picture` | `shadowCaster.lightOnPicture` |
 
 ---
 
@@ -343,3 +416,5 @@ its rect straight in.
 | A shadow that shows over a bright backdrop or a video | `shadowCaster.darkness` (0.6 is a natural start), `shadowCaster.color` |
 | A solid frame light cannot pass through | `shadowCaster.solid`; for "nothing behind it is lit", `shadowCaster.wallDistance` 150 or more |
 | Rails that shade the picture inside | `shadowCaster.frameWidth` + `shadowCaster.frameDepth` |
+| A longer rail shadow on the picture | `shadowCaster.frameDepth` (clamped to `wallDistance`), or the lamp further from the frame - not `frameWidth` |
+| A picture a bright lamp washes out | `shadowCaster.lightOnPicture` below 1 (0 = the picture as drawn, with only the rails' shadow on it) |

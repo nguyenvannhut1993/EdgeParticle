@@ -5,6 +5,122 @@ and what is open. Each entry names the commits it covers; the headers under
 `lib/include/` stay the source of truth, and the topic documents linked here
 hold the detail.
 
+## 2026-10-24 - The shadow caster's `lightOnPicture`, and a shadow that only adds to the light
+
+Uncommitted, on top of the 2026-10-22 merge below. Intel Iris Plus Graphics
+655. Prompted by a report that a wide solid frame "pushed the shadow into the
+picture" while the lamp still lit the band above it. That band is the rails'
+front, lit, and the streak is the top rail's shadow on the recessed picture,
+whose length `frameDepth` and the lamp's distance set, not `frameWidth` - the
+model was right. What the owner wanted was a picture the lamp does not wash
+out, with the frame's shadow still on it. Reference:
+[`spotlight-shadow.md`](../guides/spotlight-shadow.md), sections 1, 4 and 5.
+
+- **`ShadowCaster::lightOnPicture`** (default 1): how much of a casting lamp's
+  light lands on the picture - the caster's whole face, rails included. The
+  layer screens its light, so a bright lamp lifts a picture's dark parts to the
+  lamp's colour. Below 1 the face shows that fraction of the light, and at 0
+  exactly what the host drew, except the rails' shadow on the recessed picture,
+  which stays: the darkening pass draws it at strength
+  `mix(1, darkness, lightOnPicture)` (`spotShadowStrength`), so that pass now
+  runs at `darkness` 0 too when the option is below 1 over a recess
+  (`UsesDarkenPass`). The gain is applied AFTER the shadow; every shadow input
+  - mask, fill lift, darkening reach - stays computed from the real light, so
+  the fill's source buffer is drawn with `uPictureLight` 1. Gated per lamp by
+  a second weight: the shadow's
+  `WEIGHT` attribute is now a `vec2` (8 floats a vertex, still locations
+  13-15), because dimming the light needs no caster that casts. Exactly 1 is
+  "off" on the CPU, so the default takes no branch. C ABI
+  `el_effect_set/get_spotlight_shadow_light_on_picture`; a Light On Picture
+  slider in both demos; the config dump prints it; the presets reset it to 1.
+- **The first version was wrong, and is gone**: it scaled the light BEFORE the
+  shadow, inside the rails only. A light-only shadow is light taken away, so at
+  0 the rails' shadow vanished with the light - the owner's "neither the
+  shadow nor the lamp shows in the picture". A demo-only "Frame Outside" box
+  (the picture on the rect, the rails around it) went in with it and was
+  removed at the owner's request.
+- **Two files of the 2026-10-22 merge removed, at the owner's request.**
+  `core/shadow-caster.h`: `ShadowCaster` now sits in `core/config.h` between
+  `SpotLight` and `SpotlightConfig`, like every other layer's config.
+  `gl/vertex-buffer.h`: no new GL wrapper - the shadow's per-lamp attributes
+  ride in a `VertexArray` of its own, used for its buffer (its own VAO is
+  never drawn), which `AttachAttributes` binds into the light's strip VAO at
+  locations 13-15 with `glVertexAttribPointer` by hand. (A version in between
+  put them in a region of the light's strip buffer; that changed the light's
+  allocation line, and went with the next item.)
+- **The light's files only gain lines now** - the owner's rule, since
+  `SpotlightRenderer` and its shaders are other people's code. Against HEAD,
+  `spotlight-renderer.{h,cpp}`, `spotlight.frag`, `spotlight.vert`,
+  `shaders.h.in`, `lib/CMakeLists.txt` and `core/config.h` add lines and change
+  or remove none (`git diff --numstat`: 0 deletions in each). Before this, the
+  merge had changed the light's class (`private SpotShadowHost` and four
+  overrides), split `drawLamps` into `uploadStripUniforms` (rewriting its
+  uniform calls), replaced `HasClippedLamp` by `HasMaskedLamp` in the scale pin
+  and its log lines, wrapped the light's `drawLamps` call in
+  `if (!mShadow.RenderLight(...))` and reworded the light's comments. Now the
+  light's two files are HEAD plus one-line hooks (+28 / +6 lines):
+  `GetClampedSpotScale` (`PinsResolutionScale` ahead of the clip's test),
+  `RenderOffscreen`, `Render` (`RenderBeforeLight` / `RenderAfterLight` on
+  either side of the light's untouched draw), `OnConfigChanged`,
+  `ensureBuffer`, `buildStrips` (`AddLampStrip` as each lamp's run ends, then
+  `OnStripsBuilt`) and `drawLamps` (`UploadUniforms`). What it cost, in the
+  shadow module: `SpotShadowHost` is gone, so the shadow draws through
+  programs of its own - a copy of the light's plain program for the fill's
+  source, beside the three variants - and uploads the light's four strip
+  uniforms and sets the screen blend itself, as mirrors of `drawLamps` and
+  `UseScreenBlend` (`uploadLightUniforms`), with a check that logs any active
+  uniform of its programs it does not upload. The fill no longer replaces the
+  light's draw: it screens a correction `(z - y) / (1 - y)` after it, which the
+  screen adds up to the lifted light - one more strip pass when filling, and
+  two 8-bit roundings where there was one. The shadow logs its own scale-pin
+  transitions. In `config.h`, the light's doc paragraphs and `operator==`
+  lines are back as committed, the shadow's notes beside them.
+- **Verified**, with a throwaway harness (`EdgeLightingEffect` +
+  `OffscreenCapture`, 1280 x 720, Release; "before" is a snapshot of the tree
+  before this entry; 123 checks, all re-run after the restructure):
+  - 17 shadow scenes at the default (panel, recess, solid frame, solid with
+    darkness, fill on two lamps at one height and at two, fill with darkness
+    and a frame, one of two lamps casting, a five-lamp fan, a transparent wall,
+    a flush caster, rounded corners, solid casters deeper than the lamps with
+    and without a recess, a clipped casting lamp with darkness, fill beside a
+    clipped lamp, fill on a lone lamp): 13 byte-identical to before, colour
+    and alpha - the clipped one with darkness among them, so the mirrored clip
+    uniforms are exact. The four fill scenes with two lamps differ by at most 2
+    levels (11,181-15,575 pixels each), every one of them a pixel the fill
+    changes. A lone lamp's fill 1 is byte-identical to fill 0.
+  - At 0: off the face byte-identical to 1. The rails, and every picture pixel
+    a CPU mirror of the recess test says every casting lamp sees over them,
+    byte-identical to the backdrop as drawn - or, beside a lamp that does not
+    cast, to that lamp's light alone (the casting lamps blacked out by tint
+    for the reference, not removed: every strip is solved against its share of
+    the rig's budget, so removing one reshapes the other's tail by a level).
+    The rails' umbra byte-identical to the render at 1 with `darkness` 1: the
+    same darkening, no light. A flush caster leaves the wall identical to no
+    caster; with no casting lamp, 0 == 1 everywhere.
+  - At 0.5: off the face identical to 1; the umbra byte-identical to
+    `darkness` `mix(1, d, 0.5)` at 1; the lit picture
+    `|2 (half - backdrop) - (full - backdrop)|` at most 1 level.
+  - Fill on two casting lamps at different heights, at 0: the fill lifts the
+    higher lamp's shadow on the picture by the lower lamp's real light (8,503
+    pixels up by 3 levels or more, none down). A copy of the library that drew
+    the fill's source with the dimmed light failed that one check and nothing
+    else, before the restructure and again after it.
+  - No program logged a uniform it lacks or one the shadow does not upload;
+    all six spotlight programs link (`FillSource` the new one).
+  - C ABI round trip through the dylib, 9 checks (default, set / get, NaN and
+    infinity refused and not stored, null out pointer, null handles).
+  - Library, C dylib and both demos build with no new warnings, in a Release
+    tree and a Debug one that had both tracked the two deleted headers.
+- **Not done**: the demos were built, not driven interactively. The harness is
+  not in the repository.
+- **Open**: at 0 the rails' umbra goes all the way to `color` where the lamp is
+  bright; `opacity` lightens it, but there is no strength of its own. The
+  option scales screened light rather than lighting the picture: a
+  multiplicative mode (brightened, contrast kept) would need a pass of its own.
+  The mirrors (`uploadLightUniforms`, `UseScreenBlend`) follow the light by
+  hand: a new uniform is caught in the log, a changed formula for an existing
+  one is not. The fill's extra pass is unmeasured.
+
 ## 2026-10-22 - The spotlight shadow caster, merged as a module of its own
 
 Uncommitted, on top of `54a7479`. Intel Iris Plus Graphics 655. `source_shadow/`

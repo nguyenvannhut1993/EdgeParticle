@@ -113,17 +113,8 @@ namespace EdgeLighting
             return false;
         }
 
-        /// @ref HasClippedLamp, or a drawn lamp THE SHADOW pins the scale for
-        /// (@ref SpotlightShadow::PinsResolutionScale, for the clip's reason at
-        /// the edge where the caster's lit face meets its own shadow). The one
-        /// predicate the scale and its log read.
-        bool HasMaskedLamp(const SpotlightConfig &spotlight)
-        {
-            return HasClippedLamp(spotlight) || SpotlightShadow::PinsResolutionScale(spotlight);
-        }
-
         /// @c SpotlightConfig::resolutionScale clamped to (0, 1] - and PINNED
-        /// to 1.0 while any drawn lamp is clipped or casts a shadow.
+        /// to 1.0 while any drawn lamp is clipped.
         ///
         /// WHY THE CLIP DISABLES THE SCALE. spotlight.frag evaluates the clip
         /// mask in whatever buffer it is rasterising into, so on the scaled
@@ -165,7 +156,12 @@ namespace EdgeLighting
         /// the loss is never silent.
         float GetClampedSpotScale(const Config &config)
         {
-            if (HasMaskedLamp(config.spotlight))
+            // THE SHADOW pins it as the clip does - spotlight-shadow.h.
+            if (SpotlightShadow::PinsResolutionScale(config.spotlight))
+            {
+                return 1.0f;
+            }
+            if (HasClippedLamp(config.spotlight))
             {
                 return 1.0f;
             }
@@ -651,8 +647,7 @@ namespace EdgeLighting
             }
         }
 
-        /// Say so when a clipped (or shadow-casting) lamp takes
-        /// @c resolutionScale out of effect,
+        /// Say so when a clipped lamp takes @c resolutionScale out of effect,
         /// and when it comes back. @ref GetClampedSpotScale explains why it
         /// has to; this is what stops the host's setting being overridden in
         /// silence, which is the one thing that would make the pin feel like a
@@ -676,8 +671,8 @@ namespace EdgeLighting
                 return;
             }
 
-            const bool wasPinned = HasMaskedLamp(prev);
-            const bool isPinned = HasMaskedLamp(now);
+            const bool wasPinned = HasClippedLamp(prev);
+            const bool isPinned = HasClippedLamp(now);
             if (isPinned == wasPinned)
             {
                 return;
@@ -686,14 +681,14 @@ namespace EdgeLighting
             if (isPinned)
             {
                 LOG_I("SpotlightRenderer: resolutionScale %.3f held at 1.0 while a "
-                      "clipped or shadow-casting lamp is enabled - its mask edge has "
-                      "to be resolved at full resolution.",
+                      "clipped lamp is enabled - the clip edge has to be resolved at "
+                      "full resolution.",
                       static_cast<double>(now.resolutionScale));
             }
             else
             {
-                LOG_I("SpotlightRenderer: no clipped or shadow-casting lamp left - "
-                      "resolutionScale %.3f back in effect.",
+                LOG_I("SpotlightRenderer: no clipped lamp left - resolutionScale %.3f "
+                      "back in effect.",
                       static_cast<double>(now.resolutionScale));
             }
         }
@@ -730,9 +725,7 @@ namespace EdgeLighting
         mFrame.prepared = true;
         mFrame.viewport = glm::ivec2(viewportWidth, viewportHeight);
 
-        // THE SHADOW's offscreen pass (the fill's first) - spotlight-shadow.h.
-        // Nothing unless a lamp casts, and a casting lamp pins the scale, so
-        // it never runs beside the scaled path below.
+        // THE SHADOW's offscreen pass - spotlight-shadow.h.
         mShadow.RenderOffscreen(viewportWidth, viewportHeight, config);
 
         // Only the scaled path draws offscreen: at 1.0 - or pinned there by a
@@ -817,8 +810,7 @@ namespace EdgeLighting
             return;
         }
 
-        // THE SHADOW's darkening, under the light - spotlight-shadow.h. Sets
-        // its own blend, so it goes before the layer's.
+        // THE SHADOW's pass under the light - spotlight-shadow.h.
         mShadow.RenderBeforeLight(viewportWidth, viewportHeight, config);
 
         UseScreenBlend();
@@ -853,13 +845,12 @@ namespace EdgeLighting
         else
         {
             // The direct path: the strips straight onto the caller's
-            // framebuffer, under the host's clip - unless THE SHADOW's fill
-            // draws them itself (spotlight-shadow.h).
-            if (!mShadow.RenderLight(viewportWidth, viewportHeight, config))
-            {
-                drawLamps(viewportWidth, viewportHeight, false, config);
-            }
+            // framebuffer, under the host's clip.
+            drawLamps(viewportWidth, viewportHeight, false, config);
         }
+
+        // THE SHADOW's pass over the light - spotlight-shadow.h.
+        mShadow.RenderAfterLight(viewportWidth, viewportHeight, config);
 
         // Restore the blend state convention the other renderers leave behind.
         // glBlendFunc sets the RGB and alpha factors to the same pair, so it
@@ -882,7 +873,7 @@ namespace EdgeLighting
         {
             mScaledBuffer.Release();
         }
-        // THE SHADOW's fill buffer, on the same terms - spotlight-shadow.h.
+        // THE SHADOW - spotlight-shadow.h.
         mShadow.OnConfigChanged(config);
 
         // Before the rebuild gate below, and before mCurrentSpotlight is
@@ -998,8 +989,6 @@ namespace EdgeLighting
         // for the VBO, applied to the staging that fills it.
         mStripVerts.clear();
         mStripVerts.reserve(static_cast<size_t>(MAX_VERTS));
-        mLampStrips.clear();
-        mLampStrips.reserve(static_cast<size_t>(SPOT_MAX_LAMPS));
 
         const int lampCount = std::min(static_cast<int>(spotlight.lamps.size()),
                                        static_cast<int>(SPOT_MAX_LAMPS));
@@ -1020,7 +1009,7 @@ namespace EdgeLighting
         if (drawnLamps == 0)
         {
             mVertexCount = 0;
-            mShadow.OnStripsBuilt(spotlight, mLampStrips, 0); // THE SHADOW: nothing to shadow.
+            mShadow.OnStripsBuilt(spotlight, 0); // THE SHADOW: nothing to shadow.
             return;
         }
         const float sharedFloor = static_cast<float>(SPOT_VISIBILITY_FLOOR) /
@@ -1220,8 +1209,6 @@ namespace EdgeLighting
             }
 
             const float clipWeight = clipped ? 1.0f : 0.0f;
-            // Where this lamp's run starts, for THE SHADOW's attributes.
-            const int firstVertex = static_cast<int>(mStripVerts.size());
 
             for (int seg = 0; seg < SPOT_STRIP_SEGMENTS; seg++)
             {
@@ -1288,15 +1275,14 @@ namespace EdgeLighting
                 }
             }
 
-            mLampStrips.push_back(SpotLampStrip{i, firstVertex,
-                                                static_cast<int>(mStripVerts.size()) - firstVertex,
-                                                s.apertureWidth});
+            // THE SHADOW: this lamp's run of the strips ends here -
+            // spotlight-shadow.h.
+            mShadow.AddLampStrip(i, static_cast<int>(mStripVerts.size()), s.apertureWidth);
         }
 
         mVertexCount = static_cast<int>(mStripVerts.size());
-        // THE SHADOW's per-lamp attributes, for the strips just laid out -
-        // spotlight-shadow.h.
-        mShadow.OnStripsBuilt(spotlight, mLampStrips, mVertexCount);
+        // THE SHADOW's per-lamp attributes, for the strips just laid out.
+        mShadow.OnStripsBuilt(spotlight, mVertexCount);
         if (mVertexCount == 0)
         {
             return;
@@ -1311,8 +1297,7 @@ namespace EdgeLighting
                         mStripVerts.data());
     }
 
-    void SpotlightRenderer::uploadStripUniforms(ShaderProgram &program, int viewportWidth, int viewportHeight,
-                                                bool scaled, const Config &config)
+    void SpotlightRenderer::drawLamps(int viewportWidth, int viewportHeight, bool scaled, const Config &config)
     {
         // A y-FLIPPED ortho: note bottom and top are swapped relative to the
         // one the other renderers build. That is what lets the VBO hold app
@@ -1337,6 +1322,8 @@ namespace EdgeLighting
                                          static_cast<float>(viewportHeight), 0.0f,
                                          -1.0f, 1.0f);
 
+        mShaderProgram.Use();
+
         // ONE uniform differs between the two paths, and it is not geometry.
         // The ortho is over APP coordinates, and the viewport transform alone
         // carries the scale: the same vertex lands at scale * its app pixel in
@@ -1357,8 +1344,8 @@ namespace EdgeLighting
         // help. See SCALED_FORMATS for what that looked like. On the RGBA8
         // fallback this pass dithers as before and the blit adds its own.
         const bool blitDithersAlone = scaled && SCALED_FORMATS[mScaledFormat].holdsSubLevels;
-        program.SetUniform("uMVP", mvp);
-        program.SetUniform("uDither", blitDithersAlone ? 0.0f : 1.0f);
+        mShaderProgram.SetUniform("uMVP", mvp);
+        mShaderProgram.SetUniform("uDither", blitDithersAlone ? 0.0f : 1.0f);
 
         // The clip area, in the SAME app coordinates the ortho above maps -
         // which is what keeps the comment above uDither true. A clip is a
@@ -1373,9 +1360,8 @@ namespace EdgeLighting
         // enabled clipped lamp pins the scale to 1.0 rather than being one
         // more scale-invariant term: see GetClampedSpotScale for the numbers
         // and for why the neon's fix could not be reused. Past that pin, the
-        // scaled path is only ever reached with NO lamp clipped (or casting a
-        // shadow), which is what keeps uDither the only uniform that differs
-        // between the two.
+        // scaled path is only ever reached with NO lamp clipped, which is what
+        // keeps uDither the only uniform that differs between the two.
         //
         // Uploaded unconditionally, including when no lamp is clipped. The
         // per-lamp opt-in is baked into the strips as a vertex attribute (see
@@ -1384,43 +1370,17 @@ namespace EdgeLighting
         // in exchange for a stale value the first frame a lamp opts in. There
         // is no area-level enable that could gate them either.
         const ClipSolve clipSolve = DeriveClip(config.spotlight.clipArea);
-        program.SetUniform("uClipRect",
-                           glm::vec4(clipSolve.center.x, clipSolve.center.y,
-                                     clipSolve.half.x, clipSolve.half.y));
-        program.SetUniform("uClipParams",
-                           glm::vec3(clipSolve.radius, clipSolve.softness,
-                                     clipSolve.keepInside ? 1.0f : 0.0f));
-
+        mShaderProgram.SetUniform("uClipRect",
+                                  glm::vec4(clipSolve.center.x, clipSolve.center.y,
+                                            clipSolve.half.x, clipSolve.half.y));
+        mShaderProgram.SetUniform("uClipParams",
+                                  glm::vec3(clipSolve.radius, clipSolve.softness,
+                                            clipSolve.keepInside ? 1.0f : 0.0f));
         // THE SHADOW caster's uniforms - spotlight-shadow.h.
-        mShadow.UploadUniforms(program, config);
-    }
+        mShadow.UploadUniforms(mShaderProgram, config);
 
-    void SpotlightRenderer::drawLamps(int viewportWidth, int viewportHeight, bool scaled, const Config &config)
-    {
-        mShaderProgram.Use();
-        uploadStripUniforms(mShaderProgram, viewportWidth, viewportHeight, scaled, config);
         mVertexArray.DrawArrays(GL_TRIANGLES, mVertexCount);
+
         mShaderProgram.Unuse();
-    }
-
-    void SpotlightRenderer::UploadStripUniforms(ShaderProgram &program, int viewportWidth, int viewportHeight,
-                                                const Config &config)
-    {
-        uploadStripUniforms(program, viewportWidth, viewportHeight, false, config);
-    }
-
-    void SpotlightRenderer::UseLightBlend()
-    {
-        UseScreenBlend();
-    }
-
-    void SpotlightRenderer::DrawLamps(int viewportWidth, int viewportHeight, const Config &config)
-    {
-        drawLamps(viewportWidth, viewportHeight, false, config);
-    }
-
-    void SpotlightRenderer::DrawStrips(int first, int count)
-    {
-        mVertexArray.DrawArrays(GL_TRIANGLES, count, first);
     }
 }

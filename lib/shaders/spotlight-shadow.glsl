@@ -86,13 +86,37 @@ precision highp float;
 // contains p, so the end point decides it. The rails' front itself is lit
 // wherever the cone reaches, like the panel's face.
 //
+// THE PICTURE'S LIGHT (ShadowCaster::lightOnPicture), a look. This layer
+// SCREENS its light over what the host drew, so a bright lamp lifts every dark
+// part of a picture towards the lamp's colour and the picture washes out. For
+// a lamp the CPU opts in (vPictureWeight: castsShadow, the option below 1, a
+// caster of some size), two things change on the FACE - the picture and its
+// frame, the rectangle the host draws into - and nothing else does:
+//
+//   - the LIGHT the lamp shows there is scaled by uPictureLight, after the
+//     shadow (spotFaceGain);
+//   - the rails' shadow on the recessed picture, the one shadow that falls on
+//     the face, DARKENS the picture with strength mix(1, darkness,
+//     uPictureLight) (spotShadowStrength): the wall's darkness at 1, all of
+//     the lamp's share at 0. A shadow that only took light away would vanish
+//     with the light; this one stays.
+//
+// So at 0 the face shows exactly what the host drew, darkened where the rails
+// shade it. Everything the shadow is made of - the mask, the fill's lift, the
+// darkening's reach - is still computed from the lamp's REAL light, which is
+// why SpotlightShadow::RenderOffscreen draws the fill's source buffer with
+// uPictureLight at 1: the option decides only how much of that light the face
+// shows and how the face's shadow is drawn. A weight of its own, apart from
+// vShadowWeight, because dimming the light needs no caster that casts: a
+// flush or transparent caster still keeps its picture out of the light.
+//
 // THE FILL VARIANT (SPOT_FILL), which is a look and not physics. With two
 // lamps, a point in lamp A's shadow receives exactly lamp B's light, so where
 // B is weaker than A the shadow still shows, lighter. ShadowCaster::fill
-// washes it out instead. This program runs SECOND: the plain one has already
-// drawn every lamp - shadows applied - into uFillSource, so each fragment can
-// read how much light reaches its pixel (R) and take its own share back out of
-// the screen to find what the OTHER lamps put there:
+// washes it out instead. A copy of the plain program has already drawn every
+// lamp - shadows applied - into uFillSource, so each fragment can read how much
+// light reaches its pixel (R) and take its own share back out of the screen to
+// find what the OTHER lamps put there:
 //
 //   others = 1 - (1 - R) / (1 - own),   own = this lamp's light after its shadow
 //
@@ -105,8 +129,17 @@ precision highp float;
 // alone, a lamp's own penumbra looks like light from elsewhere, and filling
 // with it would shrink every shadow.
 //
-// It only ever raises a coverage that is below 1, so outside every shadow this
-// program writes exactly what the plain one does.
+// This program runs AFTER the light, as a CORRECTION, so the light's own draw
+// stays as it is: the light has screened y = lit * cover, and this screens on
+//
+//   x = (z - y) / (1 - y),   z = lit * lifted cover
+//
+// which the screen, being associative, adds up to z exactly: 1 - (1 - y)(1 - x)
+// = z. y and z are lit times scalars, so x is largest in lit's largest
+// channel, and spotlight.frag's max-channel coverage alpha is the same
+// correction for the alpha. Outside every shadow, and for a lamp that casts
+// nothing, x is exactly 0, which the half-step dither cannot round up: the
+// light pass's output stands.
 //
 // THE DARKENING VARIANT (SPOT_SHADOW_DARKEN), ShadowCaster::darkness. Light
 // only, a shadow is this lamp's light taken away, and the screen leaves
@@ -120,8 +153,10 @@ precision highp float;
 //
 // so the destination becomes dst * (1 - D) + colour * D, colour and alpha
 // alike: the backdrop darkens under the shadow and the umbra records
-// coverage. `cover` is the light pass's own (fill lift included under
-// SPOT_FILL), and `lit` the lamp's unshadowed light - no light, no shadow,
+// coverage. (On a picture kept out of the light, darkness rises - see THE
+// PICTURE'S LIGHT; this pass then runs whatever darkness is.) `cover` is the
+// light pass's own (fill lift included under SPOT_FILL), and `lit` the
+// lamp's unshadowed light - no light, no shadow,
 // and the shadow fades out with the beam inside the strip, which is what
 // keeps the strip bound free (see SPOT_SHADOW_FULL_REACH). One colour for
 // every lamp makes the chain of OVERs commutative, so lamp order cannot
@@ -134,6 +169,9 @@ precision highp float;
 /// width on the caster's plane in px (w, never 0 - the CPU floors it).
 flat in vec4 vShadow;
 flat in float vShadowWeight; ///< ShadowCaster::opacity if this lamp casts a shadow, else 0.
+/// 1 if ShadowCaster::lightOnPicture scales this lamp's light on the picture,
+/// else 0 - see THE PICTURE'S LIGHT above.
+flat in float vPictureWeight;
 /// The rails over the recessed picture: t_in (x) and the penumbra half width
 /// at the rails' front in px (y, never 0).
 flat in vec2 vRecess;
@@ -161,12 +199,18 @@ uniform float uShadowSoftness;
 
 /// The picture inside the rails: half extent (xy), corner radius (z), and 1
 /// when the rails shade it (w) - a uniform branch. Centred on uShadowRect.xy.
+/// Without rails xyz is the face itself.
 uniform vec4 uShadowInner;
 
+/// ShadowCaster::lightOnPicture, clamped to [0, 1]: the fraction of an
+/// opted-in lamp's light the face shows. 1 while the fill's source buffer is
+/// drawn, which has to hold the real light.
+uniform float uPictureLight;
+
 #ifdef SPOT_FILL
-/// What the plain pass drew: every lamp, shadows applied, screened into a
-/// buffer the size of the viewport under the same y-flipped ortho - so app px
-/// (x, y) is texel (x, uFillHeight - y).
+/// What the fill's source pass drew: every lamp, shadows applied, screened
+/// into a buffer the size of the viewport under the same y-flipped ortho - so
+/// app px (x, y) is texel (x, uFillHeight - y).
 uniform sampler2D uFillSource;
 /// ShadowCaster::fill, clamped to [0, 1].
 uniform float uFillAmount;
@@ -278,6 +322,17 @@ float spotShadowMask(vec2 app, vec4 shadow, vec2 recess, float aperture) {
     return mix(wallVis, faceVis, onFace);
 }
 
+/// How much of an opted-in lamp's light the face shows at app px @p app:
+/// uPictureLight on the face, 1 off it, across the face's own one-pixel edge -
+/// see THE PICTURE'S LIGHT above. Written so uPictureLight 1 gives exactly 1,
+/// which is how the fill's source pass draws the real light. Called only for a
+/// lamp whose vPictureWeight is above 0, so a lamp it does not apply to pays
+/// nothing and stays bit for bit what it was.
+float spotFaceGain(vec2 app) {
+    float dFace = sdRoundBox(app - uShadowRect.xy, uShadowRect.zw, uShadowCorner);
+    return 1.0 - (1.0 - uPictureLight) * (1.0 - smoothstep(-0.5, 0.5, dFace));
+}
+
 /// What the shadow caster leaves of this lamp's light at app px @p app, in
 /// [0, 1] - reached through spotShadowLight (and spotShadowDarken), and only
 /// for a lamp whose vShadowWeight is above 0 (a branch on a flat value, so
@@ -286,18 +341,19 @@ float spotShadowMask(vec2 app, vec4 shadow, vec2 recess, float aperture) {
 /// the renderer before the caster). The weight is ShadowCaster::opacity, so a
 /// translucent caster lets that much through.
 ///
-/// @p lit is the lamp's light BEFORE the shadow - after the shoulder and the
-/// clip - which the fill variant needs as the light this lamp would have put
-/// here unshadowed.
-///
-/// Under SPOT_FILL the coverage is then lifted by the other lamps' light - see
-/// THE FILL VARIANT above. A lamp that casts nothing skips this whole function
-/// there too, which is exact: with a coverage of 1 the lift is (1 - 1) times a
-/// finite value, so the light would be multiplied by exactly 1.0.
-float spotShadowCover(vec2 app, vec3 lit, float apertureWidth) {
-    float cover = mix(1.0, spotShadowMask(app, vShadow, vRecess, apertureWidth), vShadowWeight);
+/// The fill's lift comes after, from spotFillLift.
+float spotShadowCover(vec2 app, float apertureWidth) {
+    return mix(1.0, spotShadowMask(app, vShadow, vRecess, apertureWidth), vShadowWeight);
+}
+
 #ifdef SPOT_FILL
-    // THE FILL - see THE FILL VARIANT above.
+/// @p cover lifted by the other lamps' light at app px @p app - see THE FILL
+/// VARIANT above. @p lit is the lamp's light BEFORE the shadow - after the
+/// shoulder and the clip, and never dimmed by THE PICTURE'S LIGHT - which the
+/// fill needs as the light this lamp would have put here unshadowed. For a
+/// lamp that casts nothing, with a coverage of 1, the lift is (1 - 1) times a
+/// finite value: exactly the coverage it was given.
+float spotFillLift(vec2 app, vec3 lit, float cover) {
     vec3 own = lit * cover;
     // app is the fragment's centre, so truncation lands on its own texel.
     vec3 reaching = texelFetch(uFillSource, ivec2(app.x, uFillHeight - app.y), 0).rgb;
@@ -315,24 +371,47 @@ float spotShadowCover(vec2 app, vec3 lit, float apertureWidth) {
     float noise = (2.0 / 255.0) / max(1.0 - max(max(own.r, own.g), own.b), 1.0e-3);
     float othersPeak = max(max(max(others.r, others.g), others.b) - noise, 0.0);
     float ratio = othersPeak / max(ownPeak, 1.0e-4);
-    cover += (1.0 - cover) * uFillAmount * smoothstep(0.0, SPOT_FILL_FULL_RATIO, ratio);
-#endif
-    return cover;
+    return cover + (1.0 - cover) * uFillAmount * smoothstep(0.0, SPOT_FILL_FULL_RATIO, ratio);
 }
+#endif
 
 /// The light pass's entry point: @p lit - the lamp's light after the shoulder
-/// and the clip - with the shadow caster applied at app px @p app. The ONE
-/// call spotlight.frag's main() makes into this chunk outside the darkening
+/// and the clip - with the shadow caster applied at app px @p app: first the
+/// shadow, from the real light, then THE PICTURE'S LIGHT. The ONE call
+/// spotlight.frag's main() makes into this chunk outside the darkening
 /// variant, after the clip and before the coverage alpha and the dither, for
 /// the clip's reasons.
 ///
-/// Behind a branch on the flat weight rather than a lerp: see spotShadowCover.
-/// A lamp that casts nothing gets @p lit back untouched.
+/// Behind branches on the flat weights rather than lerps: see
+/// spotShadowCover. A lamp that casts nothing and dims no picture gets @p lit
+/// back untouched.
+///
+/// Under SPOT_FILL it returns the fill's CORRECTION instead - what to screen
+/// over the light pass's y so that the two make the lifted light; see THE
+/// FILL VARIANT above. y is computed exactly as the plain pass computes it.
 vec3 spotShadowLight(vec2 app, vec3 lit, float apertureWidth) {
+#ifdef SPOT_FILL
+    if (vShadowWeight <= 0.0) {
+        return vec3(0.0);
+    }
+    float cover = spotShadowCover(app, apertureWidth);
+    vec3 y = lit * cover;
+    vec3 z = lit * spotFillLift(app, lit, cover);
+    if (vPictureWeight > 0.0) {
+        float gain = spotFaceGain(app);
+        y *= gain;
+        z *= gain;
+    }
+    return clamp((z - y) / max(1.0 - y, 1.0e-3), 0.0, 1.0);
+#else
     if (vShadowWeight > 0.0) {
-        lit *= spotShadowCover(app, lit, apertureWidth);
+        lit *= spotShadowCover(app, apertureWidth);
+    }
+    if (vPictureWeight > 0.0) {
+        lit *= spotFaceGain(app);
     }
     return lit;
+#endif
 }
 
 #ifdef SPOT_SHADOW_DARKEN
@@ -340,6 +419,22 @@ vec3 spotShadowLight(vec2 app, vec3 lit, float apertureWidth) {
 uniform float uShadowDarkness;
 /// ShadowCaster::color, linear RGB clamped to [0, 1].
 uniform vec3 uShadowColor;
+
+/// How strongly a shadow darkens the destination at app px @p app: darkness,
+/// except on the recessed picture of a lamp with vPictureWeight, where it
+/// rises towards 1 as uPictureLight falls - see THE PICTURE'S LIGHT above. The
+/// picture inside the rails only, not the whole face: the rails' shadow is the
+/// one shadow that falls there, while the face's own edge is where the WALL's
+/// shadow meets it, which keeps the wall's strength (rails a pixel or more
+/// wide keep the two apart).
+float spotShadowStrength(vec2 app) {
+    if (vPictureWeight > 0.0 && uShadowInner.w > 0.5) {
+        float dPicture = sdRoundBox(app - uShadowRect.xy, uShadowInner.xy, uShadowInner.z);
+        float onPicture = 1.0 - smoothstep(-0.5, 0.5, dPicture);
+        return mix(uShadowDarkness, mix(1.0, uShadowDarkness, uPictureLight), onPicture);
+    }
+    return uShadowDarkness;
+}
 
 /// The darkening variant's output for the fragment at app px @p app - see THE
 /// DARKENING VARIANT above, and the one call spotlight.frag's main() makes
@@ -354,9 +449,12 @@ vec4 spotShadowDarken(vec2 app, vec3 lit, float apertureWidth, float dither) {
     if (vShadowWeight <= 0.0) {
         return vec4(0.0);
     }
-    float cover = spotShadowCover(app, lit, apertureWidth);
+    float cover = spotShadowCover(app, apertureWidth);
+#ifdef SPOT_FILL
+    cover = spotFillLift(app, lit, cover);
+#endif
     float reach = smoothstep(0.0, SPOT_SHADOW_FULL_REACH, max(max(lit.r, lit.g), lit.b));
-    float d = uShadowDarkness * (1.0 - cover) * reach;
+    float d = spotShadowStrength(app) * (1.0 - cover) * reach;
     if (d <= 0.0) {
         return vec4(0.0);
     }

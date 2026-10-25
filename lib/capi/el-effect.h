@@ -844,6 +844,24 @@ extern "C"
     EL_API el_result_e el_effect_get_spotlight_shadow_frame(el_effect_handle_t effect,
                                                             float *outFrameWidth, float *outFrameDepth);
 
+    /** @brief How much of a casting lamp's light lands on the PICTURE - the
+     *         caster's whole face, frame included - in [0, 1]. Default 1.0
+     *         (lit like the wall).
+     *  @details The layer screens its light over what the host drew, so a
+     *           bright lamp washes a picture out. Below 1 the face shows that
+     *           fraction of the light, and at 0 it shows exactly as drawn -
+     *           except the frame's shadow on the recessed picture, which stays
+     *           and darkens it instead (darkness's strength at 1, the lamp's
+     *           whole share at 0, in the shadow colour). The wall, its light
+     *           and its shadow are untouched. Applies to every lamp with
+     *           el_effect_set_spotlight_casts_shadow set, whatever the
+     *           caster's distance and opacity.
+     *  @note  Below 1 over a recessed picture, the darkening pass runs even at
+     *         darkness 0. */
+    EL_API el_result_e el_effect_set_spotlight_shadow_light_on_picture(el_effect_handle_t effect, float lightOnPicture);
+    EL_API el_result_e el_effect_get_spotlight_shadow_light_on_picture(el_effect_handle_t effect,
+                                                                       float *outLightOnPicture);
+
     /** @brief Fraction of the viewport the lamps render at before being
      *         bilinear-blitted back. 1.0 (default) draws direct - no offscreen
      *         buffer, no blit. Clamped to [0.125, 1.0] at draw time.

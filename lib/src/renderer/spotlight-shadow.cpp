@@ -5,8 +5,11 @@
 #include "util/gl-utils.h"
 #include "shaders.h"
 
+#include <glm/gtc/matrix_transform.hpp>
 #include <algorithm>
 #include <cstddef>
+#include <cstring>
+#include <iterator>
 #include <string>
 
 namespace EdgeLighting
@@ -71,6 +74,12 @@ namespace EdgeLighting
             /// Whether the rails shade the picture: a frame with width AND
             /// depth, leaving a picture of some size inside it.
             bool hasRecess;
+            /// @c ShadowCaster::lightOnPicture, clamped to [0, 1].
+            float lightOnPicture;
+            /// Whether that changes anything: below 1, on a caster of some
+            /// size - the face it dims is the whole rectangle, rails and
+            /// picture.
+            bool dimsPicture;
         } ShadowSolve;
 
         /// Signed distance to a rounded box centred at the origin, negative
@@ -111,6 +120,12 @@ namespace EdgeLighting
                                       std::max(out.wallDistance, 0.0f));
             out.hasRecess = rail > 0.0f && out.frameDepth > 0.0f &&
                             out.innerHalf.x > 0.0f && out.innerHalf.y > 0.0f;
+
+            // Exactly 1 is "off", not merely a factor of 1, so the default
+            // takes no branch in the shader at all and stays bit for bit
+            // what it was.
+            out.lightOnPicture = std::min(std::max(caster.lightOnPicture, 0.0f), 1.0f);
+            out.dimsPicture = out.lightOnPicture < 1.0f && out.half.x > 0.0f && out.half.y > 0.0f;
             return out;
         }
 
@@ -142,6 +157,18 @@ namespace EdgeLighting
                 return false;
             }
             return SdRoundBox(lamp.position - shadow.center, shadow.half, shadow.radius) > 0.0f;
+        }
+
+        /// Whether @c ShadowCaster::lightOnPicture applies to @p lamp - its
+        /// picture weight: the light it shows on the face is scaled, and the
+        /// rails' shadow on the picture darkens it instead. The lamp's opt-in
+        /// and the option alone: unlike @ref LampCastsShadow it does not ask
+        /// whether the caster throws a shadow, so a flush, transparent or
+        /// too-deep caster still keeps its picture out of the light, and the
+        /// face it dims is the one the model keeps lit for every lamp anyway.
+        bool LampDimsPicture(const ShadowSolve &shadow, const SpotLight &lamp)
+        {
+            return lamp.castsShadow && shadow.dimsPicture;
         }
 
         /// What one lamp's strip carries for the shadow: @p outShadow is the
@@ -254,13 +281,26 @@ namespace EdgeLighting
         }
 
         /// Whether this config's frame takes the darkening pass: the layer
-        /// on, @c ShadowCaster::darkness above 0, and a drawn lamp that throws
-        /// a shadow. Never alongside the scaled path, for the fill's reason.
+        /// on, something for it to darken, and a drawn lamp that throws a
+        /// shadow. Something is @c ShadowCaster::darkness above 0 - or a
+        /// recessed picture kept out of the light, whose rails' shadow this
+        /// pass draws whatever darkness is, since there is no light on it
+        /// left to take away (THE PICTURE'S LIGHT in spotlight-shadow.glsl).
+        /// Never alongside the scaled path, for the fill's reason.
         bool UsesDarkenPass(const Config &config)
         {
             const SpotlightConfig &spotlight = config.spotlight;
-            return spotlight.enable && spotlight.shadowCaster.darkness > 0.0f &&
-                   AnyDrawnLampCasts(spotlight);
+            if (!spotlight.enable)
+            {
+                return false;
+            }
+            bool darkens = spotlight.shadowCaster.darkness > 0.0f;
+            if (!darkens)
+            {
+                const ShadowSolve shadow = DeriveShadow(spotlight.shadowCaster);
+                darkens = shadow.dimsPicture && shadow.hasRecess;
+            }
+            return darkens && AnyDrawnLampCasts(spotlight);
         }
 
         /// @p src with a `#define` line per space-separated name in
@@ -289,11 +329,47 @@ namespace EdgeLighting
             out.insert(eol == std::string::npos ? out.size() : eol + 1, lines);
             return out;
         }
-    }
 
-    SpotlightShadow::SpotlightShadow(SpotShadowHost &host)
-        : mHost(host)
-    {
+        // ===================================================================
+        // MIRRORS of what SpotlightRenderer keeps to its own file. The
+        // light's files take no call that would hand these over, so the
+        // shadow's programs get them from here - keep each in step with the
+        // light. SpotlightShadow::warnUnmirroredUniforms names any uniform of
+        // the light's shader this misses.
+        // ===================================================================
+
+        /// The clip area's two uniforms as the light's drawLamps uploads
+        /// them - DeriveClip in spotlight-renderer.cpp: the centre and half
+        /// extent, then the radius clamped to the shorter half extent, the
+        /// feather and which side survives.
+        void UploadMirroredClip(ShaderProgram &program, const ClipArea &area)
+        {
+            const glm::vec2 half(std::max(area.width, 0.0f) * 0.5f, std::max(area.height, 0.0f) * 0.5f);
+            const glm::vec2 center = area.position + half;
+            const float radius = std::min(std::max(area.cornerRadius, 0.0f), std::min(half.x, half.y));
+            const float softness = std::max(area.edgeSoftness, 0.0f);
+            program.SetUniform("uClipRect", glm::vec4(center.x, center.y, half.x, half.y));
+            program.SetUniform("uClipParams",
+                               glm::vec3(radius, softness, area.mode == ClipMode::KEEP_INSIDE ? 1.0f : 0.0f));
+        }
+
+        /// The layer's screen blend - UseScreenBlend in spotlight-renderer.cpp:
+        /// dst + src * (1 - dst), colour and alpha alike.
+        void UseScreenBlend()
+        {
+            glEnable(GL_BLEND);
+            glBlendFuncSeparate(GL_ONE_MINUS_DST_COLOR, GL_ONE, GL_ONE_MINUS_DST_ALPHA, GL_ONE);
+        }
+
+        /// Every uniform this module uploads onto its programs: the light's
+        /// four (uploadLightUniforms), the caster's, the fill's and the
+        /// darkening's.
+        const char *const UPLOADED_UNIFORMS[] = {
+            "uMVP", "uDither", "uClipRect", "uClipParams",
+            "uShadowRect", "uShadowCorner", "uShadowSolid", "uShadowSoftness", "uShadowInner", "uPictureLight",
+            "uFillSource", "uFillAmount", "uFillHeight",
+            "uShadowDarkness", "uShadowColor",
+        };
     }
 
     bool SpotlightShadow::PinsResolutionScale(const SpotlightConfig &spotlight)
@@ -315,40 +391,72 @@ namespace EdgeLighting
 
     void SpotlightShadow::AttachAttributes(const VertexArray &strips, int maxVertices)
     {
+        mStrips = &strips;
         mMaxVertices = std::max(maxVertices, 0);
         // Ceiling-sized once, for the light's own reason: the strips are
         // rebuilt every frame under an animation, and a reallocation per frame
         // is what the ceiling is for. The staging is reserved to match.
-        mAttribs.SetData(nullptr, static_cast<size_t>(mMaxVertices) * sizeof(ShadowVertex), GL_DYNAMIC_DRAW);
+        mAttribs.SetVertexData(nullptr, static_cast<size_t>(mMaxVertices) * sizeof(ShadowVertex), GL_DYNAMIC_DRAW);
         mShadowVerts.reserve(static_cast<size_t>(mMaxVertices));
+        mLampStrips.reserve(static_cast<size_t>(SPOT_MAX_LAMPS));
         mCasterRanges.reserve(static_cast<size_t>(SPOT_MAX_LAMPS));
 
+        // Into the LIGHT's VAO, read from THIS buffer: a VAO records, per
+        // attribute, the buffer bound to GL_ARRAY_BUFFER when its pointer is
+        // set, so the light's attributes keep reading its StripVertex buffer
+        // and these read this one. VertexArray::SetAttribPointer would bind
+        // the light's own buffer instead, hence the two calls by hand.
         const GLsizei stride = static_cast<GLsizei>(sizeof(ShadowVertex));
-        mAttribs.AttachAttrib(strips, SPOT_SHADOW_ATTRIB_SHADOW, 4, GL_FLOAT, stride, offsetof(ShadowVertex, shadow));
-        mAttribs.AttachAttrib(strips, SPOT_SHADOW_ATTRIB_WEIGHT, 1, GL_FLOAT, stride, offsetof(ShadowVertex, weight));
-        mAttribs.AttachAttrib(strips, SPOT_SHADOW_ATTRIB_RECESS, 2, GL_FLOAT, stride, offsetof(ShadowVertex, recess));
+        const auto attach = [stride](GLuint location, GLint size, size_t offset)
+        {
+            glEnableVertexAttribArray(location);
+            glVertexAttribPointer(location, size, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<const void *>(offset));
+        };
+        strips.Bind();
+        mAttribs.BindBuffer();
+        attach(SPOT_SHADOW_ATTRIB_SHADOW, 4, offsetof(ShadowVertex, shadow));
+        attach(SPOT_SHADOW_ATTRIB_WEIGHT, 2, offsetof(ShadowVertex, weight));
+        attach(SPOT_SHADOW_ATTRIB_RECESS, 2, offsetof(ShadowVertex, recess));
     }
 
-    void SpotlightShadow::OnStripsBuilt(const SpotlightConfig &spotlight, const std::vector<SpotLampStrip> &strips,
-                                        int vertexCount)
+    void SpotlightShadow::AddLampStrip(int lampIndex, int endVertex, float apertureWidth)
+    {
+        mLampStrips.push_back(LampStrip{lampIndex, mStripsEnd, endVertex - mStripsEnd, apertureWidth});
+        mStripsEnd = endVertex;
+    }
+
+    void SpotlightShadow::OnStripsBuilt(const SpotlightConfig &spotlight, int vertexCount)
     {
         mVertexCount = std::min(std::max(vertexCount, 0), mMaxVertices);
         mCasterRanges.clear();
 
-        // Every vertex starts as a lamp that casts nothing - weight 0, t 0,
-        // the half widths floored - so a vertex no strip claims stays finite
-        // and inert. resize stays inside the reserve: no allocation.
+        // Every vertex starts as a lamp that casts nothing and dims no
+        // picture - both weights 0, t 0, the half widths floored - so a
+        // vertex no run claims stays finite and inert. resize stays inside
+        // the reserve: no allocation.
         ShadowVertex none{};
         none.shadow[3] = MIN_SHADOW_HALF_WIDTH;
         none.recess[1] = MIN_SHADOW_HALF_WIDTH;
         mShadowVerts.assign(static_cast<size_t>(mVertexCount), none);
+
+        // The runs have to tile the strips as AddLampStrip assumes, back to
+        // back from vertex 0. Should buildStrips ever lay them out otherwise,
+        // say so rather than hand one lamp's shadow to another.
+        if (mStripsEnd != vertexCount)
+        {
+            LOG_E("SpotlightShadow: the lamps' runs end at vertex %d of %d - buildStrips no "
+                  "longer lays its strips out back to back, and no lamp casts a shadow until "
+                  "AddLampStrip follows it.",
+                  mStripsEnd, vertexCount);
+            mLampStrips.clear();
+        }
 
         // Resolved once for the whole rig, as the light resolves its clip.
         // Nothing narrows the strips to it, and nothing has to: a shadow only
         // removes light from the support the strip was solved for.
         const ShadowSolve shadowSolve = DeriveShadow(spotlight.shadowCaster);
 
-        for (const SpotLampStrip &strip : strips)
+        for (const LampStrip &strip : mLampStrips)
         {
             if (strip.lampIndex < 0 || static_cast<size_t>(strip.lampIndex) >= spotlight.lamps.size())
             {
@@ -363,14 +471,16 @@ namespace EdgeLighting
 
             // This lamp's share of the caster, constant along its strip like
             // the clip weight.
+            const SpotLight &lamp = spotlight.lamps[static_cast<size_t>(strip.lampIndex)];
             ShadowVertex v{};
-            v.weight = DeriveLampShadow(shadowSolve, spotlight.lamps[static_cast<size_t>(strip.lampIndex)],
-                                        strip.apertureWidth, v.shadow, v.recess);
+            v.weight[0] = DeriveLampShadow(shadowSolve, lamp, strip.apertureWidth, v.shadow, v.recess);
+            v.weight[1] = LampDimsPicture(shadowSolve, lamp) ? 1.0f : 0.0f;
             std::fill(mShadowVerts.begin() + first, mShadowVerts.begin() + last, v);
 
-            // A casting lamp's strip joins the darkening pass's runs, merged
-            // with the run before it when they touch.
-            if (v.weight > 0.0f)
+            // A casting lamp's strip joins the runs the darkening and the
+            // fill draw, merged with the run before it when they touch.
+            // Dimming the picture alone needs neither.
+            if (v.weight[0] > 0.0f)
             {
                 const int count = last - first;
                 if (!mCasterRanges.empty() &&
@@ -384,10 +494,17 @@ namespace EdgeLighting
                 }
             }
         }
+        mLampStrips.clear();
+        mStripsEnd = 0;
 
+        // Sub-data into the ceiling-sized allocation, the way the light
+        // refills its own: never a fresh allocation per rebuild.
         if (mVertexCount > 0)
         {
-            mAttribs.SetSubData(0, mShadowVerts.size() * sizeof(ShadowVertex), mShadowVerts.data());
+            mAttribs.BindBuffer();
+            glBufferSubData(GL_ARRAY_BUFFER, 0,
+                            static_cast<GLsizeiptr>(mShadowVerts.size() * sizeof(ShadowVertex)),
+                            mShadowVerts.data());
         }
     }
 
@@ -400,30 +517,32 @@ namespace EdgeLighting
         {
             mFillBuffer.Release();
         }
+
+        // Say so when a casting lamp holds resolutionScale at 1.0, and when it
+        // lets go, so the host's setting is never overridden in silence. The
+        // light's own line speaks for clipped lamps only. A requested scale
+        // of 1.0 is what the pin gives anyway: nothing to report.
+        const SpotlightConfig &spotlight = config.spotlight;
+        const bool pinned = spotlight.resolutionScale < 1.0f && PinsResolutionScale(spotlight);
+        if (pinned != mScalePinLogged)
+        {
+            if (pinned)
+            {
+                LOG_I("SpotlightShadow: resolutionScale %.3f held at 1.0 while a shadow-casting "
+                      "lamp is enabled - the edge of its shadow has to be resolved at full resolution.",
+                      static_cast<double>(spotlight.resolutionScale));
+            }
+            else
+            {
+                LOG_I("SpotlightShadow: resolutionScale no longer held at 1.0 by a shadow-casting lamp.");
+            }
+            mScalePinLogged = pinned;
+        }
     }
 
     void SpotlightShadow::UploadUniforms(ShaderProgram &program, const Config &config)
     {
-        // On the same terms as the clip area: app coordinates, uploaded
-        // unconditionally, inert where no lamp's weight reads it. Only the
-        // caster's shape is here - the rest of it (distance, softness,
-        // opacity) is folded per lamp into the attributes, and the fill's and
-        // the darkening's own uniforms are set by the passes that read them.
-        const ShadowSolve shadowSolve = DeriveShadow(config.spotlight.shadowCaster);
-        program.SetUniform("uShadowRect",
-                           glm::vec4(shadowSolve.center.x, shadowSolve.center.y,
-                                     shadowSolve.half.x, shadowSolve.half.y));
-        program.SetUniform("uShadowCorner", shadowSolve.radius);
-
-        // The solid block and the frame. Uniform branches in the shader, so a
-        // panel without a frame runs exactly the panel test. The softness
-        // rides here as well as folded into the per-lamp half widths because
-        // the solid search rebuilds its window at every sample.
-        program.SetUniform("uShadowSolid", shadowSolve.solid ? 1.0f : 0.0f);
-        program.SetUniform("uShadowSoftness", shadowSolve.softness);
-        program.SetUniform("uShadowInner",
-                           glm::vec4(shadowSolve.innerHalf.x, shadowSolve.innerHalf.y,
-                                     shadowSolve.innerRadius, shadowSolve.hasRecess ? 1.0f : 0.0f));
+        uploadCasterUniforms(program, config, false);
     }
 
     void SpotlightShadow::RenderOffscreen(int viewportWidth, int viewportHeight, const Config &config)
@@ -436,10 +555,10 @@ namespace EdgeLighting
 
         // Never alongside the light's scaled path - UsesFillPass needs a
         // casting lamp, and that pins the scale - and never without its
-        // program: a variant that failed to compile leaves a filled frame
-        // drawing the physical shadow, which is the right thing to degrade to.
-        if (mVertexCount <= 0 || viewportWidth <= 0 || viewportHeight <= 0 ||
-            !UsesFillPass(config) || !ensureFillProgram())
+        // programs: a fill that failed to compile leaves the frame drawing
+        // the physical shadow, which is the right thing to degrade to.
+        if (mVertexCount <= 0 || mStrips == nullptr || viewportWidth <= 0 || viewportHeight <= 0 ||
+            !UsesFillPass(config) || !ensureFillPrograms())
         {
             return;
         }
@@ -460,34 +579,41 @@ namespace EdgeLighting
             return;
         }
 
-        // THE FILL'S FIRST PASS: every lamp, shadows applied, screened - how
-        // much light reaches each pixel. The light's own program and blend,
-        // so this is exactly the light the caller's target would get.
-        mHost.UseLightBlend();
-        mHost.DrawLamps(viewportWidth, viewportHeight, config);
+        // THE FILL'S SOURCE: every lamp, shadows applied, screened - how much
+        // light reaches each pixel. The light's own shading, through this
+        // module's copy of its program so that the light's keeps to the
+        // caller's target, with the face drawn lit (uPictureLight 1): the
+        // fill lifts a shadow computed from the lamps' REAL light - see THE
+        // PICTURE'S LIGHT in spotlight-shadow.glsl.
+        UseScreenBlend();
+        mSourceShader.Use();
+        uploadLightUniforms(mSourceShader, viewportWidth, viewportHeight, config);
+        uploadCasterUniforms(mSourceShader, config, true);
+        mStrips->DrawArrays(GL_TRIANGLES, mVertexCount);
+        mSourceShader.Unuse();
 
         prevTarget.Restore();
         mFrame.fillReady = true;
 
         // The blend state a Render leaves, for the layers that composite
         // before this one: glBlendFunc sets the RGB and alpha factors to the
-        // same pair, so it also undoes the light's split.
+        // same pair, so it also undoes the screen's split.
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     }
 
     void SpotlightShadow::RenderBeforeLight(int viewportWidth, int viewportHeight, const Config &config)
     {
-        if (mCasterRanges.empty() || !UsesDarkenPass(config))
+        if (mCasterRanges.empty() || mStrips == nullptr || !UsesDarkenPass(config))
         {
             return;
         }
         // Its programs are built the first frame they are wanted: most hosts
-        // never set ShadowCaster::darkness, and should not pay two compiles.
+        // never darken, and should not pay two compiles.
         ensureDarkenPrograms();
 
         // A filled frame darkens through the variant that reads the fill
         // buffer, so the fill lifts the darkening with the shadow.
-        const bool withFill = UsesFillPass(config) && ensureFillProgram() &&
+        const bool withFill = UsesFillPass(config) && ensureFillPrograms() &&
                               isFillReady(viewportWidth, viewportHeight, config);
         ShaderProgram &program = withFill ? mDarkenFillShader : mDarkenShader;
         if (!program.IsValid())
@@ -499,12 +625,13 @@ namespace EdgeLighting
         // and the alpha gains D. The program writes (colour * D, D), and an
         // exact 0 outside every shadow, which this blend leaves bit for bit.
         // One colour for every lamp, so the chain of OVERs commutes. Left set:
-        // the caller sets the light's blend after this.
+        // the light sets its own blend after this.
         glEnable(GL_BLEND);
         glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
 
         program.Use();
-        mHost.UploadStripUniforms(program, viewportWidth, viewportHeight, config);
+        uploadLightUniforms(program, viewportWidth, viewportHeight, config);
+        uploadCasterUniforms(program, config, false);
         if (withFill)
         {
             uploadFillUniforms(program, config, viewportHeight);
@@ -514,63 +641,73 @@ namespace EdgeLighting
         program.SetUniform("uShadowColor", glm::clamp(caster.color, glm::vec3(0.0f), glm::vec3(1.0f)));
         for (const CasterRange &range : mCasterRanges)
         {
-            mHost.DrawStrips(range.first, range.count);
+            mStrips->DrawArrays(GL_TRIANGLES, range.count, range.first);
         }
         program.Unuse();
     }
 
-    bool SpotlightShadow::RenderLight(int viewportWidth, int viewportHeight, const Config &config)
+    void SpotlightShadow::RenderAfterLight(int viewportWidth, int viewportHeight, const Config &config)
     {
-        const bool fill = UsesFillPass(config) && ensureFillProgram() &&
-                          isFillReady(viewportWidth, viewportHeight, config);
+        const bool fill = !mCasterRanges.empty() && mStrips != nullptr && UsesFillPass(config) &&
+                          ensureFillPrograms() && isFillReady(viewportWidth, viewportHeight, config);
         // This frame is over either way.
         mFrame.prepared = false;
         if (!fill)
         {
-            return false;
+            return;
         }
 
-        // THE FILL'S SECOND PASS. RenderOffscreen's went into mFillBuffer:
-        // every lamp, shadows applied, screened. Now the same strips again,
-        // onto the caller's target this time, through the SPOT_FILL variant,
-        // which reads that buffer to find how much of each pixel's light came
-        // from the OTHER lamps and lifts this lamp's shadow by it. See THE
-        // FILL VARIANT in spotlight-shadow.glsl.
+        // THE FILL'S CORRECTION. The light has just screened every lamp with
+        // its shadow as cast, y = lit * cover. Now the casting lamps again,
+        // through the SPOT_FILL variant: it reads mFillBuffer to find how
+        // much of each pixel's light came from the OTHER lamps, lifts this
+        // lamp's cover by it, and screens on what the lift lets through - so
+        // that y and then the correction add up to the lifted light. Drawn
+        // after the light's own pass rather than in place of it, so the
+        // light's draw call stays as it is. See THE FILL VARIANT in
+        // spotlight-shadow.glsl.
         //
-        // Two programs, one per target, rather than one program drawing
-        // both: the plain one draws the buffer and the variant draws the
-        // caller's framebuffer, in the same blend state either way. Same
-        // split NeonRenderer keeps between its shade and ring programs.
-        //
-        // The light's blend set HERE, although the caller has just set it:
-        // when nothing ran RenderOffscreen this frame, isFillReady above ran
-        // it, and it leaves the library's default blend behind it.
-        mHost.UseLightBlend();
+        // Its own program, as the fill's source has its own: each program
+        // draws one target in one blend state, the split NeonRenderer keeps
+        // between its shade and ring programs.
+        UseScreenBlend();
         mFillShader.Use();
-        mHost.UploadStripUniforms(mFillShader, viewportWidth, viewportHeight, config);
+        uploadLightUniforms(mFillShader, viewportWidth, viewportHeight, config);
+        uploadCasterUniforms(mFillShader, config, false);
         uploadFillUniforms(mFillShader, config, viewportHeight);
-        mHost.DrawStrips(0, mVertexCount);
+        for (const CasterRange &range : mCasterRanges)
+        {
+            mStrips->DrawArrays(GL_TRIANGLES, range.count, range.first);
+        }
         mFillShader.Unuse();
-        return true;
     }
 
-    bool SpotlightShadow::ensureFillProgram()
+    bool SpotlightShadow::ensureFillPrograms()
     {
-        if (!mFillProgramTried)
+        if (!mFillProgramsTried)
         {
-            mFillProgramTried = true;
+            mFillProgramsTried = true;
+            // The light's plain program rebuilt from its own sources, for the
+            // fill's source pass, and the SPOT_FILL variant for its correction.
+            mSourceShader = ShaderProgram(ShaderSource::SPOTLIGHT_VERT_SRC, ShaderSource::SPOTLIGHT_FRAG_SRC,
+                                          "SpotlightRenderer.FillSource");
             const std::string fillSource = WithDefines(ShaderSource::SPOTLIGHT_FRAG_SRC, "SPOT_FILL");
             mFillShader = ShaderProgram(ShaderSource::SPOTLIGHT_VERT_SRC, fillSource.c_str(),
                                         "SpotlightRenderer.Fill");
             // Optional on purpose: a fill is a look on top of a working layer,
             // so a driver that rejects it costs the look, not the lamps.
-            if (!mFillShader.IsValid())
+            if (!mSourceShader.IsValid() || !mFillShader.IsValid())
             {
-                LOG_E("SpotlightRenderer: the fill variant failed to compile/link - "
+                LOG_E("SpotlightRenderer: the fill's programs failed to compile/link - "
                       "ShadowCaster::fill will draw the physical shadow.");
             }
+            else
+            {
+                warnUnmirroredUniforms(mSourceShader, "SpotlightRenderer.FillSource");
+                warnUnmirroredUniforms(mFillShader, "SpotlightRenderer.Fill");
+            }
         }
-        return mFillShader.IsValid();
+        return mSourceShader.IsValid() && mFillShader.IsValid();
     }
 
     void SpotlightShadow::ensureDarkenPrograms()
@@ -592,6 +729,11 @@ namespace EdgeLighting
         {
             LOG_E("SpotlightRenderer: a darkening variant failed to compile/link - "
                   "ShadowCaster::darkness will draw the light-only shadow.");
+        }
+        else
+        {
+            warnUnmirroredUniforms(mDarkenShader, "SpotlightRenderer.Darken");
+            warnUnmirroredUniforms(mDarkenFillShader, "SpotlightRenderer.DarkenFill");
         }
     }
 
@@ -625,6 +767,69 @@ namespace EdgeLighting
         mFillBuffer.Bind();
         mFillBuffer.ClearBuffer();
         return true;
+    }
+
+    void SpotlightShadow::uploadCasterUniforms(ShaderProgram &program, const Config &config, bool realLight)
+    {
+        // On the same terms as the clip area: app coordinates, uploaded
+        // unconditionally, inert where no lamp's weight reads it. Only the
+        // caster's shape is here - the rest of it (distance, softness,
+        // opacity) is folded per lamp into the attributes, and the fill's and
+        // the darkening's own uniforms are set by the passes that read them.
+        const ShadowSolve shadowSolve = DeriveShadow(config.spotlight.shadowCaster);
+        program.SetUniform("uShadowRect",
+                           glm::vec4(shadowSolve.center.x, shadowSolve.center.y,
+                                     shadowSolve.half.x, shadowSolve.half.y));
+        program.SetUniform("uShadowCorner", shadowSolve.radius);
+
+        // The solid block and the frame. Uniform branches in the shader, so a
+        // panel without a frame runs exactly the panel test. The softness
+        // rides here as well as folded into the per-lamp half widths because
+        // the solid search rebuilds its window at every sample.
+        program.SetUniform("uShadowSolid", shadowSolve.solid ? 1.0f : 0.0f);
+        program.SetUniform("uShadowSoftness", shadowSolve.softness);
+        program.SetUniform("uShadowInner",
+                           glm::vec4(shadowSolve.innerHalf.x, shadowSolve.innerHalf.y,
+                                     shadowSolve.innerRadius, shadowSolve.hasRecess ? 1.0f : 0.0f));
+        // Read only for a lamp whose picture weight is 1, which is decided
+        // per lamp in OnStripsBuilt; uploaded regardless, like the rest.
+        program.SetUniform("uPictureLight", realLight ? 1.0f : shadowSolve.lightOnPicture);
+    }
+
+    void SpotlightShadow::uploadLightUniforms(ShaderProgram &program, int viewportWidth, int viewportHeight,
+                                              const Config &config)
+    {
+        // As drawLamps builds them on the direct path: the y-flipped ortho
+        // over the app viewport, uDither 1 (this module never draws the
+        // light's scaled buffer), and the clip area.
+        program.SetUniform("uMVP", glm::ortho(0.0f, static_cast<float>(viewportWidth),
+                                              static_cast<float>(viewportHeight), 0.0f,
+                                              -1.0f, 1.0f));
+        program.SetUniform("uDither", 1.0f);
+        UploadMirroredClip(program, config.spotlight.clipArea);
+    }
+
+    void SpotlightShadow::warnUnmirroredUniforms(const ShaderProgram &program, const char *label)
+    {
+        GLint count = 0;
+        glGetProgramiv(program.GetId(), GL_ACTIVE_UNIFORMS, &count);
+        for (GLint i = 0; i < count; i++)
+        {
+            char name[64] = {0};
+            GLsizei length = 0;
+            GLint size = 0;
+            GLenum type = 0;
+            glGetActiveUniform(program.GetId(), static_cast<GLuint>(i), sizeof(name), &length, &size, &type, name);
+            const bool uploaded = std::any_of(std::begin(UPLOADED_UNIFORMS), std::end(UPLOADED_UNIFORMS),
+                                              [&name](const char *known) { return std::strcmp(known, name) == 0; });
+            if (!uploaded)
+            {
+                LOG_E("SpotlightShadow: %s has uniform '%s', which SpotlightShadow does not upload - "
+                      "the light's shader gained it after uploadLightUniforms was written, and the "
+                      "shadow's passes draw it as 0. Mirror it there.",
+                      label, name);
+            }
+        }
     }
 
     void SpotlightShadow::uploadFillUniforms(ShaderProgram &program, const Config &config, int viewportHeight)

@@ -118,8 +118,8 @@
 #define SPOT_SOLID_SEARCH_STEPS   12
 
 /// Vertex attribute locations of the shadow's per-lamp data - read from a
-/// buffer of the shadow's own (SpotlightShadow::AttachAttributes), not from
-/// SpotlightRenderer's StripVertex.
+/// buffer of the shadow's own, bound into SpotlightRenderer's strip VAO
+/// (SpotlightShadow::AttachAttributes), not from its StripVertex.
 ///
 /// The TOP of the 16 locations GL 3.3 and GLES 3.0 both guarantee, on
 /// purpose: the light's own attributes count up from 0 (0-6 today), so a new
@@ -129,7 +129,9 @@
 /// desktop GL.
 ///
 ///   SHADOW  vec4   lamp app position (xy), t (z), penumbra half width (w)
-///   WEIGHT  float  ShadowCaster::opacity for a casting lamp, else 0
+///   WEIGHT  vec2   ShadowCaster::opacity for a casting lamp, else 0 (x);
+///                  1 for a lamp whose light on the picture
+///                  ShadowCaster::lightOnPicture scales, else 0 (y)
 ///   RECESS  vec2   the rails' t_in (x) and penumbra half width (y)
 #define SPOT_SHADOW_ATTRIB_SHADOW 13
 #define SPOT_SHADOW_ATTRIB_WEIGHT 14
