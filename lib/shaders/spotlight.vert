@@ -22,7 +22,7 @@ precision highp float;
 // straight to clip space (see SpotlightRenderer::Render).
 //
 // vApp forwards that app-space position to the fragment stage, where the clip
-// area is evaluated. It is a SECOND USE of aPos, not a second attribute, and
+// area and the shadow caster are evaluated. It is a SECOND USE of aPos, not a second attribute, and
 // it is what keeps the clip out of gl_FragCoord: the projection is an ortho
 // (w is 1 everywhere), so this varying interpolates exactly and reads the same
 // app pixel whatever buffer the strips are being rasterised into.
@@ -30,8 +30,8 @@ precision highp float;
 // That makes the clip's GEOMETRY scale-free; it does not make its EDGE so. The
 // mask is still evaluated once per fragment, so a reduced-resolution buffer
 // resolves the boundary at its own texel pitch and the blit smears it back.
-// SpotlightRenderer pins resolutionScale to 1.0 whenever a clipped lamp is
-// enabled for that reason - see GetClampedSpotScale for the measurements, and
+// SpotlightRenderer pins resolutionScale to 1.0 whenever a clipped or
+// shadow-casting lamp is enabled for that reason - see GetClampedSpotScale for the measurements, and
 // the note about uniforms in SpotlightRenderer::Render.
 
 layout(location = 0) in vec2 aPos;   ///< App px, top-left origin, +y down.
@@ -48,6 +48,20 @@ layout(location = 5) in float aClipWeight; ///< 1 where this lamp honours the cl
 /// Its own attribute because aP0 and aP1 are full; see StripVertex.
 layout(location = 6) in float aSpreadFalloff;
 
+// THE SHADOW: one lamp's share of SpotlightConfig::shadowCaster, baked by
+// DeriveLampShadow in spotlight-renderer.cpp and read by the THE SHADOW
+// section of spotlight.frag. Constant across a strip, like everything above
+// but aPos and aLocal.
+/// The lamp's app position (xy), the caster-to-lamp wall-distance ratio t
+/// (z), and the penumbra's half width on the caster's plane (w).
+layout(location = 7) in vec4 aShadow;
+/// A WEIGHT, like aClipWeight: ShadowCaster::opacity for a lamp that casts a
+/// shadow, 0 for one that does not.
+layout(location = 8) in float aShadowWeight;
+/// The frame's rails over the recessed picture: t_in and the penumbra half
+/// width at the rails' front.
+layout(location = 9) in vec2 aRecess;
+
 out vec2 vLocal;
 out vec2 vApp;
 flat out vec4 vP0;
@@ -55,6 +69,10 @@ flat out vec4 vP1;
 flat out vec3 vColor;
 flat out float vClipWeight;
 flat out float vSpreadFalloff;
+// THE SHADOW.
+flat out vec4 vShadow;
+flat out float vShadowWeight;
+flat out vec2 vRecess;
 
 uniform mat4 uMVP;
 
@@ -66,7 +84,9 @@ void main() {
     vColor = aColor;
     vClipWeight = aClipWeight;
     vSpreadFalloff = aSpreadFalloff;
-    // THE SHADOW's per-lamp attributes - spotlight-shadow-vert.glsl.
-    spotShadowForward();
+    // THE SHADOW.
+    vShadow = aShadow;
+    vShadowWeight = aShadowWeight;
+    vRecess = aRecess;
     gl_Position = uMVP * vec4(aPos, 0.0, 1.0);
 }

@@ -2,7 +2,6 @@
 #define _EDGE_LIGHTING_SPOTLIGHT_RENDERER_H_
 
 #include "renderer/base-renderer.h"
-#include "renderer/spotlight-shadow.h"
 #include "gl/shader-program.h"
 #include "gl/vertex-array.h"
 #include "gl/framebuffer.h"
@@ -16,8 +15,9 @@ namespace EdgeLighting
     /// The odd one out in this library: every other renderer parameterises its
     /// look by position along the rect's perimeter, and this one does not
     /// touch the rect at all. A lamp sits at a @c SpotLight::position in app
-    /// coordinates and points at a @c SpotLight::angle, and nothing occludes
-    /// it - a cone crosses the frame freely.
+    /// coordinates and points at a @c SpotLight::angle, and the rect does not
+    /// occlude it - a cone crosses the frame freely. The only occluder is one
+    /// the host places explicitly: see the shadow caster below.
     ///
     /// It also emits LIGHT ONLY. No backdrop, no fixture housings, no floor,
     /// no framebuffer capture, no LUT. What it is is the whole term stack in
@@ -30,26 +30,25 @@ namespace EdgeLighting
     /// alpha 0, which costs nothing on an opaque desktop window and erases the
     /// entire layer on an embedded surface a compositor or hardware video
     /// plane blends by alpha. A screen rather than an add so that overlapping
-    /// lamps approach full scale instead of clipping. See UseScreenBlend in the
-    /// .cpp for the blend and the measurements.
+    /// lamps approach full scale instead of clipping. See @ref Render for the
+    /// blend and the measurements.
     ///
     /// **One renderer, two resolution paths**, selected by
     /// @c SpotlightConfig::resolutionScale: at 1.0 the strips draw straight
     /// onto the framebuffer this renderer was handed (no offscreen buffer, no
     /// blit); below 1.0 they draw into a buffer of that fraction of the
-    /// viewport and are bilinear-blitted back. That draw is
-    /// @ref RenderOffscreen's - the effect runs it for every layer before any
-    /// layer composites, so the caller's target is drawn in one run - and the
-    /// blit is @ref Render's.
+    /// viewport and are bilinear-blitted back.
     ///
-    /// **An enabled clipped lamp pins the scale to 1.0**, because the clip
-    /// mask is resolved per fragment and a reduced buffer would resolve its
+    /// **An enabled clipped or shadow-casting lamp pins the scale to 1.0**,
+    /// because the clip mask (and the shadow's edge at the caster) is
+    /// resolved per fragment and a reduced buffer would resolve its
     /// boundary at that buffer's texel pitch - moving the edge, leaking light
     /// outside a @c KEEP_INSIDE area, and flattening
     /// @c ClipArea::edgeSoftness. The scaled path below is therefore only
-    /// ever reached with no lamp clipped. See @c GetClampedSpotScale in the
-    /// .cpp for the measurements and for why the neon's fix - moving its cut
-    /// into the blit - could not be reused here.
+    /// ever reached with no lamp clipped or casting. See
+    /// @c GetClampedSpotScale in the .cpp for the measurements and for why
+    /// the neon's fix - moving its cut into the blit - could not be reused
+    /// here.
     ///
     /// **No uniform that shapes the light differs between the paths.** The
     /// fragment stage reads only interpolated full-res lamp-local coordinates
@@ -92,7 +91,7 @@ namespace EdgeLighting
     /// frame, so the fragment program never touches a sin or a cos.
     ///
     /// **The VBO holds app coordinates verbatim** and the y-flip lives in the
-    /// projection (see @ref drawLamps), so it depends only on
+    /// projection (see @ref Render), so it depends only on
     /// @c Config::spotlight and never on the viewport: a resize costs one
     /// uniform, not a rebuild.
     ///
@@ -111,52 +110,55 @@ namespace EdgeLighting
     /// reduced-resolution buffer, which is why opting a lamp in costs the
     /// resolution scale - see the note on the two paths above.
     ///
-    /// **Light can be shadowed by a picture** - @c SpotlightConfig::shadowCaster,
-    /// opted into per lamp by @c SpotLight::castsShadow. All of it is
-    /// @ref SpotlightShadow (spotlight-shadow.h), a module of its own that
-    /// this class only calls into at marked hooks and serves through
-    /// @ref SpotShadowHost; like the clip it pins the resolution scale.
+    /// **Light can be shadowed by a picture** -
+    /// @c SpotlightConfig::shadowCaster, a rounded rectangle standing
+    /// @c ShadowCaster::wallDistance px off the wall, opted into per lamp by
+    /// @c SpotLight::castsShadow. Each fragment tests the line from itself to
+    /// the lamp (every lamp stands SPOT_LAMP_WALL_DISTANCE px off the wall)
+    /// against the caster, so the shadow is thrown away from the lamp and
+    /// follows it when it moves; the lamp's aperture sets the penumbra. The
+    /// caster's own face stays lit. Like the clip it is a coverage multiply
+    /// that only removes light, so the solved strips stand as they are - and
+    /// like the clip it pins the resolution scale.
+    ///
+    /// The caster is a flat panel by default. @c ShadowCaster::solid makes it
+    /// a block from the wall out to its depth - a framed picture - whose
+    /// shadow is attached to it and, for a lamp no further from the wall than
+    /// the block is deep, never ends; @c frameWidth / @c frameDepth give it
+    /// rails that shade the recessed picture inside them. See
+    /// docs/spotlight-solid-frame-plan.md.
+    ///
+    /// By default that shadow is physical: a second lamp lights a point in
+    /// the first one's shadow with exactly its own light, so the shadow shows
+    /// lighter wherever the second lamp is weaker. @c ShadowCaster::fill
+    /// washes it out instead, at the price of a SECOND PASS: the lamps are
+    /// drawn into @c mFillBuffer first, then drawn again onto the target by
+    /// a variant of the same program that reads how much of each pixel's
+    /// light came from the other lamps.
+    ///
+    /// All of the shadow's code sits together: the CPU derivation in the
+    /// .cpp's THE SHADOW CASTER block, the GL side in this class's THE
+    /// SHADOW CASTER method and member groups, the GLSL in spotlight.frag's
+    /// THE SHADOW section, and its per-lamp attributes at the end of
+    /// @c StripVertex.
     ///
     /// Parameters come from @c Config::spotlight. Nothing else is read - not
     /// @c Config::geometry, not @c Config::neon. The clip area is part of that
     /// sub-config rather than a reuse of @c Config::geometry for exactly this
     /// reason.
-    class SpotlightRenderer : public BaseRenderer, private SpotShadowHost
+    class SpotlightRenderer : public BaseRenderer
     {
     public:
         SpotlightRenderer() = default;
         virtual ~SpotlightRenderer() = default;
 
         virtual bool Initialize() override;
-        virtual void Update(float deltaTime, double time, const Config &config) override;
-
-        /// Phase 1: below scale 1.0, the lamps into @c mScaledBuffer - sized,
-        /// bound and cleared here, under no host scissor - and nothing on the
-        /// caller's framebuffer. At 1.0 (a clipped lamp pins it there), or
-        /// with the layer off, nothing but the shadow's own offscreen pass
-        /// (@ref SpotlightShadow::RenderOffscreen). Restores the framebuffer
-        /// and viewport it was handed, and leaves the blend as @ref Render
-        /// does.
-        virtual void RenderOffscreen(int viewportWidth, int viewportHeight, double time,
-                                     const Config &config) override;
-
-        /// Phase 2, onto the caller's framebuffer, screened: the scaled buffer
-        /// blitted back below 1.0, the lamps themselves at 1.0. A host that
-        /// calls it without RenderOffscreen for the same frame
-        /// (EdgeLightingEffect never does) gets that phase run first, here.
-        virtual void Render(int viewportWidth, int viewportHeight, double time, const Config &config) override;
+        virtual void Update(float deltaTime, float time, const Config &config) override;
+        virtual void Render(int viewportWidth, int viewportHeight, float time, const Config &config) override;
         virtual void OnConfigChanged(const Config &config) override;
         virtual RendererLayer GetLayer() const override { return RendererLayer::SPOTLIGHT; }
 
     private:
-        /// What @ref RenderOffscreen leaves for @ref Render in the same frame.
-        typedef struct FrameState
-        {
-            bool prepared = false;    ///< RenderOffscreen ran for this frame and Render has not consumed it.
-            glm::ivec2 viewport{0};   ///< The viewport it ran for.
-            bool scaledReady = false; ///< @c mScaledBuffer holds this frame's lamps: the blit draws.
-        } FrameState;
-
         /// One vertex of a lamp's strip. Declared here rather than in the .cpp
         /// only so @c mStripVerts below can be a member; nothing outside this
         /// class names it. Everything but @c pos and @c local is constant
@@ -189,13 +191,43 @@ namespace EdgeLighting
             /// costs nothing here: these are separate attribute pointers, not
             /// a std140 block.
             float spreadFalloff;
+
+            // THE SHADOW CASTER, per lamp - baked by DeriveLampShadow and read
+            // by spotlight.frag's THE SHADOW section (attributes 7, 8, 9).
+            /// The shadow, per lamp: the lamp's app position (x, y), the ratio
+            /// t = caster / lamp wall distance, and the penumbra's half width
+            /// on the caster's plane in px. Well-formed for EVERY lamp, a lamp
+            /// that casts nothing included (t 0, half width floored), so the
+            /// mask stays finite if it is ever evaluated for one - today
+            /// spotlight.frag only reaches it for a weight above 0. See
+            /// spotShadowMask.
+            float shadow[4];
+            /// How much of the caster this lamp honours: @c ShadowCaster::opacity
+            /// for a lamp that casts a shadow, 0 for one that does not. A
+            /// WEIGHT, for the reason @c clipWeight is one.
+            float shadowWeight;
+            /// The frame's rails shading the picture inside them, per lamp:
+            /// t_in = frameDepth / (lamp distance - picture depth), and the
+            /// penumbra's half width at the rails' front in px. (0, floored
+            /// width) when the caster has no recess. See
+            /// docs/spotlight-solid-frame-plan.md section 3.2.
+            float recess[2];
         } StripVertex;
 
-        static_assert(sizeof(StripVertex) == 17 * sizeof(float),
+        static_assert(sizeof(StripVertex) == 24 * sizeof(float),
                       "StripVertex must be tightly packed - ensureBuffer's "
                       "attribute pointers use sizeof(StripVertex) as the stride.");
 
         bool setupShaders();
+
+        /// The uniforms every strip program reads - the projection, the
+        /// dither switch, the clip area and (through
+        /// @ref uploadShadowUniforms) the shadow caster. One function for the
+        /// plain program and the fill variant, so the two passes of a filled
+        /// frame cannot draw the strips under different values.
+        void uploadStripUniforms(ShaderProgram &program, const glm::mat4 &mvp,
+                                 float dither, const Config &config);
+
         void setupBlitGeometry();
 
         /// Allocate @c mScaledBuffer at @p width x @p height in the best
@@ -214,7 +246,7 @@ namespace EdgeLighting
         /// Solve every enabled lamp's support and upload the strips.
         ///
         /// Runs from @ref OnConfigChanged (and @ref Initialize), not from
-        /// either phase of a frame, because its inputs are exactly @c Config::spotlight -
+        /// @ref Render, because its inputs are exactly @c Config::spotlight -
         /// the same invariant the lens flare's ghost table rests on. Under an
         /// animation driving any lamp scalar it therefore runs EVERY FRAME,
         /// so it is worth knowing what one costs.
@@ -224,7 +256,8 @@ namespace EdgeLighting
         /// includes the <= 37 KB @c glBufferSubData into the ceiling-sized
         /// allocation @ref ensureBuffer made once. (Those numbers predate the
         /// clip attribute, which added one float per vertex and no
-        /// transcendental calls at all.)
+        /// transcendental calls at all, and the shadow's seven, which take the
+        /// ceiling upload to 54 KB and add one divide per lamp.)
         ///
         /// The flatness across lamp counts is the useful part of that number.
         /// The arithmetic is **998 transcendental calls for one lamp and 7,880
@@ -240,29 +273,62 @@ namespace EdgeLighting
         /// a pixel in any verification scene.
         void buildStrips(const SpotlightConfig &spotlight);
 
-        /// Every uniform a strip program reads, onto @p program (in use): the
-        /// y-flipped ortho over the @p viewportWidth x @p viewportHeight app
-        /// viewport, whatever the target's size - the viewport transform alone
-        /// carries the scale - @c uDither, which @p scaled picks (the target
-        /// is the scaled buffer; see @c mScaledFormat), the clip area and the
-        /// shadow caster's. ONE function for the light's program and the
-        /// shadow's variants, so they cannot draw the strips under different
-        /// values.
-        void uploadStripUniforms(ShaderProgram &program, int viewportWidth, int viewportHeight, bool scaled,
-                                 const Config &config);
+        // --- THE SHADOW CASTER --------------------------------------------
+        // The GL side of SpotlightConfig::shadowCaster. Its CPU derivation
+        // (DeriveShadow, LampCastsShadow, DeriveLampShadow, UsesFillPass,
+        // UsesDarkenPass) is
+        // the THE SHADOW CASTER block of the .cpp's anonymous namespace; these
+        // are defined together at the end of the .cpp.
 
-        /// The lamps' own draw, into whatever is bound, through
-        /// @ref uploadStripUniforms. The caller sets the target and the blend
-        /// (UseScreenBlend in the .cpp).
-        void drawLamps(int viewportWidth, int viewportHeight, bool scaled, const Config &config);
+        /// The caster's uniforms - its rectangle, the solid switch, the
+        /// feather and the recessed picture. Called by
+        /// @ref uploadStripUniforms, so both strip programs get them.
+        void uploadShadowUniforms(ShaderProgram &program, const Config &config);
 
-        // --- SpotShadowHost: what THE SHADOW draws through, all at full
-        // resolution (spotlight-shadow.h). Thin wrappers over the above.
-        virtual void UploadStripUniforms(ShaderProgram &program, int viewportWidth, int viewportHeight,
-                                         const Config &config) override;
-        virtual void UseLightBlend() override;
-        virtual void DrawLamps(int viewportWidth, int viewportHeight, const Config &config) override;
-        virtual void DrawStrips(int first, int count) override;
+        /// The fill's FIRST pass target: allocate @c mFillBuffer at the
+        /// viewport's size, bind it and clear it. Render then draws the plain
+        /// strips into it.
+        /// @return false if the buffer would not allocate - nothing is bound
+        ///         then, and the frame must not draw.
+        bool bindFillTarget(int width, int height);
+
+        /// The fill's SECOND pass: the strips again, onto the caller's target
+        /// (which Render has already put back), through @c mFillShader, which
+        /// reads @c mFillBuffer to lift each lamp's shadow by the light the
+        /// OTHER lamps put there.
+        void renderFillPass(const glm::mat4 &mvp, float dither, const Config &config,
+                            int viewportHeight);
+
+        /// The fill's own uniforms - its source buffer on unit 0, the amount
+        /// and the buffer's height - for whichever program reads it: the fill
+        /// pass, and the darkening pass of a filled frame.
+        void uploadFillUniforms(ShaderProgram &program, const Config &config, int viewportHeight);
+
+        /// Build @c mDarkenShader and @c mDarkenFillShader on the first frame
+        /// that darkens. Lazily, unlike the fill: most hosts never set
+        /// @c ShadowCaster::darkness, and should not pay two more compiles at
+        /// startup. Tried once; a failure is logged and the frame draws the
+        /// light-only shadow.
+        void ensureDarkenPrograms();
+
+        /// The DARKENING pass (@c ShadowCaster::darkness): the casting lamps'
+        /// strips, before the light, onto the caller's target, through the
+        /// SPOT_SHADOW_DARKEN variant - each lamp's shadow written as
+        /// premultiplied colour OVER the destination, so a bright backdrop
+        /// darkens under it and the umbra records coverage. @p withFill picks
+        /// the variant that also reads @c mFillBuffer, so the fill lifts the
+        /// darkening with the shadow. Sets its own blend and puts the layer's
+        /// screen back.
+        void renderShadowDarkenPass(const glm::mat4 &mvp, float dither, const Config &config,
+                                    int viewportHeight, bool withFill);
+
+        /// A run of strip vertices whose lamps cast a shadow - what the
+        /// darkening pass draws. Neighbouring casting lamps share one run.
+        typedef struct CasterRange
+        {
+            int first; ///< First vertex in the VBO.
+            int count; ///< Vertices in the run.
+        } CasterRange;
 
     private:
         ShaderProgram mShaderProgram;
@@ -275,8 +341,7 @@ namespace EdgeLighting
         /// Allocated only when the scaled path first runs; at scale 1.0 this
         /// stays empty and costs nothing, and it is released again as soon as
         /// a config stops asking for it. Half float where the driver renders
-        /// to it, RGBA8 otherwise - see @ref resizeScaledBuffer. Drawn by
-        /// @ref RenderOffscreen, read by @ref Render.
+        /// to it, RGBA8 otherwise - see @ref resizeScaledBuffer.
         Framebuffer mScaledBuffer{"Spotlight.Scaled"};
         /// Index into SCALED_FORMATS (the .cpp) of the best format the driver
         /// has not refused for @c mScaledBuffer, where the walk resumes. Kept
@@ -300,7 +365,7 @@ namespace EdgeLighting
         /// Staging for @ref buildStrips, a member rather than a local for the
         /// reason @ref ensureBuffer gives about the VBO: under an animation
         /// that method runs every frame, and a local would heap-allocate and
-        /// free its 34 KB ceiling on each one. Cleared, never shrunk, so it
+        /// free its 54 KB ceiling on each one. Cleared, never shrunk, so it
         /// allocates exactly once.
         std::vector<StripVertex> mStripVerts;
 
@@ -310,17 +375,35 @@ namespace EdgeLighting
         /// false so the first build is unconditional however the renderer is
         /// brought up - @ref Initialize and @ref OnConfigChanged both honour it.
         bool mBuilt = false;
-        /// What this frame's @ref RenderOffscreen left for @ref Render - see
-        /// @ref FrameState.
-        FrameState mFrame;
 
-        /// Each drawn lamp's run of @c mStripVerts, recorded by
-        /// @ref buildStrips for THE SHADOW's per-lamp attributes. Reserved to
-        /// @c SPOT_MAX_LAMPS, so it allocates once.
-        std::vector<SpotLampStrip> mLampStrips;
-        /// THE SHADOW caster - every bit of it, GL objects included. See
-        /// spotlight-shadow.h.
-        SpotlightShadow mShadow{*this};
+        // --- THE SHADOW CASTER --------------------------------------------
+
+        /// spotlight.frag with SPOT_FILL defined: the second pass of a frame
+        /// with @c ShadowCaster::fill above 0, reading @c mFillBuffer to find
+        /// how much of each pixel's light came from the OTHER lamps. Built in
+        /// @ref setupShaders with the others, but NOT required by
+        /// @ref Initialize - if it fails, a filled frame draws the physical
+        /// shadow instead, and the layer keeps working.
+        ShaderProgram mFillShader;
+        /// The fill pass's source: every lamp, shadows applied, at the
+        /// viewport's size. Same lifetime rule as @c mScaledBuffer - allocated
+        /// the first frame a fill needs it, released when a config stops
+        /// asking. Never needed alongside it: a fill needs a shadow-casting
+        /// lamp, and that pins the scale to 1.0.
+        Framebuffer mFillBuffer{"Spotlight.Fill"};
+
+        /// spotlight.frag with SPOT_SHADOW_DARKEN - the darkening pass of a
+        /// frame with @c ShadowCaster::darkness above 0 - and the same with
+        /// SPOT_FILL as well, for a frame that also fills. Built by
+        /// @ref ensureDarkenPrograms; optional like @c mFillShader.
+        ShaderProgram mDarkenShader;
+        ShaderProgram mDarkenFillShader;
+        bool mDarkenProgramsTried = false; ///< Whether @ref ensureDarkenPrograms has run.
+
+        /// The casting lamps' vertex runs, rebuilt by @ref buildStrips with
+        /// the strips. Reserved to @c SPOT_MAX_LAMPS once, so a rebuild never
+        /// allocates.
+        std::vector<CasterRange> mCasterRanges;
     };
 }
 

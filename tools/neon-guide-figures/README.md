@@ -1,9 +1,9 @@
 # neon-guide-figures
 
 Renders every image in
-[`docs/guides/neon-onboarding-guide.md`](../../docs/guides/neon-onboarding-guide.md) into
+[`docs/neon-onboarding-guide.md`](../../docs/neon-onboarding-guide.md) into
 `docs/images/neon-onboarding/`, which
-[`docs/pages/neon-shader-outputs.html`](../../docs/pages/neon-shader-outputs.html) also
+[`docs/neon-shader-outputs.html`](../../docs/neon-shader-outputs.html) also
 reads its pass images from - plus two only that page shows, the edge ring's
 field and its composite below 1.0 (`pass-p1r-ring-field.png`,
 `pass-p2r-ring-composite.png`). Off in the default build, like

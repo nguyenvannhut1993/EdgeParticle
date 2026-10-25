@@ -2,8 +2,7 @@
 #define _EDGE_LIGHTING_DEMO_UI_CONTROLS_H_
 
 #include "core/edge-lighting.h"
-#include "renderer/spotlight-tuning.h" // SPOT_MAX_LAMPS + SPOT_BLOOM_WINDOW_OUTER
-#include "renderer/spotlight-shadow-tuning.h" // SPOT_LAMP_WALL_DISTANCE
+#include "renderer/spotlight-tuning.h" // SPOT_MAX_LAMPS, SPOT_BLOOM_WINDOW_OUTER, SPOT_LAMP_WALL_DISTANCE
 #include "util/geometry-utils.h"       // sun placement, shared with the renderer
 #include <iostream>
 #include <iomanip>
@@ -28,6 +27,7 @@ namespace EdgeLightingDemo
         std::cout << "  [SHIFT+O]      - Toggle Neon Resolution (full / half)\n";
         std::cout << "  [G]            - Toggle Wireframe Bounding Box\n";
         std::cout << "  [D]            - Toggle Water Droplets Pane\n";
+        std::cout << "  [K]            - Toggle Particles\n";
         std::cout << "  [W]            - Toggle Winding (CW / CCW)\n";
         std::cout << "  [SPACE]        - Pause / Resume Animation\n";
         std::cout << "  [ESC]          - Exit\n";
@@ -122,7 +122,7 @@ namespace EdgeLightingDemo
     /// reporting, and print the fields that actually decide the pixels.
     ///
     /// Covers every registered renderer - neon, droplets, lens flare,
-    /// spotlight, debug - in registration order, enabled or not. A disabled
+    /// spotlight, particles, debug - in registration order, enabled or not. A disabled
     /// layer still prints in full: the dump's job is to let someone rebuild
     /// the whole state, and "what was the flare set to before I turned it off"
     /// is exactly the question it gets asked.
@@ -483,7 +483,7 @@ namespace EdgeLightingDemo
             {
                 // The aperture bloom's SUPPORT, not its radius - that is what
                 // decides the strip area, and a large one fills the frame on
-                // its own. See docs/design/spotlight-renderer-plan.md.
+                // its own. See docs/spotlight-renderer-plan.md.
                 std::cout << " (support " << std::setprecision(0)
                           << l.bloomRadius * static_cast<float>(SPOT_BLOOM_WINDOW_OUTER) << " px)";
             }
@@ -498,6 +498,96 @@ namespace EdgeLightingDemo
             }
             std::cout << "  shadow " << (l.castsShadow ? "ON" : "OFF");
             std::cout << "\n";
+        }
+
+        // -------------------------------------------------------------------
+        // Particles. One emitter per arc - the neon's or the layer's own, per
+        // useNeonArc - each with its own settings, so every arc is spelled
+        // out, rate and all.
+        // -------------------------------------------------------------------
+        const auto &pt = config.particle;
+        const size_t arcCount = pt.useNeonArc ? config.neon.arcs.size() : pt.arcs.size();
+        const size_t emitters = pt.arcs.empty()
+                                    ? 0
+                                    : std::min(arcCount, static_cast<size_t>(ParticleConfig::MAX_ARCS_CAP));
+        const char *modeItems[] = {"MOVEMENT", "HEAD_SPARKS"};
+
+        std::cout << "\nParticles  " << (pt.enable ? "ON" : "OFF")
+                  << "   arcs from " << (pt.useNeonArc ? "the NEON (useNeonArc)" : "their OWN arcStart / arcLength")
+                  << "   (" << emitters << " emitter(s), ring "
+                  << emitters * ParticleArcConfig::MAX_PARTICLES_CAP << " motes)\n";
+        for (size_t i = 0; i < emitters; ++i)
+        {
+            // Mirrors ParticleManager::Render: a neon arc past the end of the
+            // list takes the last entry.
+            const size_t entry = std::min(i, pt.arcs.size() - 1);
+            const auto &p = pt.arcs[entry];
+            float start = p.arcStart;
+            float length = p.arcLength;
+            bool lit = length > 0.001f;
+            if (pt.useNeonArc)
+            {
+                const auto &a = config.neon.arcs[i];
+                start = a.start;
+                length = a.length;
+                lit = a.length > 0.001f && a.intensity > 0.0f;
+            }
+
+            std::cout << "  arc [" << i << "]";
+            if (entry != i)
+            {
+                std::cout << " (settings of [" << entry << "])";
+            }
+            std::cout << "  " << modeItems[static_cast<int>(p.mode)]
+                      << "  start " << std::setprecision(3) << start << ", length " << length;
+            if (!p.enable || !lit)
+            {
+                std::cout << "   " << (p.enable ? "dark" : "disabled") << ": emits nothing\n";
+                continue;
+            }
+
+            // Mirrors ParticleEmitter::Emit, clamp included.
+            const bool pointSource = p.mode == ParticleMode::HEAD_SPARKS;
+            const int cap = std::clamp(p.maxParticles, 0, ParticleArcConfig::MAX_PARTICLES_CAP);
+            const float rateCap = p.lifetime > 0.0f ? static_cast<float>(cap) / p.lifetime : 0.0f;
+            const float arcPx = length * peri;
+            const float rate = pointSource ? p.emissionRate : arcPx * 2.0f * p.emissionRate / 100.0f;
+            std::cout << "   " << std::setprecision(1) << arcPx << " px -> "
+                      << std::min(rate, rateCap) << " motes/s"
+                      << (rate > rateCap ? "   [clamped by maxParticles]" : "") << "\n";
+
+            std::cout << "    emissionRate     " << std::setprecision(1) << p.emissionRate
+                      << (pointSource ? "   (sparks/s)\n" : "   (arc px x 2 x this / 100 motes/s)\n");
+            std::cout << "    lifetime         " << std::setprecision(2) << p.lifetime << " s"
+                      << "   (the longest any mote lives)\n";
+            std::cout << "    speed            " << std::setprecision(1) << p.speed
+                      << (pointSource ? "   (px/s)" : "   (drift multiplier, not px/s)")
+                      << ", drag " << std::setprecision(2) << p.drag << " /s\n";
+            std::cout << "    sizeStart        " << std::setprecision(1) << p.sizeStart << " px"
+                      << ", maxParticles " << p.maxParticles << "\n";
+            std::cout << "    scatterRadius    " << std::setprecision(1) << p.scatterRadius << " px\n";
+            if (pointSource)
+            {
+                std::cout << "    spreadDeg        " << std::setprecision(1) << p.spreadDeg << " deg"
+                          << ", outwardBias " << std::setprecision(2) << p.outwardBias
+                          << "   (0 = along the sweep, 1 = straight out)\n";
+            }
+            else
+            {
+                std::cout << "    headBias         " << std::setprecision(2) << p.headBias
+                          << "   (<1 crowds the head, >1 the tail)\n";
+                std::cout << "    tailSizeFraction " << std::setprecision(2) << p.tailSizeFraction << "\n";
+            }
+            std::cout << "    colour           ";
+            if (p.useCustomColor)
+            {
+                std::cout << "custom (" << std::setprecision(2) << p.customColor.r << ", " << p.customColor.g
+                          << ", " << p.customColor.b << ", " << p.customColor.a << ")\n";
+            }
+            else
+            {
+                std::cout << "the neon's (its drawn glow, else the colour ring)\n";
+            }
         }
 
         const auto &d = config.debug;

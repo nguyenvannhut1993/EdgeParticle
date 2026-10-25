@@ -219,20 +219,15 @@ namespace EdgeLighting
             }
         }
 
-        void writeSegment(Config &cfg, size_t index, SegmentField field, float value, bool &logged)
+        void writeSegment(Config &cfg, size_t index, SegmentField field, float value)
         {
             SegmentBoost *s = segmentSlot(cfg, index);
             if (!s)
             {
-                if (!logged)
-                {
-                    logged = true;
-                    LOG_E("writeSegment: index %zu out of range (size=%zu); skipping",
-                          index, cfg.neon.segmentBoosts.size());
-                }
+                LOG_E("writeSegment: index %zu out of range (size=%zu); skipping",
+                      index, cfg.neon.segmentBoosts.size());
                 return;
             }
-            logged = false;
             writeSegmentScalar(*s, field, value);
         }
 
@@ -292,36 +287,27 @@ namespace EdgeLighting
         }
 
         void writeStop(Config &cfg, size_t segIdx, size_t stopIdx,
-                       ColorStopField field, float value, bool &logged)
+                       ColorStopField field, float value)
         {
             SegmentBoost *s = segmentSlot(cfg, segIdx);
             if (!s)
             {
-                if (!logged)
-                {
-                    logged = true;
-                    LOG_E("writeStop: segment index %zu out of range (size=%zu); skipping",
-                          segIdx, cfg.neon.segmentBoosts.size());
-                }
+                LOG_E("writeStop: segment index %zu out of range (size=%zu); skipping",
+                      segIdx, cfg.neon.segmentBoosts.size());
                 return;
             }
             ColorStop *c = colorStopSlot(s->colorStops, stopIdx);
             if (!c)
             {
-                if (!logged)
-                {
-                    logged = true;
-                    LOG_E("writeStop: stop index %zu out of range (size=%zu) for segment %zu; skipping",
-                          stopIdx, s->colorStops.size(), segIdx);
-                }
+                LOG_E("writeStop: stop index %zu out of range (size=%zu) for segment %zu; skipping",
+                      stopIdx, s->colorStops.size(), segIdx);
                 return;
             }
-            logged = false;
             writeColorStopScalar(*c, field, value);
         }
 
         void writePreservedStop(Config &cfg, uint32_t id, size_t stopIdx,
-                                ColorStopField field, float value, bool &logged)
+                                ColorStopField field, float value)
         {
             // Nothing is auto-grown here: the entry must have been acquired and
             // its stops sized already (via el_effect_set_preserved_segment_color_stop_count).
@@ -336,15 +322,10 @@ namespace EdgeLighting
             ColorStop *c = colorStopSlot(s.colorStops, stopIdx);
             if (!c)
             {
-                if (!logged)
-                {
-                    logged = true;
-                    LOG_E("writePreservedStop: stopIdx %zu out of range (size=%zu) for preserved id %u; skipping",
-                          stopIdx, s.colorStops.size(), id);
-                }
+                LOG_E("writePreservedStop: stopIdx %zu out of range (size=%zu) for preserved id %u; skipping",
+                      stopIdx, s.colorStops.size(), id);
                 return;
             }
-            logged = false;
             writeColorStopScalar(*c, field, value);
         }
 
@@ -359,20 +340,15 @@ namespace EdgeLighting
             return &cfg.neon.arcs[index];
         }
 
-        void writeArc(Config &cfg, size_t index, ArcField field, float value, bool &logged)
+        void writeArc(Config &cfg, size_t index, ArcField field, float value)
         {
             Arc *ap = arcSlot(cfg, index);
             if (!ap)
             {
-                if (!logged)
-                {
-                    logged = true;
-                    LOG_E("writeArc: index %zu out of range (size=%zu); skipping",
-                          index, cfg.neon.arcs.size());
-                }
+                LOG_E("writeArc: index %zu out of range (size=%zu); skipping",
+                      index, cfg.neon.arcs.size());
                 return;
             }
-            logged = false;
             Arc &a = *ap;
             switch (field)
             {
@@ -405,21 +381,16 @@ namespace EdgeLighting
             return &cfg.spotlight.lamps[index];
         }
 
-        void writeSpotlight(Config &cfg, size_t index, SpotlightField field, float value, bool &logged)
+        void writeSpotlight(Config &cfg, size_t index, SpotlightField field, float value)
         {
             SpotLight *lp = spotlightSlot(cfg, index);
             if (!lp)
             {
-                if (!logged)
-                {
-                    logged = true;
-                    LOG_E("writeSpotlight: index %zu out of range (size=%zu); skipping",
-                          index, cfg.spotlight.lamps.size());
-                }
+                LOG_E("writeSpotlight: index %zu out of range (size=%zu); skipping",
+                      index, cfg.spotlight.lamps.size());
                 return;
             }
 
-            logged = false;
             SpotLight &l = *lp;
             switch (field)
             {
@@ -502,36 +473,27 @@ namespace EdgeLighting
         }
 
         void writeArcStop(Config &cfg, size_t arcIdx, size_t stopIdx,
-                          ColorStopField field, float value, bool &logged)
+                          ColorStopField field, float value)
         {
             Arc *a = arcSlot(cfg, arcIdx);
             if (!a)
             {
-                if (!logged)
-                {
-                    logged = true;
-                    LOG_E("writeArcStop: arc index %zu out of range (size=%zu); skipping",
-                          arcIdx, cfg.neon.arcs.size());
-                }
+                LOG_E("writeArcStop: arc index %zu out of range (size=%zu); skipping",
+                      arcIdx, cfg.neon.arcs.size());
                 return;
             }
             ColorStop *c = colorStopSlot(a->colorStops, stopIdx);
             if (!c)
             {
-                if (!logged)
-                {
-                    logged = true;
-                    LOG_E("writeArcStop: stop index %zu out of range (size=%zu) for arc %zu; skipping",
-                          stopIdx, a->colorStops.size(), arcIdx);
-                }
+                LOG_E("writeArcStop: stop index %zu out of range (size=%zu) for arc %zu; skipping",
+                      stopIdx, a->colorStops.size(), arcIdx);
                 return;
             }
-            logged = false;
             writeColorStopScalar(*c, field, value);
         }
     } // namespace
 
-    void FieldBoundAnimation::ApplyAt(Config &cfg, double elapsed) const
+    void FieldBoundAnimation::ApplyAt(Config &cfg, float elapsed) const
     {
         for (const ScalarBinding &b : mScalarBindings)
         {
@@ -544,7 +506,7 @@ namespace EdgeLighting
         {
             if (b.modulator)
             {
-                writeSegment(cfg, b.index, b.field, b.modulator->Evaluate(elapsed), b.outOfRangeLogged);
+                writeSegment(cfg, b.index, b.field, b.modulator->Evaluate(elapsed));
             }
         }
         for (const PreservedSegmentBinding &b : mPreservedSegmentBindings)
@@ -559,7 +521,7 @@ namespace EdgeLighting
             if (b.modulator)
             {
                 writePreservedStop(cfg, b.id, b.stopIndex, b.field,
-                                   b.modulator->Evaluate(elapsed), b.outOfRangeLogged);
+                                   b.modulator->Evaluate(elapsed));
             }
         }
         for (const SegmentStopBinding &b : mSegmentStopBindings)
@@ -567,14 +529,14 @@ namespace EdgeLighting
             if (b.modulator)
             {
                 writeStop(cfg, b.segIndex, b.stopIndex, b.field,
-                          b.modulator->Evaluate(elapsed), b.outOfRangeLogged);
+                          b.modulator->Evaluate(elapsed));
             }
         }
         for (const SpotlightBinding &b : mSpotlightBindings)
         {
             if (b.modulator)
             {
-                writeSpotlight(cfg, b.index, b.field, b.modulator->Evaluate(elapsed), b.outOfRangeLogged);
+                writeSpotlight(cfg, b.index, b.field, b.modulator->Evaluate(elapsed));
             }
         }
 
@@ -582,7 +544,7 @@ namespace EdgeLighting
         {
             if (b.modulator)
             {
-                writeArc(cfg, b.index, b.field, b.modulator->Evaluate(elapsed), b.outOfRangeLogged);
+                writeArc(cfg, b.index, b.field, b.modulator->Evaluate(elapsed));
             }
         }
         for (const ArcStopBinding &b : mArcStopBindings)
@@ -590,7 +552,7 @@ namespace EdgeLighting
             if (b.modulator)
             {
                 writeArcStop(cfg, b.arcIndex, b.stopIndex, b.field,
-                             b.modulator->Evaluate(elapsed), b.outOfRangeLogged);
+                             b.modulator->Evaluate(elapsed));
             }
         }
     }

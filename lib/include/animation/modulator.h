@@ -23,19 +23,10 @@ namespace EdgeLighting
     /// Usage pattern, per frame:
     /// @code
     ///     clock.Update(deltaTime);
-    ///     cfg.neon.intensity  = pulse.Evaluate(clock.GetTime());
-    ///     cfg.neon.glowRadius = glowSweep.Evaluate(clock.GetTime());
+    ///     float t = clock.GetTime();
+    ///     cfg.neon.intensity  = pulse.Evaluate(t);
+    ///     cfg.neon.glowRadius = glowSweep.Evaluate(t);
     /// @endcode
-    ///
-    /// TIME IS A DOUBLE, for the reason the @ref Clock's is: a float time loses
-    /// the frame step after a day of uptime and stops advancing past 2^19 s
-    /// (~6.07 days). An @ref Animation evaluates its modulators on its own
-    /// elapsed time, which LOOP mode keeps bounded - but an animation with a
-    /// duration of 0 (FieldBoundAnimation's default, the *Curve animations)
-    /// is never wrapped, so its elapsed is as unbounded as the clock. Each
-    /// modulator reduces time in double to the bounded quantity it shapes (a
-    /// cycle's phase, a segment's local time, an ease's progress) and only
-    /// then narrows to float.
     ///
     /// No coupling to Config / no internal pointer state - modulators are pure
     /// functions of time, so they're trivially shareable, testable, and
@@ -56,7 +47,7 @@ namespace EdgeLighting
         /// @return The modulated value at @p time.
         /// @note Implementations should be pure (no side effects, no state
         ///       advanced by this call).
-        virtual float Evaluate(double time) const = 0;
+        virtual float Evaluate(float time) const = 0;
     };
 
     /// @brief Shared owning reference to a Modulator.
@@ -70,7 +61,7 @@ namespace EdgeLighting
     public:
         /// @param value The value returned for every time input.
         explicit Constant(float value) : mValue(value) {}
-        float Evaluate(double) const override { return mValue; }
+        float Evaluate(float) const override { return mValue; }
 
     private:
         float mValue;
@@ -110,16 +101,10 @@ namespace EdgeLighting
         {
         }
 
-        float Evaluate(double time) const override
+        float Evaluate(float time) const override
         {
-            // The cycle's phase, reduced in double and only then narrowed: a
-            // float product of an unbounded time has no fractional part left
-            // to take.
-            double cycle = static_cast<double>(mFreq) * time + static_cast<double>(mPhase);
-            cycle -= std::floor(cycle);
-            float t = static_cast<float>(cycle);
-            // Narrowing a value just under 1 can round up to 1.0f.
-            t = (t >= 1.0f) ? 0.0f : t;
+            float t = mFreq * time + mPhase;
+            t -= std::floor(t);
             float w;
             switch (mWave)
             {
@@ -179,25 +164,21 @@ namespace EdgeLighting
         {
         }
 
-        float Evaluate(double time) const override
+        float Evaluate(float time) const override
         {
             if (mDuration <= 0.0f)
             {
                 return mTo;
             }
-            double progress = time / static_cast<double>(mDuration);
+            float t = time / mDuration;
             if (mLoop)
             {
-                progress -= std::floor(progress);
+                t -= std::floor(t);
             }
             else
             {
-                progress = std::min(1.0, std::max(0.0, progress));
+                t = std::min(1.0f, std::max(0.0f, t));
             }
-            float t = static_cast<float>(progress);
-            // A looping progress just under 1 can narrow to 1.0f: that is the
-            // next cycle's start.
-            t = (mLoop && t >= 1.0f) ? 0.0f : t;
             float eased = mCurve ? mCurve(t) : t;
             return mFrom + (mTo - mFrom) * eased;
         }
@@ -234,16 +215,16 @@ namespace EdgeLighting
         /// @brief Enable or disable looping.
         void SetLoop(bool loop) { mLoop = loop; }
 
-        float Evaluate(double time) const override
+        float Evaluate(float time) const override
         {
             if (mSegments.empty())
             {
                 return 0.0f;
             }
-            double t = time;
+            float t = time;
             if (mLoop && mTotalDuration > 0.0f)
             {
-                t = std::fmod(t, static_cast<double>(mTotalDuration));
+                t = std::fmod(t, mTotalDuration);
             }
             for (const auto &seg : mSegments)
             {
@@ -271,7 +252,7 @@ namespace EdgeLighting
         /// @param a First modulator.
         /// @param b Second modulator.
         Multiplier(ModulatorPtr a, ModulatorPtr b) : mA(std::move(a)), mB(std::move(b)) {}
-        float Evaluate(double time) const override { return mA->Evaluate(time) * mB->Evaluate(time); }
+        float Evaluate(float time) const override { return mA->Evaluate(time) * mB->Evaluate(time); }
 
     private:
         ModulatorPtr mA, mB;
@@ -285,7 +266,7 @@ namespace EdgeLighting
         /// @param a First modulator.
         /// @param b Second modulator.
         Adder(ModulatorPtr a, ModulatorPtr b) : mA(std::move(a)), mB(std::move(b)) {}
-        float Evaluate(double time) const override { return mA->Evaluate(time) + mB->Evaluate(time); }
+        float Evaluate(float time) const override { return mA->Evaluate(time) + mB->Evaluate(time); }
 
     private:
         ModulatorPtr mA, mB;
@@ -302,7 +283,7 @@ namespace EdgeLighting
         /// @param outMax Upper bound of the output range.
         Remap(ModulatorPtr inner, float outMin, float outMax)
             : mInner(std::move(inner)), mMin(outMin), mMax(outMax) {}
-        float Evaluate(double time) const override
+        float Evaluate(float time) const override
         {
             float v = mInner->Evaluate(time);
             return mMin + (mMax - mMin) * v;

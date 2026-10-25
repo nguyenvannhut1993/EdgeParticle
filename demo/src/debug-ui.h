@@ -19,6 +19,7 @@ namespace EdgeLighting
     struct Config;
     class EdgeLightingEffect;
     class AnimationManager;
+    class ParticleManager;
 }
 
 class DebugUI
@@ -37,6 +38,13 @@ public:
 
     /// Feed the last frame's render time (only gEffect->Render, no ImGui) for display.
     void SetLastRenderTimeMs(float ms) { mLastRenderTimeMs = ms; }
+
+    /// The registered particle layer, read back for the live-count readout.
+    /// Optional: without it the Particles section just omits the count.
+    void SetParticleManager(std::shared_ptr<const EdgeLighting::ParticleManager> manager)
+    {
+        mParticleManager = std::move(manager);
+    }
 
     /// Render the ImGui frame into the debug window. Must be called after Build() each frame.
     void Render();
@@ -94,6 +102,7 @@ private:
     void buildDropletsSection(EdgeLighting::Config &cfg);
     void buildLensFlareSection(EdgeLighting::Config &cfg);
     void buildSpotlightSection(EdgeLighting::Config &cfg);
+    void buildParticleSection(EdgeLighting::Config &cfg);
     void buildAnimationSection(EdgeLighting::Config &cfg,
                                EdgeLighting::AnimationManager &manager);
     void buildBackgroundSection();
@@ -118,6 +127,12 @@ private:
     /// Which lamp the Spotlights section is editing. Clamped to the live
     /// list every frame, so removing a lamp cannot leave it dangling.
     int mSpotlightSelected = 0;
+
+    // --- Particles ---
+    std::shared_ptr<const EdgeLighting::ParticleManager> mParticleManager;
+    /// Which arc the Particles section is editing. Clamped to the listed arcs
+    /// every frame, so removing one cannot leave it dangling.
+    int mParticleSelected = 0;
 
     // --- Animation state ---
     // Animations are owned by the effect's AnimationManager (via

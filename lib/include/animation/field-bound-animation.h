@@ -182,10 +182,6 @@ namespace EdgeLighting
             size_t index;
             SegmentField field;
             ModulatorPtr modulator;
-            /// Set once an out-of-range write has been logged, so a pool a host shrank
-            /// under this binding logs once rather than every frame; cleared when the
-            /// binding writes again. Not part of the binding's identity.
-            mutable bool outOfRangeLogged = false;
         } SegmentBinding;
 
         /// @brief A single (preservedSegmentBoosts{id}.field, modulator) binding.
@@ -213,10 +209,6 @@ namespace EdgeLighting
             size_t stopIndex;
             ColorStopField field;
             ModulatorPtr modulator;
-            /// Set once an out-of-range write has been logged, so a pool a host shrank
-            /// under this binding logs once rather than every frame; cleared when the
-            /// binding writes again. Not part of the binding's identity.
-            mutable bool outOfRangeLogged = false;
         } PreservedSegmentStopBinding;
 
         /// @brief A single (segmentBoosts[segIdx].colorStops[stopIdx].field,
@@ -227,10 +219,6 @@ namespace EdgeLighting
             size_t stopIndex;
             ColorStopField field;
             ModulatorPtr modulator;
-            /// Set once an out-of-range write has been logged, so a pool a host shrank
-            /// under this binding logs once rather than every frame; cleared when the
-            /// binding writes again. Not part of the binding's identity.
-            mutable bool outOfRangeLogged = false;
         } SegmentStopBinding;
 
         /// @brief A single (arcs[index].field, modulator) binding.
@@ -239,10 +227,6 @@ namespace EdgeLighting
             size_t index;
             ArcField field;
             ModulatorPtr modulator;
-            /// Set once an out-of-range write has been logged, so a pool a host shrank
-            /// under this binding logs once rather than every frame; cleared when the
-            /// binding writes again. Not part of the binding's identity.
-            mutable bool outOfRangeLogged = false;
         } ArcBinding;
 
         /// @brief A single (arcs[arcIdx].colorStops[stopIdx].field,
@@ -253,10 +237,6 @@ namespace EdgeLighting
             size_t stopIndex;
             ColorStopField field;
             ModulatorPtr modulator;
-            /// Set once an out-of-range write has been logged, so a pool a host shrank
-            /// under this binding logs once rather than every frame; cleared when the
-            /// binding writes again. Not part of the binding's identity.
-            mutable bool outOfRangeLogged = false;
         } ArcStopBinding;
 
         /// @brief A single (spotlight.lamps[index].field, modulator) binding.
@@ -265,10 +245,6 @@ namespace EdgeLighting
             size_t index;
             SpotlightField field;
             ModulatorPtr modulator;
-            /// Set once an out-of-range write has been logged, so a pool a host shrank
-            /// under this binding logs once rather than every frame; cleared when the
-            /// binding writes again. Not part of the binding's identity.
-            mutable bool outOfRangeLogged = false;
         } SpotlightBinding;
 
         // --- Construction ------------------------------------------------
@@ -449,7 +425,7 @@ namespace EdgeLighting
         // --- Drive -------------------------------------------------------
 
         /// @brief Evaluate every binding at @p elapsed and write into @p cfg.
-        void ApplyAt(Config &cfg, double elapsed) const override;
+        void ApplyAt(Config &cfg, float elapsed) const override;
 
         // --- RESTORE support ------------------------------------------
         // Generic implementation. For scalar bindings we snapshot per-binding

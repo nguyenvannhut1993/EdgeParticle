@@ -6,6 +6,7 @@
 #include "renderer/droplets-renderer.h"
 #include "renderer/lens-flare-renderer.h"
 #include "renderer/spotlight-renderer.h"
+#include "renderer/particle-renderer.h"
 #include "animation/neon-animations.h"
 #include "debug-ui.h"
 #include "background-quad.h"
@@ -108,6 +109,12 @@ int main()
     auto neonRenderer = std::make_shared<EdgeLighting::NeonRenderer>();
     auto debugRenderer = std::make_shared<EdgeLighting::DebugRenderer>();
     auto dropletsRenderer = std::make_shared<EdgeLighting::DropletsRenderer>();
+    // One manager for every arc's motes - an emitter per arc, one draw.
+    auto particleManager = std::make_shared<EdgeLighting::ParticleManager>();
+    // Newborn particles copy the neon's drawn glow at their spawn point (the
+    // CPU colour ring when there is none) - which is why the particles are
+    // registered after the neon below.
+    particleManager->SetNeonSource(neonRenderer);
 
     gEffect->AddRenderer(neonRenderer);
     gEffect->AddRenderer(dropletsRenderer);
@@ -115,7 +122,12 @@ int main()
     // After the neon, whose opaque fill would paint over the cones, and
     // before the debug overlays, which annotate every layer under them.
     gEffect->AddRenderer(spotlightRenderer);
+    // Sparks sit on top of every light layer, still under the debug overlays.
+    gEffect->AddRenderer(particleManager);
     gEffect->AddRenderer(debugRenderer);
+
+    // The Particles section reads the live count back for its readout.
+    debugUI.SetParticleManager(particleManager);
 
     EdgeLighting::Config config;
     config.geometry.width = displayW / 2;
@@ -359,6 +371,11 @@ void OnKey(GLFWwindow *window, int key, int scancode, int action, int mods)
     case GLFW_KEY_D:
     {
         config.droplets.enable = !config.droplets.enable;
+        break;
+    }
+    case GLFW_KEY_K:
+    {
+        config.particle.enable = !config.particle.enable;
         break;
     }
     case GLFW_KEY_O:

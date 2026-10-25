@@ -344,31 +344,6 @@ namespace EdgeLighting
             }
         }
 
-        /// @ref ClearBuffer, but only over [x, x + width) x [y, y + height)
-        /// of each attachment, in texels: through the scissor, which this sets
-        /// for the clear and puts back exactly as it found it - the test's
-        /// state and the box. Bind first, as for ClearBuffer. Nothing for an
-        /// empty rect.
-        void ClearBufferRect(GLint x, GLint y, GLsizei width, GLsizei height, GLfloat r = 0.0f,
-                             GLfloat g = 0.0f, GLfloat b = 0.0f, GLfloat a = 0.0f) const
-        {
-            if (!IsValid() || width <= 0 || height <= 0)
-            {
-                return;
-            }
-            GLint box[4] = {0, 0, 0, 0};
-            glGetIntegerv(GL_SCISSOR_BOX, box);
-            const GLboolean scissored = glIsEnabled(GL_SCISSOR_TEST);
-            glEnable(GL_SCISSOR_TEST);
-            glScissor(x, y, width, height);
-            ClearBuffer(r, g, b, a);
-            glScissor(box[0], box[1], box[2], box[3]);
-            if (!scissored)
-            {
-                glDisable(GL_SCISSOR_TEST);
-            }
-        }
-
         /// Restores the default framebuffer. Does NOT touch the viewport - the
         /// caller is responsible for setting it back to the window size.
         ///
@@ -402,7 +377,7 @@ namespace EdgeLighting
         ///       That is a breaking change to the renderer plugin API - six
         ///       renderers and both demos - and is deliberately not taken
         ///       without a profile showing this query on the critical path.
-        ///       See docs/records/review-findings.md I5.
+        ///       See docs/review-findings.md I5.
         static GLuint GetBoundId()
         {
             GLint id = 0;

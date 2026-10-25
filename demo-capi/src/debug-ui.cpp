@@ -178,7 +178,7 @@ namespace
         }
 
         // The GLOW's cutoffs. One on the side glowSide culls is ignored (see
-        // neon.frag's band-distance block and docs/design/glow-side-comparison.md
+        // neon.frag's band-distance block and docs/glow-side-comparison.md
         // section 4.3); neither reaches the opaque fill, which has its own
         // pair in the opaque section.
         DrawCutoffRow(effect, "Inside Cutoff", idSuffix, el_effect_get_inside_cutoff,
@@ -523,6 +523,10 @@ namespace
         case EL_RENDERER_SPOTLIGHT:
         {
             return "Spotlight";
+        }
+        case EL_RENDERER_PARTICLES:
+        {
+            return "Particles";
         }
         case EL_RENDERER_DEBUG:
         {
@@ -1234,7 +1238,7 @@ void DebugUI::buildSpotlightSection(el_effect_handle_t effect)
         }
 
         // A solid block rather than a floating panel, and its frame: see
-        // docs/design/spotlight-solid-frame-plan.md.
+        // docs/spotlight-solid-frame-plan.md.
         el_bool_t solidOn = 0;
         el_effect_get_spotlight_shadow_solid(effect, &solidOn);
         bool solidEn = solidOn;

@@ -26,11 +26,7 @@ extern "C"
      *  @returns A fresh animation handle on success, @c NULL on failure. */
     EL_API el_animation_handle_t el_animation_create(el_animation_preset_e preset);
 
-    /** @brief Destroy an animation handle. Detach first if attached.
-     *  @details Clears the animation's callbacks, so neither fires again with
-     *           the userData they were given. An animation destroyed while
-     *           still attached keeps running in the effect and can then be
-     *           removed only by @ref el_effect_detach_all_animations. */
+    /** @brief Destroy an animation handle. Detach first if attached. */
     EL_API el_result_e el_animation_destroy(el_animation_handle_t anim);
 
     /** @} */

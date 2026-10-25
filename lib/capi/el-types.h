@@ -354,9 +354,10 @@ extern "C"
      *           the wrong layers. @ref EL_RENDERER_ALL is the exception,
      *           unchanged at 0x7FFFFFFF.
      *
-     *           A content layer added later takes the next free bit above
-     *           @ref EL_RENDERER_LENS_FLARE and joins @ref EL_RENDERER_ALL
-     *           without a further ABI change, leaving the debug bit alone. */
+     *           A content layer added later takes the next free bit above the
+     *           last content layer (@ref EL_RENDERER_PARTICLES today) and joins
+     *           @ref EL_RENDERER_ALL without a further ABI change, leaving the
+     *           debug bit alone. */
     typedef enum el_renderer_flags_e
     {
         EL_RENDERER_NONE = 0, /**< Register no renderers. */
@@ -368,6 +369,11 @@ extern "C"
                                           *   resolution scale. */
         EL_RENDERER_SPOTLIGHT = 1 << 3,  /**< Freely placed and aimed cones of light.
                                           *   Light only - no backdrop, no fixtures. */
+        EL_RENDERER_PARTICLES = 1 << 4,  /**< Point-sprite motes from the neon's arcs or
+                                          *   the layer's own - see el-particle.h. With
+                                          *   EL_RENDERER_NEON registered too they can copy
+                                          *   the neon's drawn glow; without it they take
+                                          *   its colour ring. Starts switched off. */
 
         /* --- Debug layer ----------------------------------------------- */
         EL_RENDERER_DEBUG = 1 << 30, /**< Debug overlays describing the neon layer: LUT
