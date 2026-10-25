@@ -5,6 +5,7 @@
 #include "animation/clock.h"
 #include "animation/animation.h"
 #include "renderer/base-renderer.h"
+#include "core/shared-buffer-registry.h"
 #include <vector>
 #include <memory>
 
@@ -37,6 +38,20 @@ namespace EdgeLighting
     /// @ref Modulator family; the animation subclasses (@ref IntensityPulse,
     /// @ref ArcWipe, @ref FieldBoundAnimation, ...) wrap those into @ref Config
     /// writes.
+    ///
+    /// ## Shared buffers
+    ///
+    /// Layers composite by blending onto the caller's framebuffer, and that
+    /// is all most of them see of each other. A layer that already draws an
+    /// offscreen buffer can also SHARE it with the other renderers - the
+    /// neon's reduced buffer, @ref SharedBufferId::NEON - through the effect's
+    /// @ref SharedBufferRegistry, which every registered renderer holds
+    /// (@ref BaseRenderer::GetSharedBufferRegistry). Nothing is drawn for a reader:
+    /// the producer's @ref SharedBuffer is the buffer it renders anyway, ready
+    /// once its offscreen phase has run - and @ref Render runs every layer's
+    /// offscreen phase before any layer composites, so a reader sees this
+    /// frame's image wherever it sits in the order. Internal to the renderers
+    /// - the host neither sees nor needs it.
     class EdgeLightingEffect
     {
     public:
@@ -62,7 +77,10 @@ namespace EdgeLighting
         /// @param deltaTime Seconds since the last frame.
         void Update(float deltaTime);
 
-        /// @brief Render all active renderers in registration order.
+        /// @brief Render all active renderers in registration order, in two
+        ///        phases: every renderer's offscreen work
+        ///        (BaseRenderer::RenderOffscreen), then every renderer's
+        ///        composite (BaseRenderer::Render).
         /// @param viewportWidth  Current framebuffer width in pixels.
         /// @param viewportHeight Current framebuffer height in pixels.
         void Render(int viewportWidth, int viewportHeight);
@@ -129,11 +147,11 @@ namespace EdgeLighting
         ///
         /// Takes effect on the next @ref Render. Nothing else depends on the
         /// order: @ref Update and the config notifications reach every renderer
-        /// regardless, and no renderer reads another's output except through
-        /// the framebuffer, which is exactly what the order decides - with one
-        /// exception, the particles, whose newborns copy the neon's glow from
-        /// its own buffer: moved under the neon, they read the previous
-        /// frame's.
+        /// regardless, and a renderer reads another's output only through the
+        /// framebuffer, which is exactly what the order decides - or through a
+        /// shared buffer (@ref SharedBufferRegistry), which every layer's offscreen
+        /// phase fills before any layer composites, so the order does not
+        /// decide which frame a reader sees.
         ///
         /// @returns false (and changes nothing) if @p order is not a
         ///          permutation of the registered renderers.
@@ -157,9 +175,8 @@ namespace EdgeLighting
         static std::shared_ptr<BaseRenderer> CreateRenderer(RendererLayer layer);
 
         /// The default compositing order, bottom first: neon, droplets, lens
-        /// flare, spotlight, particles, debug. The particles follow the neon
-        /// because newborns copy the glow it drew THIS frame; the debug
-        /// overlays go last because they annotate the layers under them.
+        /// flare, spotlight, debug. The debug overlays go last because they
+        /// annotate the layers under them.
         static const std::vector<RendererLayer> &GetDefaultLayerOrder();
 
         /// Whether @p order is a well-formed layer list: every entry a named
@@ -169,12 +186,6 @@ namespace EdgeLighting
 
         /// Creates the renderer for @p layer and registers it through
         /// @ref AddRenderer, with the same initialise-if-late contract.
-        ///
-        /// Also wires the two layers that talk to each other: once both
-        /// @ref RendererLayer::NEON and @ref RendererLayer::PARTICLES are
-        /// registered, in either order, the particles take the neon as their
-        /// colour source (@ref ParticleManager::SetNeonSource). A host that
-        /// registers renderers by pointer wires them itself.
         /// @returns false if @p layer names no renderer, is already
         ///          registered, or failed to initialise.
         bool AddRenderer(RendererLayer layer);
@@ -198,10 +209,6 @@ namespace EdgeLighting
 
     private:
         void refreshActiveConfig();
-        /// Hand the registered particle layer the registered neon as its
-        /// colour source, when both are there. Leaves the source alone with
-        /// no neon registered, so a source a host chose is not cleared.
-        void connectParticleSource();
 
     private:
         Config mBaseConfig;   ///< Authored config - what SetConfig sets.
@@ -231,6 +238,11 @@ namespace EdgeLighting
         Config mScratchConfig;
         Clock mClock;
         std::unique_ptr<AnimationManager> mAnimationManager;
+        /// The layers' shared buffers, handed to every renderer AddRenderer
+        /// registers. Shared ownership, because a renderer may outlive the
+        /// effect (a host keeps its own pointer) and must not hold a dangling
+        /// one.
+        std::shared_ptr<SharedBufferRegistry> mSharedBufferRegistry;
         std::vector<std::shared_ptr<BaseRenderer>> mRenderers;
         /// Set once @ref Initialize has run, so @ref AddRenderer knows whether
         /// a newly registered renderer still has an Initialize coming or has
