@@ -1342,18 +1342,18 @@ namespace EdgeLighting
         /// own colour and the picture washes out: real light multiplies a
         /// surface, this adds to it. Below 1 the face shows only that
         /// fraction of the light, and at 0 it shows exactly what the host
-        /// drew - but the rails' shadow on the picture (@ref frameWidth,
-        /// @ref frameDepth) STAYS: as the light goes it darkens the picture
-        /// instead, with @ref darkness's strength at 1 rising to the whole of
-        /// the lamp's share at 0, in @ref color. The wall, its light and its
-        /// shadow are untouched.
+        /// drew. The wall, its light and its shadow are untouched.
+        ///
+        /// The rails' shadow on the picture (@ref frameWidth,
+        /// @ref frameDepth) is drawn as every shadow is - the light it takes
+        /// away, of which less is left on the face, plus @ref darkness at the
+        /// same strength as on the wall, in @ref color. So at 0 that shadow
+        /// is @ref darkness alone: raise it to see the shadow on an unlit
+        /// picture, as on a wall with no light to take.
         ///
         /// Applies to every lamp with @c SpotLight::castsShadow, whatever
-        /// @ref wallDistance and @ref opacity are (both still shape the
-        /// rails' shadow; @ref opacity below 1 lightens it). Below 1 over a
-        /// recessed picture it runs the darkening pass even at @ref darkness
-        /// 0; otherwise it costs one rounded-box SDF per fragment of each such
-        /// lamp. At 1 nothing runs.
+        /// @ref wallDistance and @ref opacity are. Costs one rounded-box SDF
+        /// per fragment of each such lamp while below 1; at 1 nothing runs.
         float lightOnPicture = 1.0f;
 
         bool operator==(const ShadowCaster &o) const

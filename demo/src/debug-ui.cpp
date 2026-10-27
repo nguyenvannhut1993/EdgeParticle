@@ -1413,14 +1413,14 @@ void DebugUI::buildSpotlightSection(EdgeLighting::Config &cfg)
         SliderWithInput("Frame Depth##SpotShadow", caster.frameDepth, 0.0f, 100.0f, "%.0f px");
         // How much of the casting lamps' light the picture takes: the layer
         // screens its light over the picture, so a bright lamp washes it out.
-        // The frame's shadow on the picture stays, darkening it instead.
+        // The frame's shadow on the picture keeps the wall's Darkness.
         SliderWithInput("Light On Picture##SpotShadow", caster.lightOnPicture, 0.0f, 1.0f, "%.2f");
         if (ImGui::IsItemHovered())
         {
             ImGui::SetTooltip("How much of the casting lamps' light lands on the picture (the caster's rectangle).\n"
                               "1 = lit like the wall. Lower it when a bright lamp washes the picture out:\n"
-                              "at 0 the picture shows as drawn, and only the frame's shadow appears on it,\n"
-                              "darkening it (Opacity lightens that shadow, Shadow Color tints it).");
+                              "at 0 the picture shows as drawn. The frame's shadow on it is drawn by Darkness,\n"
+                              "as the wall's is - raise Darkness to see it on an unlit picture.");
         }
 
         // Same bridge as the clip's: a one-off copy, not a binding.

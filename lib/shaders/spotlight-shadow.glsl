@@ -90,25 +90,22 @@ precision highp float;
 // SCREENS its light over what the host drew, so a bright lamp lifts every dark
 // part of a picture towards the lamp's colour and the picture washes out. For
 // a lamp the CPU opts in (vPictureWeight: castsShadow, the option below 1, a
-// caster of some size), two things change on the FACE - the picture and its
-// frame, the rectangle the host draws into - and nothing else does:
+// caster of some size), the LIGHT the lamp shows on the FACE - the picture and
+// its frame, the rectangle the host draws into - is scaled by uPictureLight,
+// after the shadow (spotFaceGain), and nothing else changes.
 //
-//   - the LIGHT the lamp shows there is scaled by uPictureLight, after the
-//     shadow (spotFaceGain);
-//   - the rails' shadow on the recessed picture, the one shadow that falls on
-//     the face, DARKENS the picture with strength mix(1, darkness,
-//     uPictureLight) (spotShadowStrength): the wall's darkness at 1, all of
-//     the lamp's share at 0. A shadow that only took light away would vanish
-//     with the light; this one stays.
-//
-// So at 0 the face shows exactly what the host drew, darkened where the rails
-// shade it. Everything the shadow is made of - the mask, the fill's lift, the
-// darkening's reach - is still computed from the lamp's REAL light, which is
-// why SpotlightShadow::RenderOffscreen draws the fill's source buffer with
-// uPictureLight at 1: the option decides only how much of that light the face
-// shows and how the face's shadow is drawn. A weight of its own, apart from
-// vShadowWeight, because dimming the light needs no caster that casts: a
-// flush or transparent caster still keeps its picture out of the light.
+// So the rails' shadow on the recessed picture is drawn as every other shadow
+// is: the light it takes away, of which less is left on the face, plus the
+// darkening pass at ShadowCaster::darkness - the same strength inside the
+// picture as on the wall, at every value of this option. At 0 the face shows
+// exactly what the host drew, darkened by `darkness` where the rails shade it;
+// at darkness 0 nothing marks the shadow there, as nothing marks it on a wall
+// with no light to take. Everything the shadow is made of - the mask, the
+// fill's lift, the darkening's reach - is computed from the lamp's REAL light,
+// which is why SpotlightShadow::RenderOffscreen draws the fill's source buffer
+// with uPictureLight at 1. A weight of its own, apart from vShadowWeight,
+// because dimming the light needs no caster that casts: a flush or
+// transparent caster still keeps its picture out of the light.
 //
 // THE FILL VARIANT (SPOT_FILL), which is a look and not physics. With two
 // lamps, a point in lamp A's shadow receives exactly lamp B's light, so where
@@ -153,9 +150,8 @@ precision highp float;
 //
 // so the destination becomes dst * (1 - D) + colour * D, colour and alpha
 // alike: the backdrop darkens under the shadow and the umbra records
-// coverage. (On a picture kept out of the light, darkness rises - see THE
-// PICTURE'S LIGHT; this pass then runs whatever darkness is.) `cover` is the
-// light pass's own (fill lift included under SPOT_FILL), and `lit` the
+// coverage - on a picture kept out of the light as on the wall (THE PICTURE'S
+// LIGHT). `cover` is the light pass's own (fill lift included under SPOT_FILL), and `lit` the
 // lamp's unshadowed light - no light, no shadow,
 // and the shadow fades out with the beam inside the strip, which is what
 // keeps the strip bound free (see SPOT_SHADOW_FULL_REACH). One colour for
@@ -420,22 +416,6 @@ uniform float uShadowDarkness;
 /// ShadowCaster::color, linear RGB clamped to [0, 1].
 uniform vec3 uShadowColor;
 
-/// How strongly a shadow darkens the destination at app px @p app: darkness,
-/// except on the recessed picture of a lamp with vPictureWeight, where it
-/// rises towards 1 as uPictureLight falls - see THE PICTURE'S LIGHT above. The
-/// picture inside the rails only, not the whole face: the rails' shadow is the
-/// one shadow that falls there, while the face's own edge is where the WALL's
-/// shadow meets it, which keeps the wall's strength (rails a pixel or more
-/// wide keep the two apart).
-float spotShadowStrength(vec2 app) {
-    if (vPictureWeight > 0.0 && uShadowInner.w > 0.5) {
-        float dPicture = sdRoundBox(app - uShadowRect.xy, uShadowInner.xy, uShadowInner.z);
-        float onPicture = 1.0 - smoothstep(-0.5, 0.5, dPicture);
-        return mix(uShadowDarkness, mix(1.0, uShadowDarkness, uPictureLight), onPicture);
-    }
-    return uShadowDarkness;
-}
-
 /// The darkening variant's output for the fragment at app px @p app - see THE
 /// DARKENING VARIANT above, and the one call spotlight.frag's main() makes
 /// into this chunk in that variant. @p lit is the lamp's light after the shoulder and the clip,
@@ -454,7 +434,7 @@ vec4 spotShadowDarken(vec2 app, vec3 lit, float apertureWidth, float dither) {
     cover = spotFillLift(app, lit, cover);
 #endif
     float reach = smoothstep(0.0, SPOT_SHADOW_FULL_REACH, max(max(lit.r, lit.g), lit.b));
-    float d = spotShadowStrength(app) * (1.0 - cover) * reach;
+    float d = uShadowDarkness * (1.0 - cover) * reach;
     if (d <= 0.0) {
         return vec4(0.0);
     }

@@ -25,8 +25,7 @@ namespace EdgeLighting
     /// by default; @c ShadowCaster::solid makes it a block from the wall out,
     /// and @c frameWidth / @c frameDepth give it rails that shade the recessed
     /// picture inside them. @c ShadowCaster::lightOnPicture dims a lamp's
-    /// light on the caster's face, the rails' shadow on the picture darkening
-    /// it instead.
+    /// light on the caster's face.
     ///
     /// Two optional looks cost passes of their own. @c ShadowCaster::fill
     /// washes a lamp's shadow out by the OTHER lamps' light: the lamps are
@@ -35,8 +34,8 @@ namespace EdgeLighting
     /// shadow lets through (@ref RenderAfterLight). @c ShadowCaster::darkness
     /// darkens the backdrop under a shadow: the casting lamps' strips through
     /// the SPOT_SHADOW_DARKEN variant, under the light, in
-    /// @ref RenderBeforeLight - which also draws the rails' shadow on a
-    /// picture kept out of the light, whatever darkness is.
+    /// @ref RenderBeforeLight - on the wall and on the picture alike, which is
+    /// what marks the rails' shadow on a picture kept out of the light.
     ///
     /// **Added to the light, never changing it.** SpotlightRenderer and its
     /// shaders belong to other people, so the shadow enters them only through
@@ -189,6 +188,14 @@ namespace EdgeLighting
             bool fillReady = false; ///< @c mFillBuffer holds this frame's lamps.
         } FrameState;
 
+        /// What @ref uploadCasterUniforms sends as uPictureLight.
+        typedef enum class PictureLightUpload
+        {
+            NONE,         ///< Nothing: the darkening variants never read it, and a driver drops it.
+            CONFIG_VALUE, ///< @c ShadowCaster::lightOnPicture: the light and the fill's correction.
+            REAL_LIGHT    ///< 1: the fill's source, which has to hold the lamps' real light.
+        } PictureLightUpload;
+
         /// Build @c mSourceShader and @c mFillShader on the first frame that
         /// fills. Tried once; a failure is logged and a filled frame draws
         /// the physical shadow.
@@ -211,10 +218,9 @@ namespace EdgeLighting
         ///         then, and the pass must not draw.
         bool bindFillTarget(int width, int height);
 
-        /// The caster's uniforms onto @p program, in use - with uPictureLight
-        /// 1 when @p realLight (the fill's source, which has to hold the
-        /// lamps' real light), the config's value otherwise.
-        void uploadCasterUniforms(ShaderProgram &program, const Config &config, bool realLight);
+        /// The caster's uniforms onto @p program, in use, with uPictureLight
+        /// as @p pictureLight says.
+        void uploadCasterUniforms(ShaderProgram &program, const Config &config, PictureLightUpload pictureLight);
 
         /// The light's own strip uniforms onto one of this module's programs:
         /// what SpotlightRenderer's drawLamps uploads on the direct path - the

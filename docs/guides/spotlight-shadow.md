@@ -65,31 +65,30 @@ the wall). The layer screens its light over what the host drew, so a bright
 lamp lifts every dark part of a picture towards the lamp's own colour and the
 picture washes out: real light multiplies a surface, this adds to it. Below 1 a
 casting lamp shows only that fraction of its light on the face - the whole
-rectangle, rails included - and at 0 the face shows exactly what the host drew,
-**except the rails' shadow on the recessed picture (section 4), which stays**.
-With less light to take away, that shadow darkens the picture instead: by the
-darkening pass (section 5), at strength `mix(1, darkness, lightOnPicture)` - the
-wall's `darkness` at 1, the whole of the lamp's share at 0 - in `color`, so in a
-bright beam its umbra goes to the shadow colour. `opacity` below 1 lightens it.
-The wall, its light and its shadow are untouched. Everything the shadow is made
-of - the mask, the fill's lift, the darkening's reach - is still computed from
-the lamp's real light (the fill's source buffer is drawn with the face lit); the
-option only decides how much of that light the face shows and how the face's
-shadow is drawn. It needs only the lamp's `castsShadow`, not a caster that
-casts: a flush or transparent caster still keeps its picture out of the light.
-Below 1 over a recessed picture it runs the darkening pass even at `darkness`
-0; otherwise it costs one rounded-box SDF per fragment of an opted-in lamp. At 1
-nothing runs.
+rectangle, rails included - and at 0 the face shows exactly what the host drew.
+The wall, its light and its shadow are untouched. **`darkness` means the same
+inside the picture as on the wall, at every value**: the rails' shadow on the
+recessed picture (section 4) is the light it takes away, of which less is left
+on the face, plus the darkening pass (section 5) at `darkness`, in `color`. So
+at 0 that shadow is `darkness` alone - raise it to see the shadow on an unlit
+picture; at `darkness` 0 nothing marks it there, as nothing marks a shadow on a
+wall with no light to take. Everything the shadow is made of - the mask, the
+fill's lift, the darkening's reach - is computed from the lamp's real light
+(the fill's source buffer is drawn with the face lit). It needs only the lamp's
+`castsShadow`, not a caster that casts: a flush or transparent caster still
+keeps its picture out of the light. It costs one rounded-box SDF per fragment
+of an opted-in lamp while below 1; at 1 nothing runs.
 
-Verified offscreen on 14 scenes (panel, recess, solid frame, rounded corners,
+Verified offscreen on 17 scenes (panel, recess, solid frame, rounded corners,
 darkness, fill on two lamps, one of two lamps casting, a transparent wall, a
-flush caster, solid casters deeper than the lamps): at 1, byte-identical to the
-build before the field, colour and alpha. At 0: off the face byte-identical to
-1; the rails and every picture pixel the rails leave fully lit byte-identical to
-the backdrop as drawn (or, beside a lamp that does not cast, to that lamp's
-light alone); and the rails' umbra byte-identical to the render at 1 with
-`darkness` 1 - the same darkening, no light. At 0.5 the umbra is byte-identical
-to `darkness` `mix(1, d, 0.5)` at 1, and the lit picture shows half the light
+flush caster, solid casters deeper than the lamps, a clipped lamp): at 1,
+byte-identical to the build before the field, colour and alpha. At 0: off the
+face byte-identical to 1; the rails and every picture pixel the rails leave
+fully lit byte-identical to the backdrop as drawn (or, beside a lamp that does
+not cast, to that lamp's light alone); and the rails' umbra byte-identical to
+the render at 1 at the same `darkness`, at 0.5 too - it takes no light at any
+value, and the same darkening. At `darkness` 0.3 and 0.9 that umbra differs,
+and at 0.9 it matches 1 at 0.9. The lit picture at 0.5 shows half the light
 within a level. With fill on two lamps at different heights the fill still
 lifts one lamp's shadow on the picture by the other's real light (a build that
 fed the fill the dimmed light lifted nothing).
@@ -113,7 +112,7 @@ little light to remove. `darkness` (below) darkens the backdrop too.
 | `shadowCaster.darkness` | 0 | How far the shadow darkens what is behind the layer. 0 is light only. See "Over a bright backdrop" below. |
 | `shadowCaster.color` | black | The colour `darkness` paints the shadow with, linear RGB. |
 | `shadowCaster.solid`, `.frameWidth`, `.frameDepth` | `false`, 0, 0 | A solid block, and a frame around a recessed picture - section 4. |
-| `shadowCaster.lightOnPicture` | 1.0 | How much of a casting lamp's light lands on the picture (the face, rails included). 1 lights it like the wall; at 0 it shows as drawn and only the rails' shadow appears on it, darkening it - section 1. |
+| `shadowCaster.lightOnPicture` | 1.0 | How much of a casting lamp's light lands on the picture (the face, rails included). 1 lights it like the wall; at 0 it shows as drawn, and the rails' shadow on it is `darkness` alone, as on the wall - section 1. |
 | `SpotLight::castsShadow` | `false` | Per-lamp opt-in. The only gate. |
 
 **Inert by default, and not a trap.** Unlike a zero-size `KEEP_INSIDE` clip,
@@ -293,9 +292,10 @@ weights it - no light, no shadow, and the shadow fades out with the beam
 (`SPOT_SHADOW_FULL_REACH` 0.25, which also keeps it inside the strip). The
 light pass then screens every lamp on top as before, so a second lamp still
 lightens the first one's shadow, and `fill` lifts the darkening with the
-shadow. It darkens whatever the framebuffer already holds there. The same pass
-draws the rails' shadow on a picture kept out of the light (`lightOnPicture`
-below 1, section 1), at that option's strength, whatever `darkness` is.
+shadow. It darkens whatever the framebuffer already holds there - the picture
+inside the frame at the same strength as the wall, which is all that marks the
+rails' shadow on a picture kept out of the light (`lightOnPicture` 0, section
+1).
 
 Verified offscreen: `darkness` 0 is byte-identical to before on every scene
 (no pass runs); at 0.6, no pixel outside a shadow changes on any backdrop; a
@@ -417,4 +417,4 @@ its rect straight in.
 | A solid frame light cannot pass through | `shadowCaster.solid`; for "nothing behind it is lit", `shadowCaster.wallDistance` 150 or more |
 | Rails that shade the picture inside | `shadowCaster.frameWidth` + `shadowCaster.frameDepth` |
 | A longer rail shadow on the picture | `shadowCaster.frameDepth` (clamped to `wallDistance`), or the lamp further from the frame - not `frameWidth` |
-| A picture a bright lamp washes out | `shadowCaster.lightOnPicture` below 1 (0 = the picture as drawn, with only the rails' shadow on it) |
+| A picture a bright lamp washes out | `shadowCaster.lightOnPicture` below 1 (0 = the picture as drawn); `darkness` above 0 keeps the rails' shadow on it |

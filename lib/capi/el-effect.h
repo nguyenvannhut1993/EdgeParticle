@@ -849,15 +849,13 @@ extern "C"
      *         (lit like the wall).
      *  @details The layer screens its light over what the host drew, so a
      *           bright lamp washes a picture out. Below 1 the face shows that
-     *           fraction of the light, and at 0 it shows exactly as drawn -
-     *           except the frame's shadow on the recessed picture, which stays
-     *           and darkens it instead (darkness's strength at 1, the lamp's
-     *           whole share at 0, in the shadow colour). The wall, its light
-     *           and its shadow are untouched. Applies to every lamp with
+     *           fraction of the light, and at 0 it shows exactly as drawn. The
+     *           wall, its light and its shadow are untouched. The frame's
+     *           shadow on the recessed picture keeps the shadow darkness the
+     *           wall's has, so at 0 it is that darkness alone (none at
+     *           darkness 0). Applies to every lamp with
      *           el_effect_set_spotlight_casts_shadow set, whatever the
-     *           caster's distance and opacity.
-     *  @note  Below 1 over a recessed picture, the darkening pass runs even at
-     *         darkness 0. */
+     *           caster's distance and opacity. */
     EL_API el_result_e el_effect_set_spotlight_shadow_light_on_picture(el_effect_handle_t effect, float lightOnPicture);
     EL_API el_result_e el_effect_get_spotlight_shadow_light_on_picture(el_effect_handle_t effect,
                                                                        float *outLightOnPicture);

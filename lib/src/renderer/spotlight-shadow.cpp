@@ -160,8 +160,7 @@ namespace EdgeLighting
         }
 
         /// Whether @c ShadowCaster::lightOnPicture applies to @p lamp - its
-        /// picture weight: the light it shows on the face is scaled, and the
-        /// rails' shadow on the picture darkens it instead. The lamp's opt-in
+        /// picture weight: the light it shows on the face is scaled. The lamp's opt-in
         /// and the option alone: unlike @ref LampCastsShadow it does not ask
         /// whether the caster throws a shadow, so a flush, transparent or
         /// too-deep caster still keeps its picture out of the light, and the
@@ -281,26 +280,14 @@ namespace EdgeLighting
         }
 
         /// Whether this config's frame takes the darkening pass: the layer
-        /// on, something for it to darken, and a drawn lamp that throws a
-        /// shadow. Something is @c ShadowCaster::darkness above 0 - or a
-        /// recessed picture kept out of the light, whose rails' shadow this
-        /// pass draws whatever darkness is, since there is no light on it
-        /// left to take away (THE PICTURE'S LIGHT in spotlight-shadow.glsl).
+        /// on, @c ShadowCaster::darkness above 0, and a drawn lamp that throws
+        /// a shadow - on the wall or on a picture kept out of the light alike.
         /// Never alongside the scaled path, for the fill's reason.
         bool UsesDarkenPass(const Config &config)
         {
             const SpotlightConfig &spotlight = config.spotlight;
-            if (!spotlight.enable)
-            {
-                return false;
-            }
-            bool darkens = spotlight.shadowCaster.darkness > 0.0f;
-            if (!darkens)
-            {
-                const ShadowSolve shadow = DeriveShadow(spotlight.shadowCaster);
-                darkens = shadow.dimsPicture && shadow.hasRecess;
-            }
-            return darkens && AnyDrawnLampCasts(spotlight);
+            return spotlight.enable && spotlight.shadowCaster.darkness > 0.0f &&
+                   AnyDrawnLampCasts(spotlight);
         }
 
         /// @p src with a `#define` line per space-separated name in
@@ -542,7 +529,7 @@ namespace EdgeLighting
 
     void SpotlightShadow::UploadUniforms(ShaderProgram &program, const Config &config)
     {
-        uploadCasterUniforms(program, config, false);
+        uploadCasterUniforms(program, config, PictureLightUpload::CONFIG_VALUE);
     }
 
     void SpotlightShadow::RenderOffscreen(int viewportWidth, int viewportHeight, const Config &config)
@@ -588,7 +575,7 @@ namespace EdgeLighting
         UseScreenBlend();
         mSourceShader.Use();
         uploadLightUniforms(mSourceShader, viewportWidth, viewportHeight, config);
-        uploadCasterUniforms(mSourceShader, config, true);
+        uploadCasterUniforms(mSourceShader, config, PictureLightUpload::REAL_LIGHT);
         mStrips->DrawArrays(GL_TRIANGLES, mVertexCount);
         mSourceShader.Unuse();
 
@@ -631,7 +618,7 @@ namespace EdgeLighting
 
         program.Use();
         uploadLightUniforms(program, viewportWidth, viewportHeight, config);
-        uploadCasterUniforms(program, config, false);
+        uploadCasterUniforms(program, config, PictureLightUpload::NONE);
         if (withFill)
         {
             uploadFillUniforms(program, config, viewportHeight);
@@ -673,7 +660,7 @@ namespace EdgeLighting
         UseScreenBlend();
         mFillShader.Use();
         uploadLightUniforms(mFillShader, viewportWidth, viewportHeight, config);
-        uploadCasterUniforms(mFillShader, config, false);
+        uploadCasterUniforms(mFillShader, config, PictureLightUpload::CONFIG_VALUE);
         uploadFillUniforms(mFillShader, config, viewportHeight);
         for (const CasterRange &range : mCasterRanges)
         {
@@ -769,7 +756,8 @@ namespace EdgeLighting
         return true;
     }
 
-    void SpotlightShadow::uploadCasterUniforms(ShaderProgram &program, const Config &config, bool realLight)
+    void SpotlightShadow::uploadCasterUniforms(ShaderProgram &program, const Config &config,
+                                               PictureLightUpload pictureLight)
     {
         // On the same terms as the clip area: app coordinates, uploaded
         // unconditionally, inert where no lamp's weight reads it. Only the
@@ -792,8 +780,14 @@ namespace EdgeLighting
                            glm::vec4(shadowSolve.innerHalf.x, shadowSolve.innerHalf.y,
                                      shadowSolve.innerRadius, shadowSolve.hasRecess ? 1.0f : 0.0f));
         // Read only for a lamp whose picture weight is 1, which is decided
-        // per lamp in OnStripsBuilt; uploaded regardless, like the rest.
-        program.SetUniform("uPictureLight", realLight ? 1.0f : shadowSolve.lightOnPicture);
+        // per lamp in OnStripsBuilt; uploaded regardless of that, but only to
+        // the programs whose code reads it at all.
+        if (pictureLight != PictureLightUpload::NONE)
+        {
+            program.SetUniform("uPictureLight", pictureLight == PictureLightUpload::REAL_LIGHT
+                                                    ? 1.0f
+                                                    : shadowSolve.lightOnPicture);
+        }
     }
 
     void SpotlightShadow::uploadLightUniforms(ShaderProgram &program, int viewportWidth, int viewportHeight,

@@ -5,6 +5,38 @@ and what is open. Each entry names the commits it covers; the headers under
 `lib/include/` stay the source of truth, and the topic documents linked here
 hold the detail.
 
+## 2026-10-27 - `lightOnPicture`: Darkness drives the picture's shadow too
+
+Uncommitted, on top of the 2026-10-24 entry below. Intel Iris Plus Graphics 655.
+Reported by the owner: at `lightOnPicture` 0 the rails' shadow on the picture
+ignored `darkness` while the wall's shadow followed it. That was the 10-24
+design - on the picture the darkening ran at `mix(1, darkness,
+lightOnPicture)`, full strength at 0 whatever `darkness` was - chosen so the
+shadow showed at `darkness` 0. Offered three ways, the owner chose the first:
+`darkness` means the same inside the picture as on the wall, at every value.
+
+- **What changed.** `spotShadowStrength` is gone from `spotlight-shadow.glsl`:
+  the darkening variant writes `darkness * (1 - cover) * reach` everywhere, as
+  before `lightOnPicture` existed. `UsesDarkenPass` is back to `darkness > 0`
+  and a casting lamp - nothing for it to draw on the picture at 0 otherwise.
+  The darkening programs no longer read `uPictureLight`, so it is uploaded only
+  to the programs that do (`PictureLightUpload`) - a driver that drops unused
+  uniforms would otherwise log it as missing. So at `lightOnPicture` 0 the
+  rails' shadow is the darkening alone, and at `darkness` 0 nothing marks it -
+  the case the 10-24 design existed for, now the owner's accepted trade.
+  Tooltips, the config dump, the C ABI doc and the guides say so.
+- **Verified** (the 10-24 harness, 142 checks): the 17 default scenes render
+  as on 10-24 (13 byte-identical to the snapshot before `lightOnPicture`, the
+  four two-lamp fill scenes within the 2 levels the correction pass already
+  moved them). On every scene with a recessed picture, the rails' umbra at 0
+  and at 0.5 is byte-identical to 1 at the same `darkness`; at `darkness` 0 it
+  is the backdrop as drawn; `darkness` 0.3 and 0.9 differ there (up to 115
+  levels) and 0.9 matches 1 at 0.9. The fill check, now at `darkness` 0.6,
+  still lifts the higher lamp's shadow by the lower lamp's real light (8,222
+  pixels), and a copy feeding the fill the dimmed light fails it and nothing
+  else. No uniform logged missing or unmirrored. Library, C dylib and both
+  demos build with no new warnings. Not driven interactively.
+
 ## 2026-10-24 - The shadow caster's `lightOnPicture`, and a shadow that only adds to the light
 
 Uncommitted, on top of the 2026-10-22 merge below. Intel Iris Plus Graphics

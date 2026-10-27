@@ -167,7 +167,7 @@ reaches the picture. Reference: `spotlight-shadow.md`.
 | `solid` | bool | `false` | - | A block from the wall to `wallDistance`: shadow attached, grazing lamps cast forever. A short fixed search per fragment |
 | `frameWidth` | px | `0` | `[0, min(w,h)/2]` | Rail width; the picture is the rect inset by it |
 | `frameDepth` | px | `0` | `[0, wallDistance]` | Picture recess behind the rails; with `frameWidth` the top rail shades it |
-| `lightOnPicture` | fraction | `1.0` | `[0, 1]` | Casting lamps' light on the picture (the face, rails included). `1` lit like the wall; `0` the picture as drawn, the rails' shadow on it kept as a darkening of strength `mix(1, darkness, lightOnPicture)`. The wall untouched. Applies whatever `wallDistance` and `opacity` are; below `1` over a recessed picture the darkening pass runs even at `darkness` `0` |
+| `lightOnPicture` | fraction | `1.0` | `[0, 1]` | Casting lamps' light on the picture (the face, rails included). `1` lit like the wall; `0` the picture as drawn. The wall untouched. `darkness` acts on the rails' shadow on the picture as on the wall, so at `0` that shadow is `darkness` alone. Applies whatever `wallDistance` and `opacity` are |
 
 No enable flag. The per-lamp opt-in (`SpotLight.castsShadow`) is the only gate.
 

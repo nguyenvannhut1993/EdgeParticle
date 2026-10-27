@@ -1253,7 +1253,7 @@ void DebugUI::buildSpotlightSection(el_effect_handle_t effect)
         }
         // How much of the casting lamps' light the picture takes: the layer
         // screens its light over the picture, so a bright lamp washes it out.
-        // The frame's shadow on the picture stays, darkening it instead.
+        // The frame's shadow on the picture keeps the wall's Darkness.
         float lightOnPicture = 1.0f;
         el_effect_get_spotlight_shadow_light_on_picture(effect, &lightOnPicture);
         if (ImGui::SliderFloat("Light On Picture##SpotShadow", &lightOnPicture, 0.0f, 1.0f, "%.2f"))
@@ -1264,8 +1264,8 @@ void DebugUI::buildSpotlightSection(el_effect_handle_t effect)
         {
             ImGui::SetTooltip("How much of the casting lamps' light lands on the picture (the caster's rectangle).\n"
                               "1 = lit like the wall. Lower it when a bright lamp washes the picture out:\n"
-                              "at 0 the picture shows as drawn, and only the frame's shadow appears on it,\n"
-                              "darkening it (Opacity lightens that shadow, Shadow Color tints it).");
+                              "at 0 the picture shows as drawn. The frame's shadow on it is drawn by Darkness,\n"
+                              "as the wall's is - raise Darkness to see it on an unlit picture.");
         }
 
         if (ImGui::SmallButton("Match Rect##SpotShadow"))

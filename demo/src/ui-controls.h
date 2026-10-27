@@ -430,7 +430,7 @@ namespace EdgeLightingDemo
                   << ((sc.frameWidth > 0.0f && sc.frameDepth > 0.0f) ? " (rails shade the picture)" : " (no rail shadow)")
                   << "\n";
         std::cout << "                   light on picture " << std::setprecision(2) << sc.lightOnPicture
-                  << (sc.lightOnPicture < 1.0f ? " (casting lamps' light on the picture dimmed; the frame's shadow darkens it)"
+                  << (sc.lightOnPicture < 1.0f ? " (casting lamps' light on the picture dimmed; Darkness draws the frame's shadow on it)"
                                                : " (lit like the wall)")
                   << "\n";
         if (!anyShadowLamp)
