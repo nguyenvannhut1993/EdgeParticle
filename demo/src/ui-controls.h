@@ -4,6 +4,7 @@
 #include "core/edge-lighting.h"
 #include "renderer/spotlight-tuning.h" // SPOT_MAX_LAMPS + SPOT_BLOOM_WINDOW_OUTER
 #include "renderer/spotlight-shadow-tuning.h" // SPOT_LAMP_WALL_DISTANCE
+#include "renderer/spotlight-shadow.h"        // SpotlightShadow::PinsResolutionScale
 #include "util/geometry-utils.h"       // sun placement, shared with the renderer
 #include <iostream>
 #include <iomanip>
@@ -358,9 +359,11 @@ namespace EdgeLightingDemo
         const char *clipItems[] = {"KEEP_INSIDE", "KEEP_OUTSIDE"};
         size_t drawnLamps = std::min(sp.lamps.size(), static_cast<size_t>(SPOT_MAX_LAMPS));
 
-        // Mirrors the library's pin (HasClippedLamp and
-        // SpotlightShadow::PinsResolutionScale): the lamps that DRAW, within
-        // the ceiling. Either kind holds resolutionScale at 1.0.
+        // The lamps that DRAW, within the ceiling, of either kind. A clipped
+        // one holds resolutionScale at 1.0 (this mirrors the light's
+        // HasClippedLamp); whether a casting one does is asked of the library
+        // below, since a build can switch that pin off (PIN_RESOLUTION_SCALE
+        // in spotlight-shadow.cpp).
         bool anyClippedLamp = false;
         bool anyShadowLamp = false;
         for (size_t i = 0; i < drawnLamps; ++i)
@@ -390,7 +393,8 @@ namespace EdgeLightingDemo
         std::cout << "  resolutionScale  " << std::setprecision(2) << sp.resolutionScale
                   << (sp.resolutionScale < 1.0f ? "   (scaled buffer + blit)"
                                                 : "   (full res, direct)");
-        if (sp.resolutionScale < 1.0f && (anyClippedLamp || anyShadowLamp))
+        if (sp.resolutionScale < 1.0f &&
+            (anyClippedLamp || EdgeLighting::SpotlightShadow::PinsResolutionScale(sp)))
         {
             std::cout << "   [HELD AT 1.0: a clipped or shadow-casting lamp is enabled]";
         }

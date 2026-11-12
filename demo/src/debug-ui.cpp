@@ -1,5 +1,6 @@
 #include "debug-ui.h"
 #include "renderer/spotlight-tuning.h"
+#include "renderer/spotlight-shadow.h"
 #include "animation/animation-manager.h"
 #include "core/config.h"
 #include "core/edge-lighting.h"
@@ -1257,15 +1258,17 @@ void DebugUI::buildSpotlightSection(EdgeLighting::Config &cfg)
         // The library holds the scale at 1.0 while a clipped or shadow-casting
         // lamp is enabled, because a mask edge has to be resolved at full
         // resolution. Say so here, or the slider reads as broken: it moves and
-        // the frame does not change. Mirrors the library's pin - the light's
-        // HasClippedLamp and SpotlightShadow::PinsResolutionScale, both in
-        // GetClampedSpotScale - over the lamps that DRAW, within the ceiling.
+        // the frame does not change. The two pins of GetClampedSpotScale: the
+        // shadow's is asked of the library, since a build can switch it off
+        // (PIN_RESOLUTION_SCALE in spotlight-shadow.cpp); the clip's mirrors
+        // the light's HasClippedLamp, over the lamps that DRAW, within the
+        // ceiling.
         size_t drawnLamps = std::min(cfg.spotlight.lamps.size(), size_t(SPOT_MAX_LAMPS));
-        bool anyMaskedLamp = false;
+        bool anyMaskedLamp = EdgeLighting::SpotlightShadow::PinsResolutionScale(cfg.spotlight);
         for (size_t i = 0; i < drawnLamps; i++)
         {
             const auto &lamp = cfg.spotlight.lamps[i];
-            if ((lamp.clipped || lamp.castsShadow) && lamp.enable && lamp.intensity > 0.0f)
+            if (lamp.clipped && lamp.enable && lamp.intensity > 0.0f)
             {
                 anyMaskedLamp = true;
                 break;

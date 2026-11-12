@@ -158,6 +158,18 @@ float spotClipMask(vec2 app) {
 uniform float uDither;
 
 void main() {
+    // THE SHADOW's darkening variant (spotlight-shadow.glsl) takes its mask
+    // before the light, with the aperture floored as apertureWidth is below:
+    // where nothing is in shadow it writes an exact 0 without shading the lamp
+    // at all.
+#ifdef SPOT_SHADOW_DARKEN
+    float shadowCover = spotShadowDarkenCover(vApp, max(vP1.x, SPOT_MIN_APERTURE));
+    if (shadowCover >= 1.0) {
+        fragColor = vec4(0.0);
+        return;
+    }
+#endif
+
     float along = vLocal.x;
     float across = vLocal.y;
 
@@ -255,7 +267,7 @@ void main() {
     // for its reasons. The darkening variant writes the shadow instead of the
     // light, and stops here.
 #ifdef SPOT_SHADOW_DARKEN
-    fragColor = spotShadowDarken(vApp, lit, apertureWidth, spotDitherOffset(vLocal) * uDither);
+    fragColor = spotShadowDarken(vApp, shadowCover, lit, spotDitherOffset(vLocal) * uDither);
     return;
 #else
     lit = spotShadowLight(vApp, lit, apertureWidth);

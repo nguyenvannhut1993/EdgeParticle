@@ -7,6 +7,7 @@
 
 #include <glm/gtc/matrix_transform.hpp>
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstring>
 #include <iterator>
@@ -16,6 +17,24 @@ namespace EdgeLighting
 {
     namespace
     {
+        /// THE SCALE PIN, as a build-time switch: whether a casting lamp holds
+        /// SpotlightConfig::resolutionScale at 1.0 (PinsResolutionScale).
+        ///
+        /// true, the default: every shadow is resolved at full resolution,
+        /// whatever scale the config asks for. false: the light runs at the
+        /// configured scale, shadow and all - the speed of the scaled path,
+        /// at the price of the picture's edges. The light's mask is then
+        /// resolved per texel of the reduced buffer and the blit smears it, so
+        /// where the lit face meets its shadow the edge steps at the buffer's
+        /// pitch (a staircase round a rounded corner, 2 px at 0.5, 4 px at
+        /// 0.25) and the sharp edges blur. The shadow's own passes - the
+        /// darkening, the fill - still draw at full resolution: they gain
+        /// nothing, and the fill's correction is computed against
+        /// full-resolution light that the blit only approximates. The clip's
+        /// pin is the light's own (HasClippedLamp) and stays either way.
+        /// Measured in section 2 of docs/guides/spotlight-shadow.md.
+        constexpr bool PIN_RESOLUTION_SCALE = true;
+
         // ===================================================================
         // THE SHADOW CASTER's CPU derivation of SpotlightConfig::shadowCaster.
         // Pure functions of the config; the GL side is SpotlightShadow below,
@@ -236,6 +255,143 @@ namespace EdgeLighting
             return shadow.opacity;
         }
 
+        /// Stand-in for "past every viewport" in a shadow box: a solid caster
+        /// at least as deep as the lamps are far out throws its shadow away
+        /// from the lamp without end. Finite, so a box stays plain arithmetic;
+        /// WindowRect clamps it to the viewport.
+        constexpr double SHADOW_BOX_FAR = 1.0e9;
+
+        /// One axis of the wall point whose line to a lamp at @p lamp crosses
+        /// the caster's plane coordinate @p q a fraction @p s of the way there:
+        /// q = mix(p, lamp, s), so p = (q - s * lamp) / (1 - s). At s = 1 - a
+        /// solid block as deep as the lamps are far out, the line's whole
+        /// length - that is the limit: off to SHADOW_BOX_FAR on the side of
+        /// the lamp q lies on, or q itself when q is the lamp's coordinate.
+        double WallAt(double q, double lamp, double s)
+        {
+            const double den = 1.0 - s;
+            if (den > 0.0)
+            {
+                return (q - s * lamp) / den;
+            }
+            if (q > lamp)
+            {
+                return SHADOW_BOX_FAR;
+            }
+            if (q < lamp)
+            {
+                return -SHADOW_BOX_FAR;
+            }
+            return q;
+        }
+
+        /// The box, in app px, outside which spotShadowMask returns EXACTLY 1
+        /// for this lamp - so the darkening writes an exact 0 there, and the
+        /// fill's correction an exact 0 plus under half a step of dither,
+        /// which the screen cannot round up. Every pass that draws only
+        /// shadows is scissored to it (SpotlightShadow::drawCasterRanges): a
+        /// lamp's strip is most of the frame below it, its shadow a band by
+        /// the caster. @p lampShadow is what DeriveLampShadow wrote for the
+        /// lamp - its app position, t and the panel's half width - and
+        /// @p apertureWidth the floored aperture the shader reads.
+        ///
+        /// The mask is mix(wall, face, onFace), so the box is the bound of:
+        ///   - THE FACE grown by the half pixel its edge is feathered over:
+        ///     past it onFace is exactly 0 and the mask is exactly the wall's
+        ///     term (a mix weighted 0 returns its first operand). The recessed
+        ///     picture lies inside it.
+        ///   - THE WALL: below 1 only where the line to the lamp passes within
+        ///     the penumbra's window of the caster, i.e. crosses the caster's
+        ///     box grown by that window at some fraction s of the way - for a
+        ///     panel at s = t with the half width lampShadow[3]; for a solid at
+        ///     any s in [0, t], the window growing linearly from the feather
+        ///     at the wall to aperture * t (spotSolidWall). Mapped back to the
+        ///     wall by WallAt, each bound is then a linear-fractional function
+        ///     of s whose derivative keeps one sign, so the two ends of the
+        ///     interval bound it.
+        /// Plus one pixel each way for rasterisation and float rounding.
+        void LampShadowBox(const ShadowSolve &shadow, const float lampShadow[4], float apertureWidth,
+                           glm::vec2 &outLo, glm::vec2 &outHi)
+        {
+            const glm::dvec2 lamp(lampShadow[0], lampShadow[1]);
+            const glm::dvec2 center(shadow.center);
+            const glm::dvec2 half(shadow.half);
+            const double t = static_cast<double>(lampShadow[2]);
+
+            glm::dvec2 lo = center - half - 0.5;
+            glm::dvec2 hi = center + half + 0.5;
+
+            const auto addWall = [&](double s, double window)
+            {
+                for (int axis = 0; axis < 2; axis++)
+                {
+                    lo[axis] = std::min(lo[axis], WallAt(center[axis] - half[axis] - window, lamp[axis], s));
+                    hi[axis] = std::max(hi[axis], WallAt(center[axis] + half[axis] + window, lamp[axis], s));
+                }
+            };
+            if (shadow.solid)
+            {
+                // spotSolidWall's window, which its floor of 1e-4 never
+                // reaches: the feather is floored there, the aperture at
+                // SPOT_MIN_APERTURE.
+                const double feather = std::max(0.5 * static_cast<double>(shadow.softness), 1.0e-4);
+                addWall(0.0, feather);
+                addWall(t, static_cast<double>(apertureWidth) * t + feather * (1.0 - t));
+            }
+            else
+            {
+                addWall(t, static_cast<double>(lampShadow[3]));
+            }
+
+            outLo = glm::vec2(lo - 1.0);
+            outHi = glm::vec2(hi + 1.0);
+        }
+
+        /// @p lo / @p hi, a box in app px, as the whole pixels it touches of a
+        /// (0, 0, @p width, @p height) viewport under the layer's y-flipped
+        /// ortho - app y runs down from the top, window y up from the bottom -
+        /// clamped to the viewport. In floating point until it is clamped,
+        /// since a shadow box can end SHADOW_BOX_FAR out. Every pixel whose
+        /// centre lies in the box is in the rect.
+        /// @return false when no pixel of the viewport is in the box.
+        bool WindowRect(const glm::vec2 &lo, const glm::vec2 &hi, int width, int height, GLint out[4])
+        {
+            const double w = static_cast<double>(width);
+            const double h = static_cast<double>(height);
+            const double x0 = std::min(std::max(std::floor(static_cast<double>(lo.x)), 0.0), w);
+            const double x1 = std::min(std::max(std::ceil(static_cast<double>(hi.x)), 0.0), w);
+            const double y0 = std::min(std::max(std::floor(h - static_cast<double>(hi.y)), 0.0), h);
+            const double y1 = std::min(std::max(std::ceil(h - static_cast<double>(lo.y)), 0.0), h);
+            if (x1 <= x0 || y1 <= y0)
+            {
+                return false;
+            }
+            out[0] = static_cast<GLint>(x0);
+            out[1] = static_cast<GLint>(y0);
+            out[2] = static_cast<GLint>(x1 - x0);
+            out[3] = static_cast<GLint>(y1 - y0);
+            return true;
+        }
+
+        /// @p rect cut down to @p box, both (x, y, width, height).
+        /// @return false when nothing of it is left.
+        bool IntersectRect(GLint rect[4], const GLint box[4])
+        {
+            const GLint x0 = std::max(rect[0], box[0]);
+            const GLint y0 = std::max(rect[1], box[1]);
+            const GLint x1 = std::min(rect[0] + rect[2], box[0] + box[2]);
+            const GLint y1 = std::min(rect[1] + rect[3], box[1] + box[3]);
+            if (x1 <= x0 || y1 <= y0)
+            {
+                return false;
+            }
+            rect[0] = x0;
+            rect[1] = y0;
+            rect[2] = x1 - x0;
+            rect[3] = y1 - y0;
+            return true;
+        }
+
         /// Whether any lamp this pass will DRAW throws a shadow of the caster -
         /// @ref LampCastsShadow, the test @ref DeriveLampShadow makes, over the
         /// same drawn lamps @ref SpotlightShadow::PinsResolutionScale counts.
@@ -270,8 +426,11 @@ namespace EdgeLighting
         /// @ref SpotlightShadow::OnConfigChanged (whether to keep the buffer),
         /// for the reason the light's UsesScaledBuffer is one.
         ///
-        /// Never true alongside the light's scaled path: a lamp that throws a
-        /// shadow has @c castsShadow set, and that pins the scale to 1.0.
+        /// Alongside the light's scaled path only when PIN_RESOLUTION_SCALE is
+        /// off - a lamp that throws a shadow has @c castsShadow set, which
+        /// otherwise pins the scale to 1.0. Its passes draw at full resolution
+        /// either way; see PIN_RESOLUTION_SCALE for what the fill then gets
+        /// wrong.
         bool UsesFillPass(const Config &config)
         {
             const SpotlightConfig &spotlight = config.spotlight;
@@ -282,7 +441,9 @@ namespace EdgeLighting
         /// Whether this config's frame takes the darkening pass: the layer
         /// on, @c ShadowCaster::darkness above 0, and a drawn lamp that throws
         /// a shadow - on the wall or on a picture kept out of the light alike.
-        /// Never alongside the scaled path, for the fill's reason.
+        /// Alongside the scaled path only when PIN_RESOLUTION_SCALE is off, and
+        /// then still at full resolution, onto the caller's target, under the
+        /// light's blit.
         bool UsesDarkenPass(const Config &config)
         {
             const SpotlightConfig &spotlight = config.spotlight;
@@ -361,6 +522,13 @@ namespace EdgeLighting
 
     bool SpotlightShadow::PinsResolutionScale(const SpotlightConfig &spotlight)
     {
+        // Switched off at build time: the light takes the scale the config
+        // asks for - see PIN_RESOLUTION_SCALE.
+        if (!PIN_RESOLUTION_SCALE)
+        {
+            return false;
+        }
+
         // The same drawn-lamp test as the light's HasClippedLamp: enable &&
         // intensity > 0, over the first SPOT_MAX_LAMPS entries.
         const int lampCount = std::min(static_cast<int>(spotlight.lamps.size()),
@@ -465,20 +633,14 @@ namespace EdgeLighting
             std::fill(mShadowVerts.begin() + first, mShadowVerts.begin() + last, v);
 
             // A casting lamp's strip joins the runs the darkening and the
-            // fill draw, merged with the run before it when they touch.
-            // Dimming the picture alone needs neither.
+            // fill draw - its own run, with the box its shadow can reach, so
+            // that each is drawn inside its own box. Dimming the picture
+            // alone needs neither.
             if (v.weight[0] > 0.0f)
             {
-                const int count = last - first;
-                if (!mCasterRanges.empty() &&
-                    mCasterRanges.back().first + mCasterRanges.back().count == first)
-                {
-                    mCasterRanges.back().count += count;
-                }
-                else
-                {
-                    mCasterRanges.push_back(CasterRange{first, count});
-                }
+                CasterRange range{first, last - first, glm::vec2(0.0f), glm::vec2(0.0f)};
+                LampShadowBox(shadowSolve, v.shadow, strip.apertureWidth, range.boxLo, range.boxHi);
+                mCasterRanges.push_back(range);
             }
         }
         mLampStrips.clear();
@@ -540,10 +702,10 @@ namespace EdgeLighting
         mFrame.prepared = true;
         mFrame.viewport = glm::ivec2(viewportWidth, viewportHeight);
 
-        // Never alongside the light's scaled path - UsesFillPass needs a
-        // casting lamp, and that pins the scale - and never without its
-        // programs: a fill that failed to compile leaves the frame drawing
-        // the physical shadow, which is the right thing to degrade to.
+        // At full resolution whatever scale the light runs at (a casting lamp
+        // pins it to 1.0 unless PIN_RESOLUTION_SCALE is off), and never
+        // without its programs: a fill that failed to compile leaves the frame
+        // drawing the physical shadow, which is the right thing to degrade to.
         if (mVertexCount <= 0 || mStrips == nullptr || viewportWidth <= 0 || viewportHeight <= 0 ||
             !UsesFillPass(config) || !ensureFillPrograms())
         {
@@ -573,11 +735,40 @@ namespace EdgeLighting
         // fill lifts a shadow computed from the lamps' REAL light - see THE
         // PICTURE'S LIGHT in spotlight-shadow.glsl.
         UseScreenBlend();
-        mSourceShader.Use();
-        uploadLightUniforms(mSourceShader, viewportWidth, viewportHeight, config);
-        uploadCasterUniforms(mSourceShader, config, PictureLightUpload::REAL_LIGHT);
-        mStrips->DrawArrays(GL_TRIANGLES, mVertexCount);
-        mSourceShader.Unuse();
+
+        // Only inside the casting lamps' shadow boxes, the rest left as
+        // cleared: the fill reads this buffer nowhere else. Its two readers
+        // are drawn inside those boxes (drawCasterRanges), and wherever a
+        // lamp has no shadow spotFillLift returns the cover it was given,
+        // whatever the texel holds. Every lamp is drawn - the light that
+        // reaches a shadow comes from all of them - through one rect, the
+        // bound of the boxes.
+        glm::vec2 sourceLo(0.0f);
+        glm::vec2 sourceHi(0.0f);
+        for (size_t i = 0; i < mCasterRanges.size(); i++)
+        {
+            sourceLo = (i == 0) ? mCasterRanges[i].boxLo : glm::min(sourceLo, mCasterRanges[i].boxLo);
+            sourceHi = (i == 0) ? mCasterRanges[i].boxHi : glm::max(sourceHi, mCasterRanges[i].boxHi);
+        }
+        GLint sourceRect[4] = {0, 0, 0, 0};
+        if (!mCasterRanges.empty() && WindowRect(sourceLo, sourceHi, viewportWidth, viewportHeight, sourceRect))
+        {
+            // The scope above has the test off; the box is the caller's, and
+            // goes back before the scope puts the test back.
+            GLint hostBox[4] = {0, 0, 0, 0};
+            glGetIntegerv(GL_SCISSOR_BOX, hostBox);
+            glEnable(GL_SCISSOR_TEST);
+            glScissor(sourceRect[0], sourceRect[1], sourceRect[2], sourceRect[3]);
+
+            mSourceShader.Use();
+            uploadLightUniforms(mSourceShader, viewportWidth, viewportHeight, config);
+            uploadCasterUniforms(mSourceShader, config, PictureLightUpload::REAL_LIGHT);
+            mStrips->DrawArrays(GL_TRIANGLES, mVertexCount);
+            mSourceShader.Unuse();
+
+            glScissor(hostBox[0], hostBox[1], hostBox[2], hostBox[3]);
+            glDisable(GL_SCISSOR_TEST);
+        }
 
         prevTarget.Restore();
         mFrame.fillReady = true;
@@ -626,10 +817,10 @@ namespace EdgeLighting
         const ShadowCaster &caster = config.spotlight.shadowCaster;
         program.SetUniform("uShadowDarkness", std::min(std::max(caster.darkness, 0.0f), 1.0f));
         program.SetUniform("uShadowColor", glm::clamp(caster.color, glm::vec3(0.0f), glm::vec3(1.0f)));
-        for (const CasterRange &range : mCasterRanges)
-        {
-            mStrips->DrawArrays(GL_TRIANGLES, range.count, range.first);
-        }
+        // Each casting lamp inside its shadow's box only: the program writes
+        // an exact 0 everywhere else, and a lamp's strip is most of the frame
+        // below it.
+        drawCasterRanges(viewportWidth, viewportHeight);
         program.Unuse();
     }
 
@@ -662,10 +853,10 @@ namespace EdgeLighting
         uploadLightUniforms(mFillShader, viewportWidth, viewportHeight, config);
         uploadCasterUniforms(mFillShader, config, PictureLightUpload::CONFIG_VALUE);
         uploadFillUniforms(mFillShader, config, viewportHeight);
-        for (const CasterRange &range : mCasterRanges)
-        {
-            mStrips->DrawArrays(GL_TRIANGLES, range.count, range.first);
-        }
+        // Each casting lamp inside its shadow's box only: everywhere else the
+        // correction is an exact 0 plus under half a step of dither, which
+        // the screen rounds back to what the light pass left.
+        drawCasterRanges(viewportWidth, viewportHeight);
         mFillShader.Unuse();
     }
 
@@ -833,5 +1024,44 @@ namespace EdgeLighting
         program.SetUniform("uFillAmount",
                            std::min(std::max(config.spotlight.shadowCaster.fill, 0.0f), 1.0f));
         program.SetUniform("uFillHeight", static_cast<float>(viewportHeight));
+    }
+
+    void SpotlightShadow::drawCasterRanges(int viewportWidth, int viewportHeight)
+    {
+        // The host's clip, which every draw here stays inside. Two
+        // static-state reads, as NeonRenderer's opaque clear makes; the
+        // viewport is the (0, 0, width, height) BaseRenderer::Render
+        // guarantees, so it is not queried.
+        const GLboolean hostScissor = glIsEnabled(GL_SCISSOR_TEST);
+        GLint hostBox[4] = {0, 0, 0, 0};
+        glGetIntegerv(GL_SCISSOR_BOX, hostBox);
+
+        bool scissorSet = false;
+        for (const CasterRange &range : mCasterRanges)
+        {
+            GLint rect[4] = {0, 0, 0, 0};
+            if (!WindowRect(range.boxLo, range.boxHi, viewportWidth, viewportHeight, rect) ||
+                (hostScissor && !IntersectRect(rect, hostBox)))
+            {
+                continue;
+            }
+            if (!scissorSet)
+            {
+                glEnable(GL_SCISSOR_TEST);
+                scissorSet = true;
+            }
+            glScissor(rect[0], rect[1], rect[2], rect[3]);
+            mStrips->DrawArrays(GL_TRIANGLES, range.count, range.first);
+        }
+
+        // Exactly as found: the box, and the test's state.
+        if (scissorSet)
+        {
+            glScissor(hostBox[0], hostBox[1], hostBox[2], hostBox[3]);
+            if (!hostScissor)
+            {
+                glDisable(GL_SCISSOR_TEST);
+            }
+        }
     }
 }

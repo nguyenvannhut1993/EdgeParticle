@@ -149,6 +149,34 @@ logs its own transitions): where the lit face meets its own shadow the mask
 steps across one pixel, which a reduced buffer would smear exactly as it smears
 the clip's edge.
 
+**The pin is a build-time switch**: `PIN_RESOLUTION_SCALE`, at the top of
+`spotlight-shadow.cpp`, `true` by default. At `false`, `PinsResolutionScale`
+always answers no and the light runs at the `resolutionScale` the config asks
+for, shadow and all; nothing changes at `resolutionScale` 1.0 (the 75 images of
+the 2026-11-12 harness byte-identical) or for a clipped lamp, whose pin is the
+light's own. What it trades, the spotlight layer's GPU time and the largest
+colour error against 1.0 over a dark backdrop, 1920 x 1080, Intel Iris Plus
+Graphics 655:
+
+| scene | 1.0 -> 0.5 | 1.0 -> 0.25 |
+| ----- | ---------- | ----------- |
+| Picture Light, `darkness` 0 | 1.64x faster, 20 levels | 2.43x, 29 |
+| Picture Light, `darkness` 0.6 | 1.42x, 21 | 1.82x, 31 |
+| Solid Frame, `darkness` 0.6 | 1.66x, 40 | 2.09x, 60 |
+| two lamps casting, `fill` 1 + `darkness` 0.6 | 1.31x, 29 | 1.45x, 43 |
+
+The errors are the edges: where the lit face meets its shadow the edge steps at
+the reduced buffer's pitch - round a rounded corner, a 2 px staircase at 0.5
+(hard to see at a normal viewing size) and a plain 4 px one at 0.25 - and the
+sharp edges blur (the face's, the rails' shadow on a recessed picture). The
+shadow's own passes still draw at full resolution, so `darkness` and `fill`
+gain nothing from the scale (with `darkness` on, its pass is ~40% of the
+layer at 0.25), and the fill's correction is computed against
+full-resolution light that the blit only approximates - no artefact of its own
+was seen on the two-lamp scene. The C++ demo's "Held at 1.0" hint asks
+`PinsResolutionScale` and follows the switch; the C ABI demo cannot see it and
+over-reports in a build with it off.
+
 **Where the code lives** is section 6.
 
 **The demo preset.** "Picture Light", under Spotlights > Shadow Caster in both
@@ -195,7 +223,11 @@ and `z` the lifted light, which the screen adds up to `z` exactly; it is drawn
 after the light rather than instead of it so the light's own draw stays as
 committed. Two 8-bit roundings where there was one: against the earlier
 single pass it moves filled pixels by up to 2 levels (2026-10-24, four
-two-lamp scenes, no pixel outside what the fill changes).
+two-lamp scenes, no pixel outside what the fill changes). Neither extra pass
+covers more than the shadows need: the correction draws each casting lamp only
+inside the box its shadow can reach, and the source only inside the bound of
+those boxes - the only texels the fill reads (section 5 has the boxes and what
+they saved).
 
 Verified offscreen:
 
@@ -301,9 +333,48 @@ Verified offscreen: `darkness` 0 is byte-identical to before on every scene
 (no pass runs); at 0.6, no pixel outside a shadow changes on any backdrop; a
 lone lamp at `fill` 1 equals `fill` 0; scale 0.5 is pinned to 1.0; a lamp with
 `castsShadow` off equals no caster; swapping two lamps moves at most 2 levels
-(1 at `darkness` 0 - the 8-bit rounding between draws). Costs one more raster
-of the casting lamps' strips; its two programs are compiled the first frame it
-is used.
+(1 at `darkness` 0 - the 8-bit rounding between draws). Its two programs are
+compiled the first frame it is used.
+
+**What it costs.** The pass writes an exact 0 everywhere but the shadow, and a
+lamp's strip is most of the frame below it - so drawn over the whole strip it
+shaded the lamp a second time, at full resolution, to write nothing: `darkness`
+doubled the layer's GPU time on every scene below, and on a Mali-G51 it was
+reported to cost about 80% of the frame rate with Picture Light. It is bounded
+twice, both byte-identical (2026-11-12: 25 scenes over three backdrops, colour
+and alpha, against the build before):
+
+- **Each casting lamp's strip is scissored to the box its shadow can reach**
+  (`LampShadowBox` in `spotlight-shadow.cpp`): the caster's face, grown by the
+  half pixel its edge is feathered over, and the wall's shadow - the caster's
+  box grown by the penumbra and projected away from the lamp (for a solid, both
+  ends of its depth). Outside it the mask is exactly 1. The box is intersected
+  with the host's own scissor when that is on, and the host's scissor state is
+  put back. A box with nothing on screen draws nothing.
+- **The darkening variant takes the mask before it shades the light**
+  (`spotShadowDarkenCover`, from the top of `spotlight.frag`'s `main()`), so
+  inside the box a fragment with no shadow - the picture's face, the box's
+  corners - writes its 0 having paid the mask alone.
+
+The fill's two passes (section 3) take the same boxes. GPU time of the layer
+(`GL_TIME_ELAPSED` around `Render`), best of 7 x 300 frames, 1920 x 1080 unless
+noted, Intel Iris Plus Graphics 655; "no looks" is the same config at
+`darkness` 0 and `fill` 0:
+
+| scene | no looks | before | after |
+| ----- | -------- | ------ | ----- |
+| Picture Light, `darkness` 0.6 | 1.32 ms | 2.62 (1.99x) | 1.72 (1.30x) |
+| Picture Light at 1280 x 720 | 0.65 | 1.30 (1.99x) | 0.85 (1.30x) |
+| two lamps casting, `darkness` 0.6 | 2.61 | 5.21 (2.00x) | 3.38 (1.30x) |
+| two lamps casting, `fill` 1 + `darkness` 0.6 | 2.61 | 12.11 (4.64x) | 6.44 (2.47x) |
+| a shadow running off two edges of the frame | 0.88 | 1.74 (1.98x) | 1.01 (1.14x) |
+| Solid Frame | 3.92 | 7.88 (2.01x) | 6.15 (1.57x) |
+| Solid Frame, grazing (`wallDistance` 150) | 5.71 | 11.56 (2.02x) | 10.80 (1.89x) |
+
+What is left is the shadow itself, whose darkening follows the lamp's light
+and so needs it shaded, and a solid caster's search, which runs over the whole
+box: a grazing solid's shadow never ends, so its box is everything past the
+caster, and it gains least. Not yet measured on the Mali-G51.
 
 ---
 
@@ -320,8 +391,8 @@ mirrors (below).
 
 | File | What it holds |
 | ---- | ------------- |
-| [`renderer/spotlight-shadow.h`](../../lib/include/renderer/spotlight-shadow.h), [`spotlight-shadow.cpp`](../../lib/src/renderer/spotlight-shadow.cpp) | `SpotlightShadow`: the CPU derivation (`ShadowSolve`, `DeriveShadow`, `LampCastsShadow`, `LampDimsPicture`, `DeriveLampShadow`, `AnyDrawnLampCasts`, `UsesFillPass`, `UsesDarkenPass`), the mirrors of the light it needs (`uploadLightUniforms`, `UploadMirroredClip`, `UseScreenBlend`), every GL object the shadow owns - its attribute buffer, the fill buffer, its copy of the light's plain program and the three variants (all built on the first frame that needs each) - and the casting lamps' vertex runs. |
-| [`spotlight-shadow.glsl`](../../lib/shaders/spotlight-shadow.glsl) | The fragment half: the model, the per-lamp varyings, the caster's uniforms, the panel, solid and recess tests, the picture's light, the `SPOT_FILL` lift and the `SPOT_SHADOW_DARKEN` output. Injected ahead of `spotlight.frag` (`@SPOTLIGHT_SHADOW@`); reaches nothing of it but `sdRoundBox`, through a prototype. |
+| [`renderer/spotlight-shadow.h`](../../lib/include/renderer/spotlight-shadow.h), [`spotlight-shadow.cpp`](../../lib/src/renderer/spotlight-shadow.cpp) | `SpotlightShadow`: the CPU derivation (`ShadowSolve`, `DeriveShadow`, `LampCastsShadow`, `LampDimsPicture`, `DeriveLampShadow`, `LampShadowBox`, `AnyDrawnLampCasts`, `UsesFillPass`, `UsesDarkenPass`), the mirrors of the light it needs (`uploadLightUniforms`, `UploadMirroredClip`, `UseScreenBlend`), every GL object the shadow owns - its attribute buffer, the fill buffer, its copy of the light's plain program and the three variants (all built on the first frame that needs each) - and the casting lamps' vertex runs with their shadow boxes, drawn through the scissor of `drawCasterRanges`. |
+| [`spotlight-shadow.glsl`](../../lib/shaders/spotlight-shadow.glsl) | The fragment half: the model, the per-lamp varyings, the caster's uniforms, the panel, solid and recess tests, the picture's light, the `SPOT_FILL` lift and the `SPOT_SHADOW_DARKEN` mask and output. Injected ahead of `spotlight.frag` (`@SPOTLIGHT_SHADOW@`); reaches nothing of it but `sdRoundBox`, through a prototype. |
 | [`spotlight-shadow-vert.glsl`](../../lib/shaders/spotlight-shadow-vert.glsl) | The vertex half: the three per-lamp attributes and `spotShadowForward`. Injected ahead of `spotlight.vert` (`@SPOTLIGHT_SHADOW_VERT@`). |
 | [`spotlight-shadow-tuning.h`](../../lib/include/renderer/spotlight-shadow-tuning.h) | `SPOT_LAMP_WALL_DISTANCE`, `SPOT_SHADOW_FULL_REACH`, `SPOT_FILL_FULL_RATIO`, `SPOT_SOLID_SEARCH_STEPS`, and the attribute locations `SPOT_SHADOW_ATTRIB_*` (13-15). Injected into both spotlight shaders (`@SPOTLIGHT_SHADOW_TUNING@`). |
 
@@ -335,6 +406,7 @@ committed.
 | Hook | Where | What it calls |
 | ---- | ----- | ------------- |
 | Fragment | `spotlight.frag` `main()`, right after the clip | `spotShadowLight` (or `spotShadowDarken` under `SPOT_SHADOW_DARKEN`) |
+| Fragment, darkening only | `spotlight.frag` `main()`, its first lines, under `SPOT_SHADOW_DARKEN` | `spotShadowDarkenCover` - the mask before the light; where it is 1, an exact 0 and return (section 5) |
 | Vertex | `spotlight.vert` `main()` | `spotShadowForward()` |
 | Config | `config.h` | `ShadowCaster`, `SpotLight::castsShadow`, `SpotlightConfig::shadowCaster`, a line in each `operator==` |
 | Member | `spotlight-renderer.h` | the `#include` and `SpotlightShadow mShadow` |

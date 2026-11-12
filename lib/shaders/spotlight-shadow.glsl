@@ -11,8 +11,9 @@ precision highp float;
 // spotlight.frag's but sdRoundBox, through the prototype below. The fragment's
 // app position arrives as a parameter rather than as vApp for the same
 // reason. spotlight.frag's main() calls into it at ONE place, right after the
-// clip: spotShadowLight, or spotShadowDarken in the darkening variant. Not a
-// shader: no main().
+// clip: spotShadowLight - and in the darkening variant at two, its top
+// (spotShadowDarkenCover, before the light is shaded) and that place
+// (spotShadowDarken). Not a shader: no main().
 //
 // Its own file, like the rest of the shadow, so the light's shader can be
 // edited without touching it: the vertex half is spotlight-shadow-vert.glsl,
@@ -160,6 +161,18 @@ precision highp float;
 // lamp's light still lands inside the shadow. Outside a shadow D is an
 // exact 0 and the fragment writes an exact 0 - the blend leaves the
 // destination bit for bit.
+//
+// WHAT IT COSTS, and why it is bounded twice. A lamp's strip is most of the
+// frame below it, its shadow a band by the caster, and every fragment of the
+// strip outside that band writes the exact 0 above - so a pass over the whole
+// strip shaded the lamp a second time, at full resolution, to write nothing
+// (see docs/guides/spotlight-shadow.md section 5). SpotlightShadow scissors
+// each lamp's strip to the box its shadow can reach (LampShadowBox: outside
+// it spotShadowMask is exactly 1), and inside the box this variant takes the
+// mask BEFORE the light (spotShadowDarkenCover, from the top of main()): a
+// fragment it leaves at 1 - the picture's face, the box's corners - writes
+// its 0 having paid the mask alone. Byte-identical to the pass over the whole
+// strip. The fill's two passes take the same boxes, without the early mask.
 
 /// Lamp app position (xy), t = caster / lamp wall distance (z), penumbra half
 /// width on the caster's plane in px (w, never 0 - the CPU floors it).
@@ -330,7 +343,7 @@ float spotFaceGain(vec2 app) {
 }
 
 /// What the shadow caster leaves of this lamp's light at app px @p app, in
-/// [0, 1] - reached through spotShadowLight (and spotShadowDarken), and only
+/// [0, 1] - reached through spotShadowLight (and spotShadowDarkenCover), and only
 /// for a lamp whose vShadowWeight is above 0 (a branch on a flat value, so
 /// coherent per lamp: with the solid search in it the mask is a dozen SDFs,
 /// and a lamp that casts nothing pays none of them and stays byte-identical to
@@ -416,20 +429,33 @@ uniform float uShadowDarkness;
 /// ShadowCaster::color, linear RGB clamped to [0, 1].
 uniform vec3 uShadowColor;
 
-/// The darkening variant's output for the fragment at app px @p app - see THE
-/// DARKENING VARIANT above, and the one call spotlight.frag's main() makes
-/// into this chunk in that variant. @p lit is the lamp's light after the shoulder and the clip,
-/// before the shadow; @p dither the output dither main() computes.
-///
-/// An exact 0 wherever the lamp casts nothing, the fragment is outside its
-/// shadow or the lamp puts no light there, so the dither cannot speckle the
-/// rest of the strip: under GL_ONE / GL_ONE_MINUS_SRC_ALPHA a 0 leaves the
-/// destination exactly as it was.
-vec4 spotShadowDarken(vec2 app, vec3 lit, float apertureWidth, float dither) {
+/// The darkening variant's shadow coverage at app px @p app, taken FIRST: the
+/// call spotlight.frag's main() makes at its top in this variant, before it
+/// shades the light. Where this is 1 the variant writes an exact 0 and returns
+/// at once, paying the mask and none of the light's shading - which is most
+/// of the box the pass is scissored to (the picture's face, the box's
+/// corners). 1 for a lamp that casts nothing. Otherwise exactly
+/// spotShadowCover, the coverage the variant read after the light before, so
+/// a fragment the test lets through is shaded as it was: a cover of 1 or
+/// more made the darkening below 0 or less, an exact 0.
+float spotShadowDarkenCover(vec2 app, float apertureWidth) {
     if (vShadowWeight <= 0.0) {
-        return vec4(0.0);
+        return 1.0;
     }
-    float cover = spotShadowCover(app, apertureWidth);
+    return spotShadowCover(app, apertureWidth);
+}
+
+/// The darkening variant's output for the fragment at app px @p app - see THE
+/// DARKENING VARIANT above, and the second call spotlight.frag's main() makes
+/// into this chunk in that variant. @p cover is what spotShadowDarkenCover
+/// returned for it, below 1; @p lit the lamp's light after the shoulder and
+/// the clip, before the shadow; @p dither the output dither main() computes.
+///
+/// An exact 0 wherever the fragment is outside the lamp's shadow or the lamp
+/// puts no light there, so the dither cannot speckle the rest of the strip:
+/// under GL_ONE / GL_ONE_MINUS_SRC_ALPHA a 0 leaves the destination exactly
+/// as it was.
+vec4 spotShadowDarken(vec2 app, float cover, vec3 lit, float dither) {
 #ifdef SPOT_FILL
     cover = spotFillLift(app, lit, cover);
 #endif

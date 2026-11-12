@@ -426,7 +426,7 @@ Per lamp (`SpotLight`):
 | `tint` | linear `vec3`, unclamped | `(1,1,1)` | `>= 0`, no cap | Gel multiplier on blackbody. `>1` legal (grows strip), `0` = lamp off (no geometry) |
 | `enable` | bool | `true` | - | Skip without removing (stable indices/animations) |
 | `clipped` | bool | `false` | - | Opt into `clipArea`. Only gate (area has no enable). Set area size first (`0x0 KEEP_INSIDE` blanks the lamp). Also pins `SpotlightConfig.resolutionScale` to `1.0` while any enabled lamp has it set |
-| `castsShadow` | bool | `false` | - | Opt into `shadowCaster`. Only gate; an unset caster blocks nothing. Pins `resolutionScale` to `1.0` like `clipped` |
+| `castsShadow` | bool | `false` | - | Opt into `shadowCaster`. Only gate; an unset caster blocks nothing. Pins `resolutionScale` to `1.0` like `clipped`, unless the library is built with `PIN_RESOLUTION_SCALE` false (`spotlight-shadow.cpp`) |
 
 Layer (`SpotlightConfig`):
 
@@ -436,7 +436,7 @@ Layer (`SpotlightConfig`):
 | `lamps` | list | empty | first 8 entries | Past `SPOT_MAX_LAMPS = 8` ignored - entries 9+ dropped byte-for-byte, with one logged warning |
 | `clipArea` | `ClipArea` | `0x0 KEEP_INSIDE` | see `ClipArea` | Cut region. `KEEP_INSIDE` also narrows strips (buys fragments back); `KEEP_OUTSIDE` unbounded, cannot |
 | `shadowCaster` | `ShadowCaster` | `0x0`, flush | see `ShadowCaster` | The picture that shadows `castsShadow` lamps. Only removes light; strips unchanged |
-| `resolutionScale` | fraction `(0, 1]` | `1.0` | `[0.125, 1.0]` | Same two-path shape as neon/flare, no uniform differs (scale in viewport transform only). Floor is `0.125`, not neon's `0.001` - `0.001` through `0.125` are identical and `0.126` is the first that differs. Fixed blit floor (~922k frags at 720p) so only large rigs win; default `1.0`. Held at `1.0` while any enabled lamp is `clipped` or `castsShadow` (value kept, transitions logged) |
+| `resolutionScale` | fraction `(0, 1]` | `1.0` | `[0.125, 1.0]` | Same two-path shape as neon/flare, no uniform differs (scale in viewport transform only). Floor is `0.125`, not neon's `0.001` - `0.001` through `0.125` are identical and `0.126` is the first that differs. Fixed blit floor (~922k frags at 720p) so only large rigs win; default `1.0`. Held at `1.0` while any enabled lamp is `clipped` or `castsShadow` (value kept, transitions logged); the `castsShadow` hold is a build switch, `PIN_RESOLUTION_SCALE` |
 
 Caller owns GL state the pass assumes and never sets: cull off (or
 front-face surviving CCW strips), full color+alpha mask, `FUNC_ADD`, no

@@ -5,6 +5,115 @@ and what is open. Each entry names the commits it covers; the headers under
 `lib/include/` stay the source of truth, and the topic documents linked here
 hold the detail.
 
+## 2026-11-13 - The shadow's scale pin becomes a build switch
+
+Uncommitted, on top of the 2026-11-12 entry below. Intel Iris Plus Graphics
+655. Asked for by the owner after measuring on the Mali-G51: one light,
+Picture Light, 58-60 fps at `darkness` 0 and 20-30 at `darkness` above 0 - a
+frame that doubles, as the 11-12 entry measured, from a `darkness` 0 frame
+already at the 16.7 ms budget, so bounding the darkening alone cannot bring it
+back. Of three options (the pin relaxed; the light skipping its mask outside
+the shadow box plus a cached darkening; the picture's edge applied at full
+resolution in the light's blit) the owner chose the first, as a switch local
+to the shadow's file, the pin kept by default.
+
+- **What changed.** `PIN_RESOLUTION_SCALE` (`spotlight-shadow.cpp`, `constexpr
+  bool`, `true`): at `false`, `SpotlightShadow::PinsResolutionScale` returns
+  false, so `GetClampedSpotScale` - unchanged, in the light's file - hands a
+  casting lamp the configured `resolutionScale`. The shadow's comments that
+  said its passes never run beside the scaled path now say when they do, and
+  that they draw at full resolution either way. The C++ demo's "Held at 1.0"
+  hint and its config dump ask `PinsResolutionScale` for the shadow's half
+  instead of testing `castsShadow`, so they follow the switch; the C ABI demo
+  cannot see it, and says so in a comment. No config field, no C ABI.
+- **Verified.** `true`: the 11-12 harness's 75 images byte-identical to the
+  build before both changes. `false`: the same 75 (all at scale 1.0)
+  byte-identical as well; at 0.5 and 0.25 no uniform logged missing, the host's
+  scissor intact after every frame, and the images inspected - the picture's
+  rounded corner steps at the buffer's pitch (2 px at 0.5, 4 px at 0.25) and
+  its sharp edges blur; the fill's correction, computed against
+  full-resolution light the blit only approximates, showed no artefact of its
+  own on the two-lamp scene. Library, C dylib and both demos build with no
+  new warnings, with the switch either way.
+- **Measured**, the layer's GPU time at 1080p, 1.0 against 0.5 / 0.25, largest
+  colour error over a dark backdrop: Picture Light at `darkness` 0 1.64x / 2.43x
+  faster (20 / 29 levels), at `darkness` 0.6 1.42x / 1.82x (21 / 31); Solid
+  Frame at `darkness` 0.6 1.66x / 2.09x (40 / 60); two casting lamps with
+  `fill` 1 and `darkness` 0.6 1.31x / 1.45x (29 / 43). With `darkness` on the
+  gain is smaller because the darkening still draws at full resolution - at
+  0.25 it is ~40% of the layer. Table in section 2 of
+  [`spotlight-shadow.md`](../guides/spotlight-shadow.md).
+- **Open:** the numbers on the Mali-G51 with the switch off and the spotlight's
+  `resolutionScale` at 0.5. Projected from the ratios above onto the device's
+  ~21.5 ms with `darkness` on (the 11-12 entry's estimate), about 15 ms - under
+  the 16.7 ms budget, but not by much, and the blit's fixed full-screen cost
+  may weigh more on that GPU than on this one.
+
+## 2026-11-12 - The shadow's darkening and fill draw only where a shadow is
+
+Uncommitted, on top of the 2026-10-27 entry below. Intel Iris Plus Graphics
+655. Reported by the owner: on a Mali-G51, with the Picture Light preset,
+`darkness` above 0 cost about 80% of the frame rate against `darkness` 0. The
+darkening's cost had never been measured (the 2026-10-22 entry's open item).
+Reference: section 5 of [`spotlight-shadow.md`](../guides/spotlight-shadow.md);
+review item I93.
+
+- **Why.** `RenderBeforeLight` drew each casting lamp's WHOLE strip through the
+  `SPOT_SHADOW_DARKEN` variant, which shades the lamp in full (two `exp`, the
+  preset's `pow`, the clip's SDF, the shoulder) and then its mask, to write an
+  exact 0 everywhere but the shadow - and the light pass then shades the same
+  fragments again, at the full resolution a casting lamp pins. Measured here,
+  `darkness` 0.6 doubled the layer's GPU time on every scene (1.98-2.02x). The
+  fill's two passes have the same shape: the source draws every lamp over the
+  whole viewport, the correction every casting lamp's strip.
+- **What changed.** `LampShadowBox` (`spotlight-shadow.cpp`) bounds where a
+  casting lamp's mask can be below 1: the caster's face grown by the half pixel
+  its edge is feathered over, and the caster's box grown by the penumbra and
+  projected away from the lamp - for a solid at both ends of its depth, since
+  each bound is a linear-fractional function of the depth fraction whose
+  derivative keeps one sign. It is stored with the lamp's `CasterRange`, one
+  per lamp now rather than merged with a neighbour's. `drawCasterRanges`
+  scissors each run to its box inside the host's scissor and puts the host's
+  test and box back; the darkening and the fill's correction draw through it,
+  the fill's source through the bound of the boxes (the only texels the fill
+  reads). And the darkening variant takes its mask first: an inserted
+  `#ifdef SPOT_SHADOW_DARKEN` block at the top of `spotlight.frag`'s `main()`
+  calls `spotShadowDarkenCover` and writes its exact 0, before the light is
+  shaded, wherever the mask is 1; `spotShadowDarken` takes that cover. The
+  light's files stay insertion-only (`git diff --numstat HEAD`, 0 deletions),
+  and the light's program and the fill's differ from before only in comments
+  after preprocessing.
+- **Verified** with a scratch harness, Release builds before and after: 25
+  scenes over three backdrops (grey 0.1, grey 0.85, transparent), colour and
+  alpha - Picture Light at `darkness` 0, 0.6 and 1 with a colour; Solid Frame
+  plain, grazing, deeper than the lamps and at `lightOnPicture` 0; two lamps,
+  both or one casting; `fill` 1 and 0.5, with and without darkness, on a panel
+  and a solid; a lone lamp at `fill` 1; a shadow hidden behind the face; a
+  shadow running off two edges of the frame, with and without fill; clipped
+  lamps in both modes; a soft, rounded, translucent caster; lamps beside and
+  below the caster; a recessed panel at `lightOnPicture` 0.5; 1280 x 720; and
+  two host scissors. All 75 images byte-identical, and after every `Render`
+  the host's scissor test and box as it set them. The harness was checked
+  against mutants of the box: without the wall's shadow 69 of 75 images
+  differ, without the y flip 66, with the box two pixels tighter than shipped
+  6 (by 1 level, on the penumbra's last pixel) - so the box is tight and its
+  one pixel of margin is enough. No uniform logged missing or unmirrored; the
+  library, the C dylib and both demos build with no new warnings.
+- **Measured**, GPU time of the layer (`GL_TIME_ELAPSED` around `Render`),
+  best of 7 x 300 frames, interleaved with the same config at `darkness` 0 and
+  `fill` 0, 1080p: Picture Light 2.62 -> 1.72 ms against 1.32 (1.99x ->
+  1.30x); two casting lamps 2.00x -> 1.30x, with `fill` 1 4.64x -> 2.47x; a
+  shadow off two edges 1.98x -> 1.14x; Picture Light at 720p 1.99x -> 1.30x;
+  Solid Frame 2.01x -> 1.57x; a grazing solid 2.02x -> 1.89x - its shadow never
+  ends, so its box is everything past the caster. Two runs of each agreed
+  within 1%.
+- **Open:** the numbers on the Mali-G51. The 80% reported there is more than
+  the doubling measured here, so if the darkening still costs much more than
+  1.3x on the device, look next at the variant's register count and spills
+  (`malioc` on its source). Not touched: the solid search runs on the caster's
+  face, where `mix(wall, face, 1)` discards it, in both passes - skipping it
+  changes the mask's arithmetic, so it is not byte-identical by construction.
+
 ## 2026-10-27 - `lightOnPicture`: Darkness drives the picture's shadow too
 
 Uncommitted, on top of the 2026-10-24 entry below. Intel Iris Plus Graphics 655.

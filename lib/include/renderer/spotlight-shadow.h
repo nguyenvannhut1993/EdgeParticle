@@ -21,11 +21,12 @@ namespace EdgeLighting
     /// lamp's aperture sets the penumbra, and the caster's own face stays lit.
     /// It is a coverage multiply that only removes light, so the light's
     /// solved strips stand as they are - and, like the clip, it pins the
-    /// resolution scale (@ref PinsResolutionScale). The caster is a flat panel
-    /// by default; @c ShadowCaster::solid makes it a block from the wall out,
-    /// and @c frameWidth / @c frameDepth give it rails that shade the recessed
-    /// picture inside them. @c ShadowCaster::lightOnPicture dims a lamp's
-    /// light on the caster's face.
+    /// resolution scale (@ref PinsResolutionScale), unless a build switches
+    /// that off (PIN_RESOLUTION_SCALE in spotlight-shadow.cpp). The caster is
+    /// a flat panel by default; @c ShadowCaster::solid makes it a block from
+    /// the wall out, and @c frameWidth / @c frameDepth give it rails that
+    /// shade the recessed picture inside them. @c ShadowCaster::lightOnPicture
+    /// dims a lamp's light on the caster's face.
     ///
     /// Two optional looks cost passes of their own. @c ShadowCaster::fill
     /// washes a lamp's shadow out by the OTHER lamps' light: the lamps are
@@ -36,6 +37,14 @@ namespace EdgeLighting
     /// the SPOT_SHADOW_DARKEN variant, under the light, in
     /// @ref RenderBeforeLight - on the wall and on the picture alike, which is
     /// what marks the rails' shadow on a picture kept out of the light.
+    ///
+    /// Those passes change a pixel only where a shadow is, so none of them
+    /// shades a lamp's whole strip: each draws a casting lamp's strip only
+    /// inside the box its shadow can reach (@ref CasterRange, the scissor of
+    /// @ref drawCasterRanges), outside which the mask is exactly 1 and the
+    /// passes wrote an exact nothing; and the darkening variant takes the
+    /// mask before it shades the light, so inside the box a fragment with no
+    /// shadow pays the mask alone. Byte-identical to drawing the whole strips.
     ///
     /// **Added to the light, never changing it.** SpotlightRenderer and its
     /// shaders belong to other people, so the shadow enters them only through
@@ -78,6 +87,11 @@ namespace EdgeLighting
         /// the clip's edge. Counts the bit whether or not the caster is set up
         /// to cast anything, so a caster dragged across zero size does not
         /// flip the path.
+        ///
+        /// Always false in a build with PIN_RESOLUTION_SCALE off
+        /// (spotlight-shadow.cpp): the light then runs at the configured
+        /// scale, shadow and all, and the picture's edges are resolved at the
+        /// reduced buffer's pitch.
         static bool PinsResolutionScale(const SpotlightConfig &spotlight);
 
         /// Allocate the shadow's attribute buffer for @p maxVertices strip
@@ -113,22 +127,26 @@ namespace EdgeLighting
         void UploadUniforms(ShaderProgram &program, const Config &config);
 
         /// Phase 1: the fill's source - every lamp, shadows applied, the face
-        /// lit, screened into @c mFillBuffer under no host scissor - when this
-        /// config fills. Otherwise nothing. Restores the framebuffer and
-        /// viewport it was handed and leaves the blend as a Render does.
+        /// lit, screened into @c mFillBuffer under no host scissor, inside the
+        /// bounding box of the casting lamps' shadow boxes (the only texels
+        /// the fill reads) - when this config fills. Otherwise nothing.
+        /// Restores the framebuffer, viewport and scissor box it was handed and
+        /// leaves the blend as a Render does.
         void RenderOffscreen(int viewportWidth, int viewportHeight, const Config &config);
 
         /// Phase 2, before the light, onto the caller's target: the darkening
-        /// pass when this config darkens. Sets its own blend and LEAVES it -
-        /// the light sets its own after this. Runs @ref RenderOffscreen
-        /// itself if nothing ran it for this viewport.
+        /// pass when this config darkens, each casting lamp inside its shadow
+        /// box (@ref drawCasterRanges, which puts the host's scissor back).
+        /// Sets its own blend and LEAVES it - the light sets its own after
+        /// this. Runs @ref RenderOffscreen itself if nothing ran it for this
+        /// viewport.
         void RenderBeforeLight(int viewportWidth, int viewportHeight, const Config &config);
 
         /// Phase 2, after the light, onto the caller's target: when this
         /// config fills, the casting lamps again through the SPOT_FILL
-        /// variant, screening back what each lifted shadow lets through. Sets
-        /// the layer's screen blend and leaves it. Ends the frame
-        /// @ref RenderOffscreen began.
+        /// variant, each inside its shadow box, screening back what each
+        /// lifted shadow lets through. Sets the layer's screen blend and
+        /// leaves it. Ends the frame @ref RenderOffscreen began.
         void RenderAfterLight(int viewportWidth, int viewportHeight, const Config &config);
 
     private:
@@ -171,13 +189,21 @@ namespace EdgeLighting
             float apertureWidth; ///< The aperture the light's solve used (floored).
         } LampStrip;
 
-        /// A run of strip vertices whose lamps cast a shadow - what the
-        /// darkening and fill passes draw. Neighbouring casting lamps share
-        /// one run.
+        /// One casting lamp's run of strip vertices, and the box its shadow
+        /// can reach - what the darkening and fill passes draw, each run
+        /// inside its own box (@ref drawCasterRanges). One run per lamp, never
+        /// merged with a neighbour's, since each has a box of its own.
         typedef struct CasterRange
         {
             int first; ///< First vertex in the strips.
             int count; ///< Vertices in the run.
+            /// The shadow's box in app px (top-left origin, +y down): outside
+            /// it this lamp's shadow mask is exactly 1, so every pass that
+            /// draws only shadows leaves the pixel exactly as it was. A box a
+            /// solid caster throws off to one side ends far past any viewport
+            /// there. See LampShadowBox in spotlight-shadow.cpp.
+            glm::vec2 boxLo;
+            glm::vec2 boxHi; ///< See @ref boxLo.
         } CasterRange;
 
         /// What @ref RenderOffscreen leaves for phase 2 in the same frame.
@@ -226,8 +252,9 @@ namespace EdgeLighting
         /// what SpotlightRenderer's drawLamps uploads on the direct path - the
         /// y-flipped ortho, uDither 1 and the clip area - MIRRORED here, since
         /// the light's files take no call that would hand them over. Every
-        /// shadow pass runs at full resolution (a casting lamp pins the
-        /// scale), which is why uDither is a constant. Keep in step with
+        /// shadow pass draws at full resolution - onto the caller's target, or
+        /// into the viewport-sized fill buffer - whatever scale the light runs
+        /// at, which is why uDither is a constant. Keep in step with
         /// drawLamps; @ref warnUnmirroredUniforms names anything it misses.
         void uploadLightUniforms(ShaderProgram &program, int viewportWidth, int viewportHeight,
                                  const Config &config);
@@ -242,6 +269,13 @@ namespace EdgeLighting
         /// and the buffer's height - for whichever program reads it: the fill
         /// pass, and the darkening pass of a filled frame.
         void uploadFillUniforms(ShaderProgram &program, const Config &config, int viewportHeight);
+
+        /// Draw every run of @c mCasterRanges through the program in use, each
+        /// scissored to its lamp's shadow box intersected with the host's
+        /// scissor when that is on; a lamp whose box leaves nothing on screen
+        /// is not drawn. The darkening's and the fill correction's draw call.
+        /// Puts the host's scissor box and test back exactly as it found them.
+        void drawCasterRanges(int viewportWidth, int viewportHeight);
 
     private:
         /// The per-vertex shadow attributes, ceiling-sized once by
@@ -263,8 +297,8 @@ namespace EdgeLighting
         std::vector<LampStrip> mLampStrips;
         int mStripsEnd = 0; ///< Where the last reported run ended.
 
-        /// The casting lamps' vertex runs, rebuilt with the attributes.
-        /// Reserved to @c SPOT_MAX_LAMPS once.
+        /// The casting lamps' vertex runs and shadow boxes, rebuilt with the
+        /// attributes - one per lamp. Reserved to @c SPOT_MAX_LAMPS once.
         std::vector<CasterRange> mCasterRanges;
 
         /// The light's plain program, a copy of this module's own: the fill's

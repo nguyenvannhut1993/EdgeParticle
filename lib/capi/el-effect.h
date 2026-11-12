@@ -662,7 +662,10 @@ extern "C"
      *           unlike the clip not a trap: an unset caster is 0 x 0 and
      *           blocks nothing.
      *  @note  Like a clipped lamp, a shadow-casting lamp holds
-     *         el_effect_set_spotlight_resolution_scale at 1.0 while it draws. */
+     *         el_effect_set_spotlight_resolution_scale at 1.0 while it draws -
+     *         unless the library is built with PIN_RESOLUTION_SCALE false
+     *         (spotlight-shadow.cpp), which lets it run at the scale set
+     *         there, the picture's edges resolved at that scale. */
     EL_API el_result_e el_effect_set_spotlight_casts_shadow(el_effect_handle_t effect, int32_t index, el_bool_t castsShadow);
     EL_API el_result_e el_effect_get_spotlight_casts_shadow(el_effect_handle_t effect, int32_t index, el_bool_t *outCastsShadow);
 
@@ -870,7 +873,11 @@ extern "C"
      *         to what the lamps light, so the blit's full viewport of
      *         fragments is a fixed cost. Measured at 1280x720 it only wins
      *         above roughly six lamps. Leave it at 1.0 unless a profile says
-     *         otherwise. */
+     *         otherwise - one did for one wide lamp casting a shadow
+     *         (Picture Light, 1080p: 1.42x faster at 0.5 with darkness on),
+     *         which a build with PIN_RESOLUTION_SCALE false allows.
+     *  @note  Held at 1.0 while an enabled lamp is clipped, or casts a shadow
+     *         in a build with PIN_RESOLUTION_SCALE true (the default). */
     EL_API el_result_e el_effect_set_spotlight_resolution_scale(el_effect_handle_t effect, float scale);
     EL_API el_result_e el_effect_get_spotlight_resolution_scale(el_effect_handle_t effect, float *outScale);
 

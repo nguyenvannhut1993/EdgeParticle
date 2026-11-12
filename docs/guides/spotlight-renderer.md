@@ -594,7 +594,9 @@ broken.
 on, and every lamp opted in with `SpotLight::castsShadow` throws its shadow
 away from itself; the caster's face stays lit. It is a coverage multiply like
 the clip, so it moves none of this document's numbers, and like the clip it
-pins `resolutionScale` to 1.0 while a drawn lamp casts. Its fields, its looks
+pins `resolutionScale` to 1.0 while a drawn lamp casts - unless the library is
+built with `PIN_RESOLUTION_SCALE` off (`spotlight-shadow.cpp`; what that
+trades is section 2 of the shadow's guide). Its fields, its looks
 (`fill`, `darkness`, the solid frame), its C ABI and where its code lives are
 in [`spotlight-shadow.md`](spotlight-shadow.md) - a document of its own,
 because the shadow is a module of its own.

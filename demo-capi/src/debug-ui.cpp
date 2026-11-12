@@ -1058,7 +1058,10 @@ void DebugUI::buildSpotlightSection(el_effect_handle_t effect)
         // lamp is enabled, because a mask edge has to be resolved at full
         // resolution. Say so here, or the slider reads as broken: it moves and
         // the frame does not change. Mirrors the library's own test - the lamps
-        // that DRAW, within the ceiling.
+        // that DRAW, within the ceiling - as the library is built by default: a
+        // build with PIN_RESOLUTION_SCALE off (spotlight-shadow.cpp) does not
+        // hold it for a shadow-casting lamp, and the C ABI cannot say which,
+        // so there this line over-reports.
         const int drawnLamps = count < MAX_LAMPS ? count : MAX_LAMPS;
         bool anyMaskedLamp = false;
         for (int i = 0; i < drawnLamps; i++)
