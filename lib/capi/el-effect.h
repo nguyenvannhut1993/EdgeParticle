@@ -829,8 +829,9 @@ extern "C"
      *  @details A block's shadow is attached to it, and a block at least
      *           150 px deep - as deep as the lamps are far from the wall -
      *           throws a shadow that never ends: the light stops at the
-     *           frame. Costs a short search per fragment of each casting
-     *           lamp. See
+     *           frame. Costs about a tenth more than the panel: the search
+     *           behind its soft edge runs only where the shadow hangs from
+     *           the block's sides. See
      *           docs/design/spotlight-solid-frame-plan.md. */
     EL_API el_result_e el_effect_set_spotlight_shadow_solid(el_effect_handle_t effect, el_bool_t solid);
     EL_API el_result_e el_effect_get_spotlight_shadow_solid(el_effect_handle_t effect, el_bool_t *outSolid);

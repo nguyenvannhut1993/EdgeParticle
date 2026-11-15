@@ -5,6 +5,99 @@ and what is open. Each entry names the commits it covers; the headers under
 `lib/include/` stay the source of truth, and the topic documents linked here
 hold the detail.
 
+## 2026-11-15 - A solid caster searches only where its minimum is inside the line
+
+Uncommitted, on top of the 2026-11-13 entry below. Intel Iris Plus Graphics
+655. Reported by the owner from the Mali-G51: a wide gap in frame rate between
+`ShadowCaster::solid` on and off. Reference: section 4 of
+[`spotlight-shadow.md`](../guides/spotlight-shadow.md); review item I94.
+
+- **Why.** A solid caster's soft edge is the minimum of `u(s)` along the line
+  from each wall fragment to the lamp, found by `spotSolidWall`'s
+  golden-section search - twelve steps and three more SDFs. Its one early-out
+  was the circle through the caster's corners, so the search ran on every
+  fragment of a casting lamp's strip that the circle let through: 1.08 M of
+  the 2.07 M pixels of a 1080p Solid Frame frame, the picture's 477 k among
+  them, where `mix(wall, face, onFace)` weights the answer 0. The rails' two
+  SDFs ran on the whole strip as well. Measured here, `solid` made the
+  layer's frame 2.4-3.3x the panel's on every scene, the mask alone 4-7x.
+- **What changed**, in `spotlight-shadow.glsl` and one uniform. A solid
+  caster's mask is a function of its own, `spotSolidMask`; the rails' SDFs
+  (`spotRecessVis`) run only where `onFace` is above 0, for the panel as well,
+  and the panel's lines keep their order (with the face taken first there too,
+  the panel's frame was 2.4% slower here, for no work saved). The circle
+  became a box test - the segment's bounding box against the caster's box
+  grown by the wider window, a pixel and the rounding. Then values the search
+  computes anyway decide most of what is left, each handing back the search's
+  own answer: `u` at the far end or at the search's first sample at -1 or
+  below, under `u(0)`, is 0, since the search only ever keeps its lower
+  sample; `u` still falling at the far end makes `u(tMax)` the minimum; `u`
+  rising at the wall reads as lit. "Falling" and "rising" are the sign of
+  `du/ds` from the rounded box's gradient (`spotSolidSlope`): the SDF is
+  convex along the line, so its tangent at an end lies below it all along,
+  and either side's gradient at a kink sits between the one-sided slopes.
+  Inside the loop the umbra test stops the search. The far-end test is
+  skipped at `tMax` 1, where the line ends at the lamp and it settled nothing.
+  On the face, fully lit and deeper inside than the feather, the search's
+  answer is exactly 0 or 1 and the mix of whole numbers is 1: the mask
+  returns 1 unsearched.
+- **Exact on every GPU, which the first version was not.** The first version,
+  the same day, skipped the search on the whole face and handed the mix the
+  face's own value in its place: the search's result only on a GPU that
+  rounds `mix` as `x * (1 - a) + y * a`, and a rounding step away in the
+  rails' shadow on one that computes `x + a * (y - x)` - identical on this
+  GPU. Its end tests were exact in exact arithmetic only: the search's last
+  samples come within a thousandth of the line of an end, where a sample's
+  `u` can differ from the end's by little more than rounding, so near each
+  test's boundary rounding could tip it - on the lit-side test from 1 to the
+  smoothstep, not by a level. The owner asked for exactness on every GPU at
+  some cost in speed. So every test now hands back the search's own answer,
+  never a value in its place, and asks for a margin over `e`, the most a
+  computed caster SDF on the line can be off - eight ulps of the largest
+  magnitude it works in, the caster's share computed once on the CPU
+  (`uShadowRounding`); where the margin is not there the search runs. The
+  margins are compared in `d`, times the windows, so they divide by nothing,
+  and each is the second half of its test, paid only where the plain test
+  holds. What no change can promise is that a GPU compiles one expression to
+  the same bits in two programs: the search is the original's code.
+- **Verified.** The 11-12 harness, grown to 51 scenes, 32 of them solid (the
+  edge cases are listed in section 4: both presets, sharp and fully rounded
+  corners, softness 0 and 100, apertures of 2 and 80 px so that the window
+  shrinks and grows along the line, lamps beside, below, by a corner, over the
+  caster's centre and on its edge, a tiny caster, `wallDistance` 1 to 400, two
+  lamps with `fill`, a recess, a host scissor), over three backdrops: 153
+  images byte-identical to the build before, colour and alpha, on every
+  build tried along the way as well. One run of the 153 differed on one image
+  (a two-lamp `fill` scene over the light backdrop) and never again - not in
+  45 repeats of that scene, nor in any full run since - so it is put down to
+  the driver, and recorded here. A probe build that writes which way
+  `spotSolidWall` returned as the colour: under Solid Frame the loop runs on
+  9.6 k pixels (0.46% of the frame); the face settles 453 k, the box test
+  955 k, the far-end umbra 259 k, the far edges 46 k and the lit side 25 k.
+  With a block 1 px deep, 1.3%; with softness 100, 1.6%. Library, C dylib and
+  both demos build with no new warnings, no uniform is logged unmirrored, and
+  the light's files are still insertion-only.
+- **Measured**, GPU time of the layer at 1080p, `solid` on against the same
+  config with it off, interleaved, with the frame with no shadow at 0.59-0.60
+  ms: Solid Frame 2.77x -> 1.14x (3.98 -> 1.42 ms; the panel 1.44 -> 1.24,
+  its rails' SDFs now on the face only), at `darkness` 0 2.36x -> 1.11x;
+  Picture Light with `solid` 3.27x -> 1.15x, at `darkness` 0 2.72x -> 1.11x;
+  two lamps, a lamp beside the caster or by its corner, 720p 2.72-2.87x ->
+  1.13-1.18x; the grazing block 7.04 -> 3.48 ms, where the panel casts
+  nothing. The first version measured 1.02-1.06x: exactness costs about a
+  tenth. The panel without a frame is within 0.6% of before; the frame with
+  no shadow at all measured 1% slower (0.593 -> 0.600 ms), which taking out
+  each part of the change in turn did not pin on any one, so it is put down to
+  the solid's code being in the light's program at all - none of it runs
+  there. This GPU's clock moved between sessions - the no-shadow frame read
+  0.60 ms, 0.99 and 1.19 at different times, the last after the Mac idled into
+  display sleep, which slowed one run to a crawl part-way - so every figure is
+  from runs at 0.59-0.60, where ratios held to 1% between runs.
+- **Open:** the numbers on the Mali-G51. Nothing in the change adds a pass, a
+  texture or a varying - it removes SDF evaluations and adds compares - so it
+  should move the device the same way; by how much is the measurement still
+  to make.
+
 ## 2026-11-13 - The shadow's scale pin becomes a build switch
 
 Uncommitted, on top of the 2026-11-12 entry below. Intel Iris Plus Graphics

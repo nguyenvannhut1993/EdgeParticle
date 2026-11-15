@@ -514,7 +514,8 @@ namespace EdgeLighting
         /// darkening's.
         const char *const UPLOADED_UNIFORMS[] = {
             "uMVP", "uDither", "uClipRect", "uClipParams",
-            "uShadowRect", "uShadowCorner", "uShadowSolid", "uShadowSoftness", "uShadowInner", "uPictureLight",
+            "uShadowRect", "uShadowCorner", "uShadowSolid", "uShadowSoftness", "uShadowRounding", "uShadowInner",
+            "uPictureLight",
             "uFillSource", "uFillAmount", "uFillHeight",
             "uShadowDarkness", "uShadowColor",
         };
@@ -967,6 +968,16 @@ namespace EdgeLighting
         // the solid search rebuilds its window at every sample.
         program.SetUniform("uShadowSolid", shadowSolve.solid ? 1.0f : 0.0f);
         program.SetUniform("uShadowSoftness", shadowSolve.softness);
+        // The caster's share of the solid search's bound on its own rounding
+        // (ROUNDING in spotSolidWall): eight ulps of the largest magnitude an
+        // SDF of this caster works in, less the fragment's and the lamp's,
+        // which the shader adds. Once here rather than in every fragment.
+        const double roundingScale = std::max(std::abs(static_cast<double>(shadowSolve.center.x)),
+                                              std::abs(static_cast<double>(shadowSolve.center.y))) +
+                                     2.0 * std::max(static_cast<double>(shadowSolve.half.x),
+                                                    static_cast<double>(shadowSolve.half.y)) +
+                                     1.0;
+        program.SetUniform("uShadowRounding", static_cast<float>(1.0e-6 * roundingScale));
         program.SetUniform("uShadowInner",
                            glm::vec4(shadowSolve.innerHalf.x, shadowSolve.innerHalf.y,
                                      shadowSolve.innerRadius, shadowSolve.hasRecess ? 1.0f : 0.0f));

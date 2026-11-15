@@ -112,7 +112,12 @@
 /// segment, a few px on a long shadow, and the minimum is flat there, so the
 /// value read is far closer than that. Raise it if a long, soft solid shadow
 /// shows steps along its edge; every step is one more SDF for every fragment
-/// of every casting lamp.
+/// the search runs on - since 2026-11-15 only those whose minimum lies inside
+/// the segment, the band where the shadow hangs from the block's sides, and
+/// the hairlines where rounding could tip a shortcut (about 0.5% of a 1080p
+/// frame under the Solid Frame preset; spotSolidWall settles the rest from the
+/// segment's ends). spotSolidWall's END_REACH, the closest a sample comes to
+/// an end, follows this by itself.
 ///
 /// Shader only.
 #define SPOT_SOLID_SEARCH_STEPS   12

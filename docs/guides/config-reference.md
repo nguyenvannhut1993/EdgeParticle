@@ -164,7 +164,7 @@ reaches the picture. Reference: `spotlight-shadow.md`.
 | `fill` | fraction | `0` | `[0, 1]` | How far the OTHER lamps' light washes a lamp's shadow out. `0` physical; above `0` a second pass and a viewport-sized RGBA8 buffer |
 | `darkness` | fraction | `0` | `[0, 1]` | How far the shadow darkens what is behind the layer (premultiplied OVER, alpha included). `0` light only; above `0` one more pass |
 | `color` | linear `vec3` | black | `[0, 1]` | Colour `darkness` paints with |
-| `solid` | bool | `false` | - | A block from the wall to `wallDistance`: shadow attached, grazing lamps cast forever. A short fixed search per fragment |
+| `solid` | bool | `false` | - | A block from the wall to `wallDistance`: shadow attached, grazing lamps cast forever. Costs about a tenth more than the panel: its soft edge's search runs only along the block's sides (`spotSolidWall`) |
 | `frameWidth` | px | `0` | `[0, min(w,h)/2]` | Rail width; the picture is the rect inset by it |
 | `frameDepth` | px | `0` | `[0, wallDistance]` | Picture recess behind the rails; with `frameWidth` the top rail shades it |
 | `lightOnPicture` | fraction | `1.0` | `[0, 1]` | Casting lamps' light on the picture (the face, rails included). `1` lit like the wall; `0` the picture as drawn. The wall untouched. `darkness` acts on the rails' shadow on the picture as on the wall, so at `0` that shadow is `darkness` alone. Applies whatever `wallDistance` and `opacity` are |

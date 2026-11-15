@@ -1314,9 +1314,12 @@ namespace EdgeLighting
         /// way. See
         /// docs/design/spotlight-solid-frame-plan.md.
         ///
-        /// Costs a short fixed search per fragment of each casting lamp
-        /// (SPOT_SOLID_SEARCH_STEPS signed-distance evaluations) instead of
-        /// the panel's one.
+        /// Costs about a tenth more than the panel: the search behind its soft
+        /// edge (SPOT_SOLID_SEARCH_STEPS signed-distance evaluations) runs
+        /// only where the shadow hangs from the block's sides, and the rest
+        /// of a casting lamp's strip is settled, exactly, from the two ends of
+        /// each fragment's line to the lamp - see spotSolidWall in
+        /// spotlight-shadow.glsl.
         bool solid = false;
 
         /// Width of a FRAME's rails, in px. The picture is the caster's

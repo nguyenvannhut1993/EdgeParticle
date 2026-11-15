@@ -65,7 +65,7 @@ Built plans:
 | [`neon-shader-cleanup-plan.md`](design/neon-shader-cleanup-plan.md) | The neon's program slots and shader variants before the cleanup, and why each was kept or cut. |
 | [`spotlight-renderer-plan.md`](design/spotlight-renderer-plan.md) | The spotlight's design and the offscreen verification behind it. |
 | [`spotlight-shadow-plan.md`](design/spotlight-shadow-plan.md) | The spotlight shadow caster and its `fill`: the model, the decisions, and the offscreen verification. |
-| [`spotlight-solid-frame-plan.md`](design/spotlight-solid-frame-plan.md) | The caster as a solid block and a recessed frame: the search behind its soft edge, its exact early-out, and what it costs. |
+| [`spotlight-solid-frame-plan.md`](design/spotlight-solid-frame-plan.md) | The caster as a solid block and a recessed frame: the search behind its soft edge, its exact early-out, and what it cost as built (the search bounded since: section 4 of the shadow guide). |
 
 Studies of specific mechanisms:
 

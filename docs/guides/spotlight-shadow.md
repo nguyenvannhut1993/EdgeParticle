@@ -165,6 +165,10 @@ Graphics 655:
 | Solid Frame, `darkness` 0.6 | 1.66x, 40 | 2.09x, 60 |
 | two lamps casting, `fill` 1 + `darkness` 0.6 | 1.31x, 29 | 1.45x, 43 |
 
+(The Solid Frame row predates section 4's bounded search, which brought a
+solid caster's full-resolution frame to within a fifth of the panel's: the
+scale has less left to save there now.)
+
 The errors are the edges: where the lit face meets its shadow the edge steps at
 the reduced buffer's pitch - round a rounded corner, a 2 px staircase at 0.5
 (hard to see at a normal viewing size) and a plain 4 px one at 0.25 - and the
@@ -270,9 +274,8 @@ the wall than the frame is deep grazes its side and throws a shadow that never
 ends - only the frame is lit where the beam reaches it, and nothing behind it.
 `frameWidth` and `frameDepth` give the caster rails around a recessed picture,
 and the top rail shades the top of the picture when lit from above. All three
-default to the panel above. Measured: the solid search costs about 0.6 ms a
-frame at 1080p on an Intel Iris Plus 655 for one lamp over a caster filling its
-beam; the panel costs about what no shadow does.
+default to the panel above. A solid caster now costs about a tenth more than
+the panel (below).
 
 | Field | Default | Effect |
 | ----- | ------- | ------ |
@@ -295,6 +298,97 @@ What it does not do: one caster, axis aligned; no bevels, no frame sides lit
 from the front, the rails do not shadow each other, no shadows of other layers,
 and no animatable `wallDistance` (`SpotlightField` has no entry for it yet -
 moving the lamp already moves the shadow).
+
+**What it costs.** A solid caster's soft edge is the minimum of `u(s)` along
+each wall fragment's line to the lamp (the plan's section 3.1), found by a
+golden-section search of a dozen SDFs - which until 2026-11-15 ran on most of
+the casting lamp's strip, the picture's face included: 2.4-3.3x the panel's
+frame, and reported from a Mali-G51 as a wide gap in frame rate between
+`solid` on and off. Now `spotSolidWall` runs the search only where its answer
+cannot be had, with room to spare, from values the search computes anyway:
+
+- **The face**, fully lit (`faceVis` 1) and deeper inside than the feather:
+  the search's answer there is exactly 0 or exactly 1 - the lit side's rule,
+  or the smoothstep of a minimum below -1 - and `mix` of whole numbers is 1
+  however a GPU computes it, so the mask returns 1 unsearched. The face's rim
+  and the rails' shadow on a recessed picture take the search's answer
+  itself. The rails' two SDFs run on the face only, for the panel too.
+- **Where the line clears the caster's box by the window**, the answer is 1:
+  a box test, which replaced the circle through the caster's corners (a third
+  of a 4:3 caster's height too far past its top and bottom edges, and a
+  division and two lengths dearer).
+- **The umbra**: `u` at the line's far end or at the search's first sample at
+  -1 or below - the search only ever keeps its lower sample, so it can only
+  return 0. Inside the loop the same test stops the search as soon as it holds.
+- **The far edges**: `u` still falling at the far end (`spotSolidSlope`, the
+  sign of `du/ds` from the SDF's gradient; the SDF is convex along the line,
+  so its tangent there is below it all along) puts the minimum there - the
+  panel's edge. Not asked when the block is as deep as the lamps stand off the
+  wall, where the far end is the lamp itself.
+- **The lit side**: `u` already rising at the wall reads as fully lit.
+
+**Every one of them hands back the search's own answer, on every GPU** -
+never a value in its place - and only where that answer cannot turn on
+rounding. The search's last samples come within a thousandth of the line of
+an end, where their `u` can differ from the end's by little more than
+rounding, so each test asks for a margin over `e`, the most a computed caster
+SDF on the line can be off: eight ulps of the largest magnitude it works in
+(highp rounds `+ - *` correctly and `sqrt` and division to a few ulps, and the
+SDF is about seven such steps; the caster's share is computed once on the
+CPU, `uShadowRounding`). Where the margin is not there - hairline bands round
+each test's boundary - the search runs and gives its answer itself. The first
+version of this change, the same day, skipped the search on the whole face
+and handed the mix the face's value instead: identical to the search only on a
+GPU that rounds `mix` as `x * (1 - a) + y * a`, a rounding step away in a
+recess's shadow on one that computes `x + a * (y - x)`. The owner asked for
+every GPU; the face now skips only where the result is whole numbers. What no
+source change can promise is that a GPU compiles one expression to the same
+bits in two different programs: the search is the original's code, and every
+value a test returns is one it computes the same way.
+
+What is left is the band where the shadow hangs from the block's sides, plus
+those hairlines: under the Solid Frame preset at 1080p, the search's loop
+runs on 9.6 k pixels, 0.46% of the frame, against 1.08 M - more than half of
+it - before (1.3% for a block 1 px deep, whose line is so short that more of
+it is left to the search).
+Verified offscreen against the build before on 51 scenes over three
+backdrops (153 images, colour and alpha, 32 of the scenes solid: both
+presets, sharp and fully rounded corners, no softness and a softness of 100,
+apertures of 2 and 80 px so the window grows and shrinks along the line,
+lamps beside, below, close to a corner, over the caster's centre and on its
+edge, a tiny caster, `wallDistance` from 1 to 400 with 149 and 150 among them,
+two lamps with `fill`, a recess, a caster and a shadow off screen, a host
+scissor): byte-identical.
+
+GPU time of the layer (`GL_TIME_ELAPSED` around `Render`), best of 7 x 300
+frames, interleaved, 1920 x 1080, Intel Iris Plus Graphics 655: the frame with
+`solid` on against the same config with it off (the panel). This GPU's clock
+moves between sessions (the frame with no shadow read 0.60 to 1.19 ms over
+the day); these runs held it at 0.59-0.60 ms, and the ratios held to 1% from
+run to run.
+
+| scene | before: solid / panel | after: solid / panel |
+| ----- | --------------------- | -------------------- |
+| Solid Frame, `darkness` 0.6 | 3.98 / 1.44 ms (2.77x) | 1.42 / 1.24 ms (1.14x) |
+| Solid Frame, `darkness` 0 | 2.55 / 1.08 (2.36x) | 1.03 / 0.92 (1.11x) |
+| Picture Light with `solid`, `darkness` 0.6 | 3.66 / 1.12 (3.27x) | 1.29 / 1.12 (1.15x) |
+| Picture Light with `solid`, `darkness` 0 | 2.33 / 0.86 (2.72x) | 0.96 / 0.86 (1.11x) |
+
+The other solid scenes timed - two casting lamps, a lamp beside the caster,
+one by its corner, Solid Frame at 1280 x 720 - went from 2.72-2.87x the panel
+to 1.13-1.18x. The panel with a frame got faster too (1.44 -> 1.24 ms above:
+the rails' SDFs on the face only); without one it is within 0.6% of before.
+The frame with no shadow at all measured 1% slower (0.593 -> 0.600 ms), which
+taking out each part of the new code in turn did not pin on any one of them:
+the solid's code is in the light's program, and nothing of it runs there. The
+same day's first version - the face skipped whole, no rounding margins -
+measured 1.02-1.06x the panel: being exact on every GPU costs about a tenth.
+
+A grazing block (`wallDistance` 150, as far out as the lamps) has no panel to
+match - the panel casts nothing there - and its shadow never ends, so its
+umbra is most of the frame, found by the search's first samples rather than
+by an end of the line, and its penumbra widens without bound: 7.04 ms before,
+3.48 after, against 0.59-0.67 with no shadow.
 
 ## 5. Over a bright backdrop: `darkness`, `color`
 
@@ -372,9 +466,12 @@ noted, Intel Iris Plus Graphics 655; "no looks" is the same config at
 | Solid Frame, grazing (`wallDistance` 150) | 5.71 | 11.56 (2.02x) | 10.80 (1.89x) |
 
 What is left is the shadow itself, whose darkening follows the lamp's light
-and so needs it shaded, and a solid caster's search, which runs over the whole
-box: a grazing solid's shadow never ends, so its box is everything past the
-caster, and it gains least. Not yet measured on the Mali-G51.
+and so needs it shaded. The two Solid Frame rows were measured while a solid
+caster's search still ran over most of the box; since 2026-11-15 it runs only
+where the shadow hangs from the block's sides (section 4), and Solid Frame's
+`darkness` 0.6 frame is 1.38x its `darkness` 0 frame (1.49 ms against 1.08,
+at the clock of section 4's table), the grazing block's 1.96x (3.38 against
+1.73). Not yet measured on the Mali-G51.
 
 ---
 

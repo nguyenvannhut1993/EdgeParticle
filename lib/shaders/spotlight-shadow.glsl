@@ -79,6 +79,16 @@ precision highp float;
 // the lit side - and is read as fully lit; taken at face value, the feather
 // there would draw a dark outline round the lit side of the block.
 //
+// The search is the costly part - a dozen SDFs - so it runs only where it has
+// to. Where the line clears the caster's box by the window the answer is
+// already known; elsewhere u at the segment's two ends and at the search's
+// first sample, with which way u is heading at each end, settle the umbra,
+// the far edges and the lit side. The search runs where the minimum is inside
+// the segment - the band where the shadow hangs from the block's sides - and
+// wherever rounding could tip a test, which then leaves the answer to it.
+// Every test returns the search's own answer, never a stand-in for it
+// (spotSolidWall), so the result is the search's on every GPU.
+//
 // ShadowCaster::frameWidth / frameDepth make the caster a FRAME: rails of that
 // width, around a picture recessed that far behind their front. A picture
 // fragment is lit when the line to the lamp clears the rails, i.e. when
@@ -206,6 +216,12 @@ uniform float uShadowSolid;
 /// every sample, so it needs the feather itself, not a per-lamp result.
 uniform float uShadowSoftness;
 
+/// The caster's share of the solid search's rounding bound (spotSolidMask,
+/// and ROUNDING in spotSolidWall), from the CPU: 1e-6 times its centre's
+/// largest coordinate, twice its larger half extent, and 1. The fragment
+/// adds its own and its lamp's.
+uniform float uShadowRounding;
+
 /// The picture inside the rails: half extent (xy), corner radius (z), and 1
 /// when the rails shade it (w) - a uniform branch. Centred on uShadowRect.xy.
 /// Without rails xyz is the face itself.
@@ -235,42 +251,182 @@ float spotSolidRatio(vec2 p, vec2 lamp, float s, float aperture, float feather) 
     return d / max(aperture * s + feather * (1.0 - s), 1.0e-4);
 }
 
+/// Which way u(s) of the solid search is heading at one point of its line:
+/// the sign of du/ds there, above 0 where u rises. @p x is the point relative
+/// to the caster's centre, @p d the caster's SDF at it and @p w the window
+/// there; @p dir is the line's direction, lamp - p, and @p dw the window's
+/// rate, aperture - feather.
+///
+/// du/ds = (d' * w - d * dw) / w^2, with d' = grad(sd) . dir, and w > 0. At a
+/// kink of sd - where a corner's arc meets its sides, or on the medial axis
+/// inside - the gradient below is one of the two sides': sd is convex along
+/// the line, so either lies between the slope on the left and the slope on
+/// the right, which is all spotSolidWall's two tests ask of it.
+float spotSolidSlope(vec2 x, float d, float w, vec2 dir, float dw) {
+    vec2 q = abs(x) - uShadowRect.zw + uShadowCorner;
+    vec2 g = (max(q.x, q.y) > 0.0) ? normalize(max(q, 0.0))
+                                   : ((q.x > q.y) ? vec2(1.0, 0.0) : vec2(0.0, 1.0));
+    g = vec2(x.x < 0.0 ? -g.x : g.x, x.y < 0.0 ? -g.y : g.y);
+    return dot(g, dir) * w - d * dw;
+}
+
 /// Visibility of wall point @p p past a SOLID caster, for a lamp at @p lamp
 /// whose line is inside the block for s in [0, @p tMax] - see THE SOLID BLOCK
-/// at the top of this section.
+/// at the top of this section. @p dWall is the caster's SDF at @p p, which the
+/// caller has already taken for the face, and @p e the most any computed
+/// caster SDF on this line can be off (spotSolidMask).
 ///
 /// Golden-section search for the minimum of the quasiconvex u(s): a FIXED
-/// number of steps, so no loop runs longer for some fragments than others.
-/// The far end is checked separately (the search never lands on it exactly,
-/// and it is where the panel's edge is), and a minimum no lower than u(0) -
-/// the line leaving the block at once - is read as fully lit.
-float spotSolidWall(vec2 p, vec2 lamp, float tMax, float aperture) {
+/// number of steps - fewer only where it stops on the umbra, which its
+/// neighbours reach too - so no loop runs longer for some fragments than
+/// others. The far end is checked separately (the search never lands on it
+/// exactly, and it is where the panel's edge is), and a minimum no lower than
+/// u(0) - the line leaving the block at once - is read as fully lit.
+///
+/// Most fragments never reach the search: the tests ahead of it return the
+/// search's own answer, from the line's two ends - see WHERE THE SEARCH RUNS
+/// and ROUNDING below.
+float spotSolidWall(vec2 p, float dWall, vec2 lamp, float tMax, float aperture, float e) {
     const float INV_PHI = 0.6180340;
+    // The closest any sample of the search below comes to either end of the
+    // line, as a fraction of tMax: each step keeps a bracket INV_PHI as wide
+    // as the last and samples it at least (1 - INV_PHI) of its width inside
+    // its ends. A tenth taken off for the rounding of the brackets. Follows
+    // SPOT_SOLID_SEARCH_STEPS by itself.
+    const float END_REACH = 0.9 * (1.0 - INV_PHI) * pow(INV_PHI, float(SPOT_SOLID_SEARCH_STEPS));
     float feather = max(0.5 * uShadowSoftness, 1.0e-4);
 
-    // EARLY OUT, and an exact one. The caster lies inside the circle through
-    // its corners, so its SDF anywhere on the segment is at least the
-    // segment's clearance from that circle; the window is linear in s, so it
-    // is never wider than at one end. Clearance >= the wider end puts every
-    // u(s) at or above 1, where the smoothstep below is already exactly 1 -
-    // so this returns what the search would, for most of the lamp's strip, at
-    // the price of one projection. Measured: see the cost section of
-    // docs/design/spotlight-solid-frame-plan.md.
-    vec2 toFar = mix(p, lamp, tMax) - p;
-    vec2 toCentre = uShadowRect.xy - p;
-    float along = clamp(dot(toCentre, toFar) / max(dot(toFar, toFar), 1.0e-6), 0.0, 1.0);
-    float clearance = length(toCentre - toFar * along) - length(uShadowRect.zw);
-    if (clearance >= max(aperture * tMax + feather * (1.0 - tMax), feather)) {
+    // ROUNDING. A test below stands in for the search only where the search's
+    // own answer cannot turn on rounding: its last samples come within a
+    // thousandth of the line of an end, where their u can differ from the
+    // end's by little more than rounding, and two programs may round one
+    // expression differently. So each test asks for a margin over e, and
+    // where the margin is not there, the search runs and gives its answer
+    // itself. Each margin is the second half of its test, so its arithmetic
+    // is paid only where the plain test already holds.
+
+    // EARLY OUT: the line clear of the caster by more than the window. The
+    // window is linear in s, so never wider than at one end, and every point
+    // of the segment lies in the box its two ends span. If that box misses
+    // the caster's own box grown by the wider end (and a pixel, and the
+    // rounding), the caster's SDF all along the segment is above the window -
+    // the rounded box lies inside the box of its corners - so every u(s) the
+    // search could take is above 1, where the smoothstep below is exactly 1.
+    // For most of the lamp's strip, at the price of a few compares. (It was
+    // the circle through the caster's corners until 2026-11-15, which for a
+    // 4:3 caster reaches a third of its height past the top and bottom edges,
+    // and costs a division and two lengths.)
+    vec2 far = mix(p, lamp, tMax);
+    vec2 reach = uShadowRect.zw + max(aperture * tMax + feather * (1.0 - tMax), feather) + 1.0 + 2.0 * e;
+    vec2 segLo = min(p, far) - uShadowRect.xy;
+    vec2 segHi = max(p, far) - uShadowRect.xy;
+    if (any(greaterThan(segLo, reach)) || any(lessThan(segHi, -reach))) {
         return 1.0;
     }
 
+    // WHERE THE SEARCH RUNS. Past that test, values the search computes
+    // anyway settle nearly every fragment, each test returning the search's
+    // own answer. u(0) and u(tMax) are the two it ends on - written as
+    // spotSolidRatio computes them (at s = 0 the window is the feather and
+    // the SDF is dWall) - and u(s2) is its first sample. It only ever keeps
+    // the lower of its samples, and u is quasiconvex, so:
+    //   - u(tMax) or u(s2) at -1 or below, and below u(0): its minimum is no
+    //     higher, and the smoothstep returns 0. The umbra - found by u(s2)
+    //     for a block as deep as the lamps stand off the wall, whose line
+    //     ends at the lamp itself.
+    //   - u still falling at tMax: the minimum IS u(tMax), every sample
+    //     being above it. The far edges, where the panel's are. Not asked at
+    //     tMax = 1, where the line's far end is the lamp and the test settled
+    //     no fragment of any scene measured.
+    //   - u already rising at 0: every sample is above u(0), which reads as
+    //     fully lit. The lit side of the block.
+    // What is left - a minimum inside the line, where it grazes the block on
+    // the way to the lamp - is the band of shadow attached to the block's
+    // sides, searched as before, and the hairline bands round each test's
+    // boundary where ROUNDING leaves the answer to the search. What each
+    // test settles, and the measurements, are in section 4 of
+    // docs/guides/spotlight-shadow.md.
+    float u0 = dWall / max(feather, 1.0e-4);
+    vec2 xFar = far - uShadowRect.xy;
+    float dFar = sdRoundBox(xFar, uShadowRect.zw, uShadowCorner);
+    float wFar = max(aperture * tMax + feather * (1.0 - tMax), 1.0e-4);
+    float uFar = dFar / wFar;
+
+    // The margin on a u = d / w of this line: e on its SDF, plus the
+    // division's and the window's rounding, relative - twice, since this
+    // program's value and the search's can each be off. Compared times the
+    // windows, all of them positive, so the margins divide by nothing.
+    float d0Low = dWall - 2.0 * e - 4.0e-6 * abs(dWall);
+    if (uFar <= -1.0 && uFar < u0) {
+        float dFarHigh = dFar + 2.0 * e + 4.0e-6 * abs(dFar);
+        if (dFarHigh <= -wFar && dFarHigh * feather < d0Low * wFar) {
+            return 0.0;
+        }
+    }
     float lo = 0.0;
     float hi = tMax;
     float s1 = hi - INV_PHI * (hi - lo);
     float s2 = lo + INV_PHI * (hi - lo);
+    float d2 = sdRoundBox(mix(p, lamp, s2) - uShadowRect.xy, uShadowRect.zw, uShadowCorner);
+    float w2 = max(aperture * s2 + feather * (1.0 - s2), 1.0e-4);
+    float u2 = d2 / w2;
+    if (u2 <= -1.0 && u2 < u0) {
+        float d2High = d2 + 2.0 * e + 4.0e-6 * abs(d2);
+        if (d2High <= -w2 && d2High * feather < d0Low * w2) {
+            return 0.0;
+        }
+    }
+
+    // Which way u is heading at each end, with its margin. sd is convex, so
+    // the tangent at an end lies below it all along the line: with slope S
+    // there (spotSolidSlope), a sample a fraction r of the line from that end,
+    // window w, sits at least r * |S| / (wEnd * w) off the end's u. Its own
+    // rounding, the end's and a gradient taken on the wrong side of a kink
+    // cost the tangent at most (3 e + e * w / wEnd) / w between them, so, times
+    // w, the gap clears them where r * |S| / wEnd > 4 e and the window's drift
+    // over r; it is tightest at the closest sample, r = END_REACH * tMax.
+    // slopeErr bounds the slope's own rounding.
+    vec2 dir = lamp - p;
+    float dw = aperture - feather;
+    float dirSize = abs(dir.x) + abs(dir.y);
+    float endReach = END_REACH * tMax;
+    float wMax = max(feather, wFar);
+    if (tMax < 1.0) {
+        float slope = spotSolidSlope(xFar, dFar, wFar, dir, dw);
+        if (slope < 0.0) {
+            float slopeErr = 2.0 * (e * (wFar + abs(dw)) + 1.0e-6 * (dirSize * wFar + abs(dFar * dw)));
+            float slopeNeed = 4.0 * e * wFar + 4.0e-6 * (abs(dFar) * (wFar + wMax) + dirSize * endReach * wFar) -
+                              e * dw * endReach;
+            if ((-slope - slopeErr) * endReach > slopeNeed) {
+                return (uFar >= u0) ? 1.0 : smoothstep(-1.0, 1.0, uFar);
+            }
+        }
+    }
+    float slope0 = spotSolidSlope(p - uShadowRect.xy, dWall, feather, dir, dw);
+    if (slope0 > 0.0) {
+        float slope0Err = 2.0 * (e * (feather + abs(dw)) + 1.0e-6 * (dirSize * feather + abs(dWall * dw)));
+        float slope0Need = 4.0 * e * feather + 4.0e-6 * (abs(dWall) * (feather + wMax) + dirSize * endReach * feather) +
+                           e * dw * endReach;
+        if ((slope0 - slope0Err) * endReach > slope0Need) {
+            return 1.0;
+        }
+    }
+
+    // The loop's own umbra test takes the narrowest window of the line for
+    // its best sample's: which sample is best is not tracked.
+    float bestSlack = 2.0 * e / min(feather, wFar);
     float u1 = spotSolidRatio(p, lamp, s1, aperture, feather);
-    float u2 = spotSolidRatio(p, lamp, s2, aperture, feather);
     for (int i = 0; i < SPOT_SOLID_SEARCH_STEPS; i++) {
+        // THE UMBRA, found on the way: each step keeps the better of its two
+        // samples, so the best never rises. Once it is at -1 or below, and
+        // below u(0), by the margin, the search can only return 0 - stop here.
+        float best = min(u1, u2);
+        if (best <= -1.0 && best < u0) {
+            float bestHigh = best + bestSlack + 4.0e-6 * abs(best);
+            if (bestHigh <= -1.0 && bestHigh * feather < d0Low) {
+                return 0.0;
+            }
+        }
         if (u1 < u2) {
             hi = s2;
             s2 = s1;
@@ -285,48 +441,119 @@ float spotSolidWall(vec2 p, vec2 lamp, float tMax, float aperture) {
             u2 = spotSolidRatio(p, lamp, s2, aperture, feather);
         }
     }
-    float uMin = min(min(u1, u2), spotSolidRatio(p, lamp, tMax, aperture, feather));
-    if (uMin >= spotSolidRatio(p, lamp, 0.0, aperture, feather)) {
+    float uMin = min(min(u1, u2), uFar);
+    if (uMin >= u0) {
         return 1.0;
     }
     return smoothstep(-1.0, 1.0, uMin);
+}
+
+/// THE FACE's own term at app px @p app, for a caster whose rails shade the
+/// recessed picture (uShadowInner.w): lit, except where the rails hide the
+/// lamp - see the frame at the top of this section.
+///
+/// Called only ON the face, where onFace is above 0. Off it onFace is exactly
+/// 0, and a mix weighted 0 returns the wall's term whatever this would hold,
+/// so the rails' two SDFs are spent on the face alone rather than on the
+/// whole of the lamp's strip - for the panel and the solid block alike.
+float spotRecessVis(vec2 app, vec4 shadow, vec2 recess) {
+    float dPicture = sdRoundBox(app - uShadowRect.xy, uShadowInner.xy, uShadowInner.z);
+    float onPicture = 1.0 - smoothstep(-0.5, 0.5, dPicture);
+    vec2 atRails = mix(app, shadow.xy, recess.x);
+    float dOpening = sdRoundBox(atRails - uShadowRect.xy, uShadowInner.xy, uShadowInner.z);
+    return mix(1.0, 1.0 - smoothstep(-recess.y, recess.y, dOpening), onPicture);
+}
+
+/// spotShadowMask for a SOLID caster: the same face and the same mix, with
+/// the caster's SDF at the fragment taken first, since the search starts from
+/// it (spotSolidWall's dWall).
+///
+/// The face weights the wall's term 0 in the mix, but its answer still goes
+/// in: a GPU that rounds mix as x * (1 - a) + y * a returns the face's value
+/// whatever the wall's is, one that computes x + a * (y - x) can land a
+/// rounding step away wherever the face's value is below 1 - so handing the
+/// mix the face's own value in the search's place matched the search only on
+/// the first kind. What the face skips is only what is the same on every GPU:
+/// see THE FACE below.
+///
+/// A function of its own, not a branch inside spotShadowMask, so the panel's
+/// lines stay in the order they were measured in: the face first there cost
+/// the panel 2.4% of its frame on an Intel Iris Plus 655, for nothing.
+float spotSolidMask(vec2 app, vec4 shadow, vec2 recess, float aperture) {
+    float dFace = sdRoundBox(app - uShadowRect.xy, uShadowRect.zw, uShadowCorner);
+    float onFace = 1.0 - smoothstep(-0.5, 0.5, dFace);
+
+    float faceVis = 1.0;
+    if (uShadowInner.w > 0.5) {
+        if (onFace > 0.0) {
+            faceVis = spotRecessVis(app, shadow, recess);
+        }
+    }
+
+    // e: the most a computed caster SDF on this fragment's line to its lamp
+    // can be off - eight ulps of the largest magnitude it works in, the
+    // fragment's or the lamp's largest coordinate plus the caster's centre
+    // and twice its half extent (uShadowRounding, once on the CPU). highp
+    // rounds + - * correctly and sqrt and division to a few ulps, and the
+    // SDF is about seven such steps. See ROUNDING in spotSolidWall.
+    vec2 reachOf = max(abs(app), abs(shadow.xy));
+    float e = uShadowRounding + 1.0e-6 * max(reachOf.x, reachOf.y);
+
+    // THE FACE, settled without the search where that is exact on every
+    // GPU: fully on the face (onFace 1), fully lit there (faceVis 1), and
+    // deeper inside than the feather by more than the rounding, so that
+    // u(0) - the search's own value at the wall, dWall / feather - is below
+    // -1 however it is rounded. The search's answer is then exactly 0 or
+    // exactly 1 - the lit side's 1, or the smoothstep of a minimum below u(0)
+    // - and the mix of either with 1, weighted 1, is whole numbers
+    // throughout: 1, however a GPU computes it. That is most of the face; its
+    // rim, and the rails' shadow on a recessed picture, take the search's
+    // answer itself.
+    if (onFace >= 1.0 && faceVis >= 1.0) {
+        float feather = max(0.5 * uShadowSoftness, 1.0e-4);
+        if (dFace <= -(feather * (1.0 + 4.0e-6) + 2.0 * e)) {
+            return 1.0;
+        }
+    }
+
+    float wallVis = spotSolidWall(app, dFace, shadow.xy, shadow.z, aperture, e);
+    return mix(wallVis, faceVis, onFace);
 }
 
 /// Light the shadow caster leaves at @p app for one lamp, in [0, 1] - see THE
 /// SHADOW and THE SOLID BLOCK at the top of this section.
 ///
 /// Called only through spotShadowCover, so only for a lamp whose weight is
-/// above 0: with the solid search in it this is a dozen SDFs, and a lamp that
-/// casts nothing has no use for any of them. The CPU still writes
+/// above 0: where the solid search runs this is a dozen SDFs, and a lamp
+/// that casts nothing has no use for any of them. The CPU still writes
 /// well-formed values for such lamps - t 0 and floored half widths - so a
 /// smoothstep with equal edges cannot produce a NaN if one ever is evaluated.
 float spotShadowMask(vec2 app, vec4 shadow, vec2 recess, float aperture) {
-    // THE WALL around the caster.
-    float wallVis;
+    // A solid block, a uniform branch.
     if (uShadowSolid > 0.5) {
-        wallVis = spotSolidWall(app, shadow.xy, shadow.z, aperture);
-    } else {
-        // Where the line to the lamp crosses the caster's plane.
-        vec2 onPlane = mix(app, shadow.xy, shadow.z);
-        float dRay = sdRoundBox(onPlane - uShadowRect.xy, uShadowRect.zw, uShadowCorner);
-        wallVis = smoothstep(-shadow.w, shadow.w, dRay);
+        return spotSolidMask(app, shadow, recess, aperture);
     }
 
-    // THE FACE: lit, except a recessed picture where the rails hide the lamp.
-    float faceVis = 1.0;
-    if (uShadowInner.w > 0.5) {
-        float dPicture = sdRoundBox(app - uShadowRect.xy, uShadowInner.xy, uShadowInner.z);
-        float onPicture = 1.0 - smoothstep(-0.5, 0.5, dPicture);
-        vec2 atRails = mix(app, shadow.xy, recess.x);
-        float dOpening = sdRoundBox(atRails - uShadowRect.xy, uShadowInner.xy, uShadowInner.z);
-        faceVis = mix(1.0, 1.0 - smoothstep(-recess.y, recess.y, dOpening), onPicture);
-    }
+    // THE WALL around a panel: where the line to the lamp crosses the
+    // caster's plane.
+    vec2 onPlane = mix(app, shadow.xy, shadow.z);
+    float dRay = sdRoundBox(onPlane - uShadowRect.xy, uShadowRect.zw, uShadowCorner);
+    float wallVis = smoothstep(-shadow.w, shadow.w, dRay);
 
     // Which of the two this fragment is, one pixel of feather: the face is the
     // picture the host drew, and its edge is that picture's edge, not a
     // penumbra.
     float dFace = sdRoundBox(app - uShadowRect.xy, uShadowRect.zw, uShadowCorner);
     float onFace = 1.0 - smoothstep(-0.5, 0.5, dFace);
+
+    // THE FACE: lit, except a recessed picture where the rails hide the lamp
+    // (spotRecessVis, on the face only).
+    float faceVis = 1.0;
+    if (uShadowInner.w > 0.5) {
+        if (onFace > 0.0) {
+            faceVis = spotRecessVis(app, shadow, recess);
+        }
+    }
 
     return mix(wallVis, faceVis, onFace);
 }
@@ -345,7 +572,7 @@ float spotFaceGain(vec2 app) {
 /// What the shadow caster leaves of this lamp's light at app px @p app, in
 /// [0, 1] - reached through spotShadowLight (and spotShadowDarkenCover), and only
 /// for a lamp whose vShadowWeight is above 0 (a branch on a flat value, so
-/// coherent per lamp: with the solid search in it the mask is a dozen SDFs,
+/// coherent per lamp: where the solid search runs the mask is a dozen SDFs,
 /// and a lamp that casts nothing pays none of them and stays byte-identical to
 /// the renderer before the caster). The weight is ShadowCaster::opacity, so a
 /// translucent caster lets that much through.

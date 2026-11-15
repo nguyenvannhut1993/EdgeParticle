@@ -1,5 +1,17 @@
 # Spotlight solid frame - plan
 
+> **The search was bounded on 2026-11-15.** The golden-section search of
+> section 3.1 now runs only where its minimum lies inside the line - on 0.46%
+> of a 1080p frame under the Solid Frame preset, against half of it before. A
+> box test replaced the bounding-circle early-out of section 8; the fully lit
+> face deeper than the feather, the umbra, the far edges and the lit side are
+> settled from values the search computes anyway, each test handing back the
+> search's own answer with a margin over rounding, so the result is the
+> search's on every GPU: byte-identical, and a solid caster 1.11-1.18x the
+> panel's frame, where it was 2.4-3.3x. The cost table in section 9 predates
+> it; section 4 of [`spotlight-shadow.md`](../guides/spotlight-shadow.md) has
+> the current numbers and what each test settles.
+
 > **Merged into this tree on 2026-10-22**, from `source_shadow/` - the tree the
 > two notes below describe - and this time kept OUT of the light's files,
 > because `SpotlightRenderer` and its shaders are edited by several people. The
@@ -300,4 +312,6 @@ out of the early-out; a smaller frame in a larger beam pays less.
   other.
 - The solid search's cost (section 9) is measured on one integrated GPU only.
 - The early-out uses the caster's bounding CIRCLE; a box test would skip more
-  fragments of a long, thin caster. Not needed so far.
+  fragments of a long, thin caster. Not needed so far. (Since 2026-11-15 it is
+  a box test, and the line's ends settle most of what it lets through - see
+  the note at the top.)
