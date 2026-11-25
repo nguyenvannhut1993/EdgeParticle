@@ -63,13 +63,11 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/spotlight.frag"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/spotlight-blit.frag"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/spotlight-dither.glsl"
-    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/spotlight-shadow.glsl"
-    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/spotlight-shadow-vert.glsl"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/spotlight-mount.glsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/renderer/neon-tuning.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/renderer/droplets-tuning.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/renderer/lens-flare-tuning.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/renderer/spotlight-tuning.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/include/renderer/spotlight-shadow-tuning.h"
 )
 
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/shaders/wireframe.vert" WIREFRAME_VERT_CONTENT)
@@ -157,16 +155,11 @@ file(READ "${CMAKE_CURRENT_SOURCE_DIR}/include/renderer/spotlight-tuning.h" SPOT
 # below it) and have to draw the same noise. Not a shader on its own.
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/shaders/spotlight-dither.glsl" SPOTLIGHT_DITHER)
 
-# The spotlight's shadow caster, kept out of the light's own files: its
-# #defines (also #included by spotlight-shadow.cpp), injected via
-# @SPOTLIGHT_SHADOW_TUNING@ into spotlight.vert and spotlight.frag; its vertex
-# half via @SPOTLIGHT_SHADOW_VERT@ into spotlight.vert; and its fragment half
-# via @SPOTLIGHT_SHADOW@ into spotlight.frag, after @SPOTLIGHT_DITHER@. Each
-# goes ahead of the shader's own text, which reaches it through one call.
-# Neither chunk is a shader on its own.
-file(READ "${CMAKE_CURRENT_SOURCE_DIR}/include/renderer/spotlight-shadow-tuning.h" SPOTLIGHT_SHADOW_TUNING)
-file(READ "${CMAKE_CURRENT_SOURCE_DIR}/shaders/spotlight-shadow-vert.glsl" SPOTLIGHT_SHADOW_VERT)
-file(READ "${CMAKE_CURRENT_SOURCE_DIR}/shaders/spotlight-shadow.glsl" SPOTLIGHT_SHADOW)
+# The spotlight's mount shadow - its uniforms, artSd, mountShadow and
+# bevelFacing - injected via @SPOTLIGHT_MOUNT@ into the SPOT_FX_MOUNT variant
+# of spotlight.frag only (SPOTLIGHT_MOUNT_FRAG_SRC), after @SPOTLIGHT_DITHER@.
+# spotlight.frag keeps the one call site. Not a shader on its own.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/shaders/spotlight-mount.glsl" SPOTLIGHT_MOUNT)
 
 set(SHADER_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
 configure_file(
@@ -187,7 +180,6 @@ add_library(edge-lighting STATIC
     src/renderer/droplets-renderer.cpp
     src/renderer/lens-flare-renderer.cpp
     src/renderer/spotlight-renderer.cpp
-    src/renderer/spotlight-shadow.cpp
     src/util/capture-util.cpp
     src/util/stb-image.cpp
 )

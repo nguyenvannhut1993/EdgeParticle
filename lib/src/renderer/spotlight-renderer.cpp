@@ -156,12 +156,14 @@ namespace EdgeLighting
         /// the loss is never silent.
         float GetClampedSpotScale(const Config &config)
         {
-            // THE SHADOW pins it as the clip does - spotlight-shadow.h.
-            if (SpotlightShadow::PinsResolutionScale(config.spotlight))
+            if (HasClippedLamp(config.spotlight))
             {
                 return 1.0f;
             }
-            if (HasClippedLamp(config.spotlight))
+            // The mount shadow pins it for the clip's reason: its penumbra is
+            // as narrow as 1 px plus SPOT_FX_EDGE_AA, a per-fragment edge a
+            // reduced buffer would resolve at its own pitch.
+            if (config.spotlight.mount.mode != MountMode::FLUSH)
             {
                 return 1.0f;
             }
@@ -252,6 +254,248 @@ namespace EdgeLighting
             glEnable(GL_BLEND);
             glBlendFuncSeparate(GL_ONE_MINUS_DST_COLOR, GL_ONE, GL_ONE_MINUS_DST_ALPHA, GL_ONE);
         }
+
+        // ---- Mount shadow: the regions its programs are drawn in ------------
+        //
+        // The mount programs cost more than the plain light, and only the
+        // pixels the shadow can reach need them: a frame around the artwork's
+        // edge. mountShadow and bevelFacing are EXACTLY neutral outside it, so
+        // the same strips drawn with the plain program there are the same
+        // picture. The frame is split by scissor boxes - whole pixels, each
+        // pixel in exactly one box.
+
+        /// A pixel box, app coordinates, [x0, x1) x [y0, y1). Empty when it
+        /// has no width or height.
+        typedef struct PixelBox
+        {
+            int x0 = 0;
+            int y0 = 0;
+            int x1 = 0;
+            int y1 = 0;
+        } PixelBox;
+
+        bool IsEmptyBox(const PixelBox &box)
+        {
+            return box.x1 <= box.x0 || box.y1 <= box.y0;
+        }
+
+        /// A draw box and whether the mount programs are needed in it.
+        typedef struct MountBox
+        {
+            PixelBox box;
+            bool mounted = false;
+        } MountBox;
+
+        /// Most boxes LayOutMountBoxes produces: four outside the frame and the
+        /// 3 x 3 grid the frame, its corners and its hole make.
+        constexpr int MAX_MOUNT_BOXES = 13;
+
+        /// The boxes tiling @p viewportWidth x @p viewportHeight for this rig,
+        /// into @p boxes. Returns how many. A box flagged @c mounted is one the
+        /// shadow - or the recessed bevel - may reach; the rest are the plain
+        /// light, exactly.
+        int LayOutMountBoxes(const SpotlightConfig &spotlight, int viewportWidth, int viewportHeight,
+                             MountBox (&boxes)[MAX_MOUNT_BOXES])
+        {
+            const SpotMount &mount = spotlight.mount;
+            const float left = mount.position.x;
+            const float top = mount.position.y;
+            const float right = left + std::max(mount.width, 0.0f);
+            const float bottom = top + std::max(mount.height, 0.0f);
+            const float radius = std::min(std::max(mount.cornerRadius, 0.0f),
+                                          0.5f * std::min(right - left, bottom - top));
+            const float length = std::max(mount.shadowLength, 0.0f);
+            const float softness = std::max(mount.shadowSoftness, 0.0f);
+            const bool raised = mount.mode == MountMode::RAISED;
+
+            // Nothing the mount draws: no shadow and no bevel. One plain draw.
+            const bool shadows = mount.shadowStrength > 0.0f && length >= 0.5f;
+            const bool bevels = !raised && mount.bevel > 0.0f;
+            if (!shadows && !bevels)
+            {
+                boxes[0] = MountBox{PixelBox{0, 0, viewportWidth, viewportHeight}, false};
+                return 1;
+            }
+
+            // The shader's own early outs: past length + 1 + softness * length
+            // px from the art (raised, outside; recessed, inside) it is neutral.
+            const float ramp = 1.0f + softness * length;
+            const float reach = length + ramp;
+
+            // Which sides any lamp can shade. Raised, the shadow falls on the far
+            // side of the art: a lamp beyond an edge cannot shade anything past
+            // that edge, because the ray from there ends at the lamp without
+            // reaching the art. Recessed, a ray LEAVES the opening by an edge
+            // only if the lamp is past it, so a lamp inside an edge cannot shade
+            // the band along it. The widest ramp, plus 2 px, is the slack.
+            bool needLeft = false;
+            bool needTop = false;
+            bool needRight = false;
+            bool needBottom = false;
+            const int lampCount = std::min(static_cast<int>(spotlight.lamps.size()),
+                                           static_cast<int>(SPOT_MAX_LAMPS));
+            for (int i = 0; i < lampCount; i++)
+            {
+                const SpotLight &lamp = spotlight.lamps[static_cast<size_t>(i)];
+                if (!lamp.enable || lamp.intensity <= 0.0f || !shadows)
+                {
+                    continue;
+                }
+                const float slack = ramp + 2.0f;
+                if (raised)
+                {
+                    needLeft = needLeft || lamp.position.x > left - slack;
+                    needTop = needTop || lamp.position.y > top - slack;
+                    needRight = needRight || lamp.position.x < right + slack;
+                    needBottom = needBottom || lamp.position.y < bottom + slack;
+                }
+                else
+                {
+                    needLeft = needLeft || lamp.position.x < left + slack;
+                    needTop = needTop || lamp.position.y < top + slack;
+                    needRight = needRight || lamp.position.x > right - slack;
+                    needBottom = needBottom || lamp.position.y > bottom - slack;
+                }
+            }
+
+            // Margins are rounded outward and padded by 2 px: floats here, a
+            // pixel centre test there.
+            //
+            // Outside the art: raised, the shadow's reach on a side a lamp can
+            // shade, else only the edge's AA ramp; recessed, the bevel's band on
+            // every side. Inside: raised, the face's AA ramp, and up to the
+            // radius where a rounded corner leaves a notch of wall (a lamp
+            // beyond one edge can still shade that). Recessed, the shadow's
+            // depth on a needed side, and the corner squares whenever any side
+            // is needed: a ray may leave through a corner's arc by either of its
+            // two sides. The depth of the point k px in from both sides of a
+            // rounded corner is less than k, so k grows for a needed one.
+            const bool anyNeed = needLeft || needTop || needRight || needBottom;
+            const bool bowed = radius > 0.0f;
+            const float bevelOut = bevels ? mount.bevel + 1.0f : 1.0f;
+            const float deep = reach + 0.293f * std::max(radius - reach, 0.0f);
+            const auto outwardOf = [&](bool needed) { return raised ? (needed ? reach : 1.0f) : bevelOut; };
+            const auto inwardOf = [&](bool needed)
+            {
+                if (raised || !anyNeed)
+                {
+                    return radius + 1.0f;
+                }
+                return needed ? std::max(deep, radius + 1.0f) : (bowed ? radius + 1.0f : 1.0f);
+            };
+
+            const int ox0 = std::min(std::max(static_cast<int>(std::floor(left - outwardOf(needLeft))) - 2, 0), viewportWidth);
+            const int oy0 = std::min(std::max(static_cast<int>(std::floor(top - outwardOf(needTop))) - 2, 0), viewportHeight);
+            const int ox1 = std::max(std::min(static_cast<int>(std::ceil(right + outwardOf(needRight))) + 2, viewportWidth), ox0);
+            const int oy1 = std::max(std::min(static_cast<int>(std::ceil(bottom + outwardOf(needBottom))) + 2, viewportHeight), oy0);
+            const int rawHx0 = static_cast<int>(std::ceil(left + inwardOf(needLeft))) + 2;
+            const int rawHy0 = static_cast<int>(std::ceil(top + inwardOf(needTop))) + 2;
+            const int rawHx1 = static_cast<int>(std::floor(right - inwardOf(needRight))) - 2;
+            const int rawHy1 = static_cast<int>(std::floor(bottom - inwardOf(needBottom))) - 2;
+
+            // Is any lamp able to shade, or to light a bevel? A raised rounded
+            // art's notch takes any lamp.
+            const bool notch = raised && bowed;
+            const bool mountAny = anyNeed || bevels || notch;
+
+            // Four boxes outside the frame, then the frame.
+            int count = 0;
+            const auto push = [&](int x0, int y0, int x1, int y1, bool mounted)
+            {
+                const PixelBox box{x0, y0, x1, y1};
+                if (!IsEmptyBox(box))
+                {
+                    boxes[count++] = MountBox{box, mounted};
+                }
+            };
+            push(0, 0, viewportWidth, oy0, false);
+            push(0, oy1, viewportWidth, viewportHeight, false);
+            push(0, oy0, ox0, oy1, false);
+            push(ox1, oy0, viewportWidth, oy1, false);
+            if (rawHx1 <= rawHx0 || rawHy1 <= rawHy0)
+            {
+                // No hole: the bands meet, so the frame is one box.
+                push(ox0, oy0, ox1, oy1, mountAny);
+                return count;
+            }
+            const int hx0 = std::min(std::max(rawHx0, ox0), ox1);
+            const int hy0 = std::min(std::max(rawHy0, oy0), oy1);
+            const int hx1 = std::max(std::min(rawHx1, ox1), hx0);
+            const int hy1 = std::max(std::min(rawHy1, oy1), hy0);
+
+            // A bevel makes its whole band needed, and so does a notch. A recessed
+            // rounded opening shades through its corners' arcs too, so a
+            // straight side there needs the corner-adjacent sides' lamps as well.
+            const bool bentLR = !raised && bowed && (needLeft || needRight);
+            const bool bentTB = !raised && bowed && (needTop || needBottom);
+            const bool topNeeded = bevels || needTop || bentLR;
+            const bool bottomNeeded = bevels || needBottom || bentLR;
+            const bool leftNeeded = bevels || needLeft || bentTB;
+            const bool rightNeeded = bevels || needRight || bentTB;
+            push(ox0, oy0, hx0, hy0, bevels || notch || needTop || needLeft);
+            push(hx0, oy0, hx1, hy0, topNeeded);
+            push(hx1, oy0, ox1, hy0, bevels || notch || needTop || needRight);
+            push(ox0, hy0, hx0, hy1, leftNeeded);
+            push(hx0, hy0, hx1, hy1, false);
+            push(hx1, hy0, ox1, hy1, rightNeeded);
+            push(ox0, hy1, hx0, oy1, bevels || notch || needBottom || needLeft);
+            push(hx0, hy1, hx1, oy1, bottomNeeded);
+            push(hx1, hy1, ox1, oy1, bevels || notch || needBottom || needRight);
+            return count;
+        }
+
+        /// Sets the scissor to boxes within the HOST's own, restoring what it
+        /// found. The host's enable and box are read once.
+        class BoxScissor
+        {
+        public:
+            BoxScissor(int viewportWidth, int viewportHeight)
+                : mViewportHeight(viewportHeight), mHostEnabled(glIsEnabled(GL_SCISSOR_TEST) == GL_TRUE)
+            {
+                glGetIntegerv(GL_SCISSOR_BOX, mHostBox);
+                if (!mHostEnabled)
+                {
+                    mLimit = PixelBox{0, 0, viewportWidth, viewportHeight};
+                }
+                else
+                {
+                    mLimit = PixelBox{mHostBox[0], viewportHeight - mHostBox[1] - mHostBox[3],
+                                      mHostBox[0] + mHostBox[2], viewportHeight - mHostBox[1]};
+                }
+                glEnable(GL_SCISSOR_TEST);
+            }
+
+            ~BoxScissor()
+            {
+                glScissor(mHostBox[0], mHostBox[1], mHostBox[2], mHostBox[3]);
+                if (!mHostEnabled)
+                {
+                    glDisable(GL_SCISSOR_TEST);
+                }
+            }
+
+            BoxScissor(const BoxScissor &) = delete;
+            BoxScissor &operator=(const BoxScissor &) = delete;
+
+            /// Scissor to @p box within the host's. False if nothing is left.
+            bool Set(const PixelBox &box) const
+            {
+                const PixelBox cut{std::max(box.x0, mLimit.x0), std::max(box.y0, mLimit.y0),
+                                   std::min(box.x1, mLimit.x1), std::min(box.y1, mLimit.y1)};
+                if (IsEmptyBox(cut))
+                {
+                    return false;
+                }
+                glScissor(cut.x0, mViewportHeight - cut.y1, cut.x1 - cut.x0, cut.y1 - cut.y0);
+                return true;
+            }
+
+        private:
+            int mViewportHeight = 0;
+            bool mHostEnabled = false;
+            GLint mHostBox[4] = {0, 0, 0, 0};
+            PixelBox mLimit;
+        };
 
         /// Sub-samples per half-interval when widening a strip sample to the
         /// support's maximum over the span its chords cover. CPU-only, and it
@@ -725,9 +969,6 @@ namespace EdgeLighting
         mFrame.prepared = true;
         mFrame.viewport = glm::ivec2(viewportWidth, viewportHeight);
 
-        // THE SHADOW's offscreen pass - spotlight-shadow.h.
-        mShadow.RenderOffscreen(viewportWidth, viewportHeight, config);
-
         // Only the scaled path draws offscreen: at 1.0 - or pinned there by a
         // clipped lamp - the strips draw straight onto the caller's
         // framebuffer, in Render. UsesScaledBuffer also says no for a disabled
@@ -810,9 +1051,6 @@ namespace EdgeLighting
             return;
         }
 
-        // THE SHADOW's pass under the light - spotlight-shadow.h.
-        mShadow.RenderBeforeLight(viewportWidth, viewportHeight, config);
-
         UseScreenBlend();
         if (scaled)
         {
@@ -849,9 +1087,6 @@ namespace EdgeLighting
             drawLamps(viewportWidth, viewportHeight, false, config);
         }
 
-        // THE SHADOW's pass over the light - spotlight-shadow.h.
-        mShadow.RenderAfterLight(viewportWidth, viewportHeight, config);
-
         // Restore the blend state convention the other renderers leave behind.
         // glBlendFunc sets the RGB and alpha factors to the same pair, so it
         // also undoes UseScreenBlend's glBlendFuncSeparate - nothing downstream
@@ -873,8 +1108,6 @@ namespace EdgeLighting
         {
             mScaledBuffer.Release();
         }
-        // THE SHADOW - spotlight-shadow.h.
-        mShadow.OnConfigChanged(config);
 
         // Before the rebuild gate below, and before mCurrentSpotlight is
         // overwritten, because both halves of the transition are read from it.
@@ -901,6 +1134,15 @@ namespace EdgeLighting
         mShaderProgram = ShaderProgram(ShaderSource::SPOTLIGHT_VERT_SRC,
                                        ShaderSource::SPOTLIGHT_FRAG_SRC,
                                        "SpotlightRenderer");
+        // The mount shadow's programs. Built here rather than on first use for
+        // the blit's reason below; deliberately not in the return value - a
+        // mount that fails to build leaves the light drawing without it.
+        mMountShader = ShaderProgram(ShaderSource::SPOTLIGHT_VERT_SRC,
+                                     ShaderSource::SPOTLIGHT_MOUNT_FRAG_SRC,
+                                     "SpotlightRenderer.Mount");
+        mMountDarkenShader = ShaderProgram(ShaderSource::SPOTLIGHT_VERT_SRC,
+                                           ShaderSource::SPOTLIGHT_MOUNT_DARKEN_FRAG_SRC,
+                                           "SpotlightRenderer.MountDarken");
         // Its own blit, not blit.frag: the scaled path dithers there, after
         // the bilinear read, rather than into the buffer. See
         // spotlight-blit.frag.
@@ -970,9 +1212,7 @@ namespace EdgeLighting
         mVertexArray.SetAttribPointer(4, 3, GL_FLOAT, stride, offsetof(StripVertex, color));
         mVertexArray.SetAttribPointer(5, 1, GL_FLOAT, stride, offsetof(StripVertex, clipWeight));
         mVertexArray.SetAttribPointer(6, 1, GL_FLOAT, stride, offsetof(StripVertex, spreadFalloff));
-        // THE SHADOW's per-lamp attributes, from a buffer of its own -
-        // spotlight-shadow.h.
-        mShadow.AttachAttributes(mVertexArray, MAX_VERTS);
+        mVertexArray.SetAttribPointer(7, 2, GL_FLOAT, stride, offsetof(StripVertex, lampPos));
 
         mBufferReady = true;
     }
@@ -1009,7 +1249,6 @@ namespace EdgeLighting
         if (drawnLamps == 0)
         {
             mVertexCount = 0;
-            mShadow.OnStripsBuilt(spotlight, 0); // THE SHADOW: nothing to shadow.
             return;
         }
         const float sharedFloor = static_cast<float>(SPOT_VISIBILITY_FLOOR) /
@@ -1271,18 +1510,14 @@ namespace EdgeLighting
                     v.color[2] = s.color.b;
                     v.clipWeight = clipWeight;
                     v.spreadFalloff = s.spreadFalloff;
+                    v.lampPos[0] = ox;
+                    v.lampPos[1] = oy;
                     mStripVerts.push_back(v);
                 }
             }
-
-            // THE SHADOW: this lamp's run of the strips ends here -
-            // spotlight-shadow.h.
-            mShadow.AddLampStrip(i, static_cast<int>(mStripVerts.size()), s.apertureWidth);
         }
 
         mVertexCount = static_cast<int>(mStripVerts.size());
-        // THE SHADOW's per-lamp attributes, for the strips just laid out.
-        mShadow.OnStripsBuilt(spotlight, mVertexCount);
         if (mVertexCount == 0)
         {
             return;
@@ -1376,11 +1611,111 @@ namespace EdgeLighting
         mShaderProgram.SetUniform("uClipParams",
                                   glm::vec3(clipSolve.radius, clipSolve.softness,
                                             clipSolve.keepInside ? 1.0f : 0.0f));
-        // THE SHADOW caster's uniforms - spotlight-shadow.h.
-        mShadow.UploadUniforms(mShaderProgram, config);
+
+        // A mounted artwork takes the draw over (drawMounted): this one is the
+        // plain light, which is all it needs beyond the shadow's reach.
+        if (config.spotlight.mount.mode != MountMode::FLUSH && mMountShader.IsValid())
+        {
+            drawMounted(viewportWidth, viewportHeight, mvp, config);
+            mShaderProgram.Unuse();
+            return;
+        }
 
         mVertexArray.DrawArrays(GL_TRIANGLES, mVertexCount);
 
         mShaderProgram.Unuse();
+    }
+
+    void SpotlightRenderer::uploadMountUniforms(ShaderProgram &program, const glm::mat4 &mvp, const Config &config)
+    {
+        // The light's own uniforms, as drawLamps sets them. uDither is 1: the
+        // mount pins the scale to 1.0, where this pass writes the caller's
+        // framebuffer. The darkening program does not read it - the optimizer
+        // removes it, and sending it logs a missing uniform - so it is the
+        // light program's alone.
+        const ClipSolve clipSolve = DeriveClip(config.spotlight.clipArea);
+        program.SetUniform("uMVP", mvp);
+        program.SetUniform("uClipRect",
+                           glm::vec4(clipSolve.center.x, clipSolve.center.y,
+                                     clipSolve.half.x, clipSolve.half.y));
+        program.SetUniform("uClipParams",
+                           glm::vec3(clipSolve.radius, clipSolve.softness,
+                                     clipSolve.keepInside ? 1.0f : 0.0f));
+
+        // The mount's four vec4s, in the layout spotlight-mount.glsl reads
+        // (the mockup's): uArtRect centre + half size, uArtShape.x radius,
+        // uArtLevels.z mode / .w strength, uArtMount length / softness / bevel
+        // / tan elevation. The components the mockup spends on its art
+        // protection go as 0.
+        const SpotMount &mount = config.spotlight.mount;
+        const glm::vec2 half(std::max(mount.width, 0.0f) * 0.5f,
+                             std::max(mount.height, 0.0f) * 0.5f);
+        const float radius = std::min(std::max(mount.cornerRadius, 0.0f), std::min(half.x, half.y));
+        program.SetUniform("uArtRect",
+                           glm::vec4(mount.position.x + half.x, mount.position.y + half.y,
+                                     half.x, half.y));
+        program.SetUniform("uArtShape", glm::vec4(radius, 0.0f, 0.0f, 0.0f));
+        program.SetUniform("uArtLevels",
+                           glm::vec4(0.0f, 0.0f,
+                                     static_cast<float>(static_cast<int>(mount.mode)),
+                                     std::min(std::max(mount.shadowStrength, 0.0f), 1.0f)));
+        program.SetUniform("uArtMount",
+                           glm::vec4(std::max(mount.shadowLength, 0.0f),
+                                     std::max(mount.shadowSoftness, 0.0f),
+                                     std::max(mount.bevel, 0.0f),
+                                     std::max(mount.tanElevation, 0.0f)));
+    }
+
+    void SpotlightRenderer::drawMounted(int viewportWidth, int viewportHeight, const glm::mat4 &mvp, const Config &config)
+    {
+        MountBox boxes[MAX_MOUNT_BOXES];
+        const int count = LayOutMountBoxes(config.spotlight, viewportWidth, viewportHeight, boxes);
+        const SpotMount &mount = config.spotlight.mount;
+
+        BoxScissor scissor(viewportWidth, viewportHeight);
+
+        // The darkening, first: light then screens onto what it left. Only the
+        // boxes a shadow can reach, and nothing at all when it could not show.
+        if (mount.darkness > 0.0f && mount.shadowStrength > 0.0f && mMountDarkenShader.IsValid())
+        {
+            mMountDarkenShader.Use();
+            uploadMountUniforms(mMountDarkenShader, mvp, config);
+            mMountDarkenShader.SetUniform("uArtDarkness", std::min(mount.darkness, 1.0f));
+            // Black over what is there, colour and alpha: dst * (1 - a), and
+            // a + dst.a * (1 - a). On a transparent surface that is a black veil
+            // over the video plane.
+            glBlendFuncSeparate(GL_ZERO, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+            for (int i = 0; i < count; i++)
+            {
+                if (boxes[i].mounted && scissor.Set(boxes[i].box))
+                {
+                    mVertexArray.DrawArrays(GL_TRIANGLES, mVertexCount);
+                }
+            }
+            UseScreenBlend();
+        }
+
+        // The light, where no shadow can reach: the plain program, as always.
+        mShaderProgram.Use();
+        for (int i = 0; i < count; i++)
+        {
+            if (!boxes[i].mounted && scissor.Set(boxes[i].box))
+            {
+                mVertexArray.DrawArrays(GL_TRIANGLES, mVertexCount);
+            }
+        }
+
+        // The light under the shadow and the bevel.
+        mMountShader.Use();
+        uploadMountUniforms(mMountShader, mvp, config);
+        mMountShader.SetUniform("uDither", 1.0f);
+        for (int i = 0; i < count; i++)
+        {
+            if (boxes[i].mounted && scissor.Set(boxes[i].box))
+            {
+                mVertexArray.DrawArrays(GL_TRIANGLES, mVertexCount);
+            }
+        }
+        mMountShader.Unuse();
     }
 }

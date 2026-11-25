@@ -1,6 +1,5 @@
 #include "debug-ui.h"
 #include "renderer/spotlight-tuning.h"
-#include "renderer/spotlight-shadow.h"
 #include "animation/animation-manager.h"
 #include "core/config.h"
 #include "core/edge-lighting.h"
@@ -21,9 +20,6 @@
 
 namespace
 {
-    /// ShadowCaster::darkness the Picture Light / Solid Frame presets set, so
-    /// their shadow keeps its depth over a bright backdrop too.
-    constexpr float PRESET_SHADOW_DARKNESS = 0.6f;
     /// Upper bound the debug UI enforces on colour-stop lists.
     constexpr int MAX_COLOR_STOPS = 128;
     /// Max value for the neon "LUT Size" slider. Matches the LUT
@@ -1235,6 +1231,153 @@ void DebugUI::buildLensFlareSection(EdgeLighting::Config &cfg)
     SliderWithInput("Rotation Rate##Lens", cfg.lensFlare.rotationRate, -2.0f, 2.0f, "%.3f rev/s");
 }
 
+void DebugUI::buildMountShadowSection(EdgeLighting::Config &cfg)
+{
+    // --- Mount shadow: a framed artwork that shades the cones falling on it
+    // (spotlight-mount.glsl). The settings are the mockup's: Mode, Depth,
+    // Shadow Length, Shadow Softness, Shadow Strength, Bevel. ---
+    ImGui::SeparatorText("Mount Shadow");
+    auto &mount = cfg.spotlight.mount;
+    ImGui::Indent();
+
+    const char *modeItems[] = {"Flush (off)", "Raised", "Recessed"};
+    int modeIdx = static_cast<int>(mount.mode);
+    if (ImGui::Combo("Mode##SpotMount", &modeIdx, modeItems, IM_ARRAYSIZE(modeItems)))
+    {
+        mount.mode = static_cast<EdgeLighting::MountMode>(modeIdx);
+    }
+
+    // The artwork, in the same app coordinates as the lamps: top-left origin,
+    // +y down.
+    SliderWithInput("Art X##SpotMount", mount.position.x, -200.0f, 2400.0f, "%.0f px");
+    SliderWithInput("Art Y##SpotMount", mount.position.y, -200.0f, 1600.0f, "%.0f px");
+    SliderWithInput("Art Width##SpotMount", mount.width, 0.0f, 2400.0f, "%.0f px");
+    SliderWithInput("Art Height##SpotMount", mount.height, 0.0f, 1600.0f, "%.0f px");
+    SliderWithInput("Art Corner##SpotMount", mount.cornerRadius, 0.0f, 400.0f, "%.0f px");
+    if (ImGui::SmallButton("Match Rect##SpotMount"))
+    {
+        mount.position = cfg.geometry.position;
+        mount.width = cfg.geometry.width;
+        mount.height = cfg.geometry.height;
+        mount.cornerRadius = cfg.geometry.cornerRadius;
+    }
+    ImGui::SameLine();
+    // One lamp above the artwork aiming down at it, the artwork on the rect
+    // (which the wireframe outlines), and the neon off so its line does not
+    // sit on the edges the shadow starts from.
+    if (ImGui::SmallButton("Test Scene##SpotMount"))
+    {
+        mount.position = cfg.geometry.position;
+        mount.width = cfg.geometry.width;
+        mount.height = cfg.geometry.height;
+        mount.cornerRadius = cfg.geometry.cornerRadius;
+        if (mount.mode == EdgeLighting::MountMode::FLUSH)
+        {
+            mount.mode = EdgeLighting::MountMode::RAISED;
+        }
+        cfg.neon.enable = false;
+        mount.darkness = 0.6f;
+        EdgeLighting::SpotLight l;
+        l.position = glm::vec2(cfg.geometry.position.x + cfg.geometry.width * 0.5f,
+                               cfg.geometry.position.y - 80.0f);
+        l.angle = 90.0f;
+        l.beamAngle = 70.0f;
+        l.throwLength = 1500.0f;
+        l.apertureWidth = 24.0f;
+        l.softness = 0.5f;
+        l.intensity = 2.0f;
+        cfg.spotlight.lamps.clear();
+        cfg.spotlight.lamps.push_back(l);
+        mSpotlightSelected = 0;
+    }
+    if (ImGui::IsItemHovered())
+    {
+        ImGui::SetTooltip("Replaces the lamps with one above the rect, puts the artwork\n"
+                          "on the rect and turns the neon off.");
+    }
+
+    // Depth. SpotMount takes the shader's own two numbers - the shadow's
+    // length in px and tan of the lamps' elevation - because how the mockup
+    // turned its Depth slider into them is not in the notes. A mount d px off
+    // the wall under a lamp at elevation e casts a shadow d / tan(e) long, so
+    // two of the three are sliders and the third follows; this picks which.
+    const char *mapItems[] = {"A: Length in px", "B: Length = px per px of Depth", "Direct"};
+    ImGui::Combo("Depth Mapping##SpotMount", &mMountDepthMapping, mapItems, IM_ARRAYSIZE(mapItems));
+    if (ImGui::IsItemHovered())
+    {
+        ImGui::SetTooltip("A: tan(elev) = Depth / Length. Depth only shades the bevel;\n"
+                          "   in Raised it changes nothing.\n"
+                          "B: Length = Depth * ratio, tan(elev) = 1 / ratio. Depth 0 = no shadow.\n"
+                          "Direct: the shader's two numbers as they are.\n"
+                          "Raised, drag Depth: the shadow grows under B, not under A.");
+    }
+    switch (mMountDepthMapping)
+    {
+    case 0:
+    {
+        SliderWithInput("Depth##SpotMount", mMountDepth, 0.0f, 200.0f, "%.0f px");
+        SliderWithInput("Shadow Length##SpotMount", mount.shadowLength, 0.0f, 400.0f, "%.0f px");
+        mount.tanElevation = mMountDepth / std::max(mount.shadowLength, 1.0f);
+        break;
+    }
+    case 1:
+    {
+        SliderWithInput("Depth##SpotMount", mMountDepth, 0.0f, 200.0f, "%.0f px");
+        SliderWithInput("Shadow Length##SpotMount", mMountShadowRatio, 0.0f, 8.0f, "%.2f px/px");
+        mount.shadowLength = mMountDepth * mMountShadowRatio;
+        mount.tanElevation = 1.0f / std::max(mMountShadowRatio, 1.0e-3f);
+        break;
+    }
+    default:
+    {
+        SliderWithInput("Shadow Length##SpotMount", mount.shadowLength, 0.0f, 400.0f, "%.0f px");
+        SliderWithInput("tan(Elevation)##SpotMount", mount.tanElevation, 0.0f, 4.0f, "%.3f");
+        break;
+    }
+    }
+
+    SliderWithInput("Shadow Softness##SpotMount", mount.shadowSoftness, 0.0f, 1.0f, "%.3f");
+    SliderWithInput("Shadow Strength##SpotMount", mount.shadowStrength, 0.0f, 1.0f, "%.2f");
+    // The light only adds, so on a bright background a shadow that withholds it
+    // cannot be seen: this lays black over it. Try it with Background (debug)
+    // below, or an image backdrop.
+    SliderWithInput("Darkness##SpotMount", mount.darkness, 0.0f, 1.0f, "%.2f");
+    if (ImGui::IsItemHovered())
+    {
+        ImGui::SetTooltip("How far the shadow darkens what is BEHIND the light.\n"
+                          "0 = only withholds the lamp's light (invisible on a bright background).\n"
+                          "It darkens every layer under the spotlight in the shadow: the neon too.\n"
+                          "'Spotlight at bottom' in the layer order spares them.");
+    }
+    SliderWithInput("Bevel##SpotMount", mount.bevel, 0.0f, 80.0f, "%.0f px");
+
+    ImGui::TextDisabled("shader: length %.1f px, tan(elev) %.3f (%.1f deg)",
+                        mount.shadowLength, mount.tanElevation,
+                        std::atan(mount.tanElevation) * 57.29578f);
+    if (mount.mode == EdgeLighting::MountMode::FLUSH)
+    {
+        ImGui::TextDisabled("Flush: no shadow, the plain light program.");
+    }
+    else
+    {
+        if (mount.width <= 0.0f || mount.height <= 0.0f)
+        {
+            ImGui::TextDisabled("Zero-size artwork: press Match Rect or Test Scene.");
+        }
+        if (mount.mode != EdgeLighting::MountMode::RECESSED && mount.bevel > 0.0f)
+        {
+            ImGui::TextDisabled("Bevel shows in Recessed only.");
+        }
+        if (cfg.spotlight.resolutionScale < 1.0f)
+        {
+            ImGui::TextDisabled("Res Scale held at 1.0 while the mount is on.");
+        }
+    }
+
+    ImGui::Unindent();
+    ImGui::Separator();
+}
+
 void DebugUI::buildSpotlightSection(EdgeLighting::Config &cfg)
 {
     if (!ImGui::CollapsingHeader("Spotlights", ImGuiTreeNodeFlags_DefaultOpen))
@@ -1255,29 +1398,26 @@ void DebugUI::buildSpotlightSection(EdgeLighting::Config &cfg)
     SliderWithInput("Res Scale##Spot", cfg.spotlight.resolutionScale, 0.125f, 1.0f, "%.3f");
     if (cfg.spotlight.resolutionScale < 1.0f)
     {
-        // The library holds the scale at 1.0 while a clipped or shadow-casting
-        // lamp is enabled, because a mask edge has to be resolved at full
-        // resolution. Say so here, or the slider reads as broken: it moves and
-        // the frame does not change. The two pins of GetClampedSpotScale: the
-        // shadow's is asked of the library, since a build can switch it off
-        // (PIN_RESOLUTION_SCALE in spotlight-shadow.cpp); the clip's mirrors
-        // the light's HasClippedLamp, over the lamps that DRAW, within the
-        // ceiling.
+        // The library holds the scale at 1.0 while a clipped lamp is enabled,
+        // because the clip edge has to be resolved at full resolution. Say so
+        // here, or the slider reads as broken: it moves and the frame does not
+        // change. Mirrors SpotlightRenderer's own HasClippedLamp test - the
+        // lamps that DRAW, within the ceiling.
         size_t drawnLamps = std::min(cfg.spotlight.lamps.size(), size_t(SPOT_MAX_LAMPS));
-        bool anyMaskedLamp = EdgeLighting::SpotlightShadow::PinsResolutionScale(cfg.spotlight);
+        bool anyClippedLamp = false;
         for (size_t i = 0; i < drawnLamps; i++)
         {
             const auto &lamp = cfg.spotlight.lamps[i];
             if (lamp.clipped && lamp.enable && lamp.intensity > 0.0f)
             {
-                anyMaskedLamp = true;
+                anyClippedLamp = true;
                 break;
             }
         }
 
-        if (anyMaskedLamp)
+        if (anyClippedLamp)
         {
-            ImGui::TextDisabled("Held at 1.0: a clipped or shadow-casting lamp is enabled.");
+            ImGui::TextDisabled("Held at 1.0: a clipped lamp is enabled.");
         }
         else if (cfg.spotlight.lamps.size() < 6)
         {
@@ -1348,152 +1488,9 @@ void DebugUI::buildSpotlightSection(EdgeLighting::Config &cfg)
 
         ImGui::Unindent();
     }
-
-    // --- Shadow caster: ONE picture standing off the wall, opted into per
-    // lamp below with "Cast Shadow". Always shown for the reason the clip area
-    // is: it has no enable of its own.
-    ImGui::SeparatorText("Shadow Caster");
-    auto &caster = cfg.spotlight.shadowCaster;
-    {
-        ImGui::Indent();
-
-        SliderWithInput("X##SpotShadow", caster.position.x, -200.0f, 2400.0f, "%.0f px");
-        SliderWithInput("Y##SpotShadow", caster.position.y, -200.0f, 1600.0f, "%.0f px");
-        SliderWithInput("Width##SpotShadow", caster.width, 0.0f, 2400.0f, "%.0f px");
-        SliderWithInput("Height##SpotShadow", caster.height, 0.0f, 1600.0f, "%.0f px");
-        SliderWithInput("Corner Radius##SpotShadow", caster.cornerRadius, 0.0f, 400.0f, "%.0f px");
-        // How far the picture stands off the wall - the shadow's one
-        // distance. Every lamp is taken to stand 150 px off the wall
-        // (SPOT_LAMP_WALL_DISTANCE), so this sets how far the shadow is
-        // thrown and how soft its edge is: the picture scaled by
-        // 150 / (150 - this) about the lamp.
-        SliderWithInput("Wall Distance##SpotShadow", caster.wallDistance, 0.0f, 200.0f, "%.0f px");
-        if (ImGui::IsItemHovered())
-        {
-            ImGui::SetTooltip("How far the picture stands off the wall, against lamps 150 px out.\n"
-                              "Larger throws a longer, softer shadow. Near 150 a panel's shadow\n"
-                              "grows out of view; a solid caster's that deep never ends.");
-        }
-        SliderWithInput("Softness##SpotShadow", caster.softness, 0.0f, 40.0f, "%.1f px");
-        SliderWithInput("Opacity##SpotShadow", caster.opacity, 0.0f, 1.0f, "%.2f");
-        // 0 is physical: a second lamp only adds its own light inside the
-        // first one's shadow. Above it the other lamps wash the shadow out -
-        // a look, and a second pass of this layer.
-        SliderWithInput("Fill##SpotShadow", caster.fill, 0.0f, 1.0f, "%.2f");
-        if (ImGui::IsItemHovered())
-        {
-            ImGui::SetTooltip("How far the OTHER lamps' light washes a lamp's shadow out.\n"
-                              "0 = physical (the shadow shows lighter where another lamp shines).\n"
-                              "1 = gone wherever the others give half the shadowed lamp's light.\n"
-                              "Above 0 the layer draws twice.");
-        }
-        // Light only at 0: the shadow is the lamp's light taken away, so over
-        // a bright backdrop it all but disappears. Above 0 it also darkens
-        // what is behind the layer - one more pass.
-        SliderWithInput("Darkness##SpotShadow", caster.darkness, 0.0f, 1.0f, "%.2f");
-        if (ImGui::IsItemHovered())
-        {
-            ImGui::SetTooltip("How far the shadow darkens what is behind the layer.\n"
-                              "0 = light only (over a bright backdrop the shadow all but vanishes).\n"
-                              "Above 0 the shadow keeps its depth on any backdrop, and its alpha\n"
-                              "darkens a surface composited over video.");
-        }
-        ImGui::ColorEdit3("Shadow Color##SpotShadow", &caster.color.x, ImGuiColorEditFlags_NoInputs);
-
-        // A solid block (a framed picture standing out from the wall) rather
-        // than a flat panel floating in front of it. See
-        // docs/design/spotlight-solid-frame-plan.md.
-        ImGui::Checkbox("Solid##SpotShadow", &caster.solid);
-        if (ImGui::IsItemHovered())
-        {
-            ImGui::SetTooltip("The caster fills everything from the wall to its Wall Distance.\n"
-                              "Its shadow is attached to it, and at 150 px or deeper (as far\n"
-                              "out as the lamps) its shadow never ends.");
-        }
-        // The frame's rails, and how far the picture sits behind them: with
-        // both above 0 the top rail shades the top of the picture.
-        SliderWithInput("Frame Width##SpotShadow", caster.frameWidth, 0.0f, 200.0f, "%.0f px");
-        SliderWithInput("Frame Depth##SpotShadow", caster.frameDepth, 0.0f, 100.0f, "%.0f px");
-        // How much of the casting lamps' light the picture takes: the layer
-        // screens its light over the picture, so a bright lamp washes it out.
-        // The frame's shadow on the picture keeps the wall's Darkness.
-        SliderWithInput("Light On Picture##SpotShadow", caster.lightOnPicture, 0.0f, 1.0f, "%.2f");
-        if (ImGui::IsItemHovered())
-        {
-            ImGui::SetTooltip("How much of the casting lamps' light lands on the picture (the caster's rectangle).\n"
-                              "1 = lit like the wall. Lower it when a bright lamp washes the picture out:\n"
-                              "at 0 the picture shows as drawn. The frame's shadow on it is drawn by Darkness,\n"
-                              "as the wall's is - raise Darkness to see it on an unlit picture.");
-        }
-
-        // Same bridge as the clip's: a one-off copy, not a binding.
-        if (ImGui::SmallButton("Match Rect##SpotShadow"))
-        {
-            caster.position = cfg.geometry.position;
-            caster.width = cfg.geometry.width;
-            caster.height = cfg.geometry.height;
-            caster.cornerRadius = cfg.geometry.cornerRadius;
-        }
-        ImGui::SameLine();
-
-        // A downlight over the rect throwing its shadow, after the reference
-        // photo this feature was built against: the caster matched to the
-        // rect, one warm lamp a rect-height above it, the lamp about five and a
-        // half times further off the wall than the picture (27.2 of the
-        // lamps' 150 px - the 29 of 160 it was tuned at). Replaces the lamp
-        // list - it is a starting point, not an addition to a rig.
-        //
-        // "Solid Frame" is the same rig with the caster made a solid framed
-        // picture: rails 4% of the shorter side, the picture 10 px behind
-        // them (9.4 px, the 10 of 160 it was tuned at). Raise Wall Distance to
-        // 150 or more to see the light stop at the frame.
-        const bool pictureLight = ImGui::SmallButton("Picture Light##SpotShadow");
-        ImGui::SameLine();
-        const bool solidFrame = ImGui::SmallButton("Solid Frame##SpotShadow");
-        if (pictureLight || solidFrame)
-        {
-            const auto &g = cfg.geometry;
-            caster.position = g.position;
-            caster.width = g.width;
-            caster.height = g.height;
-            caster.cornerRadius = g.cornerRadius;
-            caster.wallDistance = 27.1875f;
-            caster.softness = 6.0f;
-            caster.opacity = 1.0f;
-            caster.fill = 0.0f;
-            caster.darkness = PRESET_SHADOW_DARKNESS;
-            caster.color = glm::vec3(0.0f);
-            caster.solid = solidFrame;
-            caster.frameWidth = solidFrame ? 0.04f * std::min(g.width, g.height) : 0.0f;
-            caster.frameDepth = solidFrame ? 9.375f : 0.0f;
-            caster.lightOnPicture = 1.0f;
-
-            EdgeLighting::SpotLight l;
-            l.position = glm::vec2(g.position.x + g.width * 0.5f,
-                                   std::max(g.position.y - g.height, 24.0f));
-            l.angle = 90.0f;
-            l.beamAngle = 64.0f;
-            l.throwLength = 1400.0f;
-            l.spreadFalloff = 0.6f;
-            l.apertureWidth = 22.0f;
-            l.softness = 0.75f;
-            l.intensity = 4.0f;
-            l.bloom = 0.6f;
-            l.bloomRadius = 22.0f;
-            l.colorTemp = 2900.0f;
-            l.castsShadow = true;
-
-            cfg.spotlight.lamps.clear();
-            cfg.spotlight.lamps.push_back(l);
-            mSpotlightSelected = 0;
-        }
-        ImGui::TextDisabled("copy once - it does not follow the rect");
-        ImGui::TextDisabled("Darkness 0 is light only: over a bright backdrop raise it.");
-        ImGui::TextDisabled("For a picture in the rect: Border Color Picker > Show as backdrop.");
-
-        ImGui::Unindent();
-    }
     ImGui::Separator();
+
+    buildMountShadowSection(cfg);
 
     auto &lamps = cfg.spotlight.lamps;
     const int maxLamps = SPOT_MAX_LAMPS;
@@ -1570,10 +1567,6 @@ void DebugUI::buildSpotlightSection(EdgeLighting::Config &cfg)
     ImGui::Checkbox("Lamp Enabled##Spot", &l.enable);
 
     ImGui::Checkbox("Clip This Lamp##Spot", &l.clipped);
-
-    // The shadow caster's per-lamp half: the switch alone. How far the
-    // shadow is thrown is the caster's Wall Distance, the same for every lamp.
-    ImGui::Checkbox("Cast Shadow##Spot", &l.castsShadow);
 
     // App coordinates, top-left origin, +y down - the same space as
     // Geometry > Position, which is why the ranges here are viewport-sized

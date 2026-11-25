@@ -7,7 +7,6 @@ Related docs:
 
 * `effect-reference.md` - neon visual model and recipes (neon-focused).
 * `spotlight-renderer.md` - spotlight layer reference, cost measurements.
-* `spotlight-shadow.md` - the spotlight's shadow caster: model, looks, C ABI, where the code lives.
 * `implementation.md` - orchestrator, per-frame flow, C ABI staging.
 * `renderer/*-tuning.h` - shared CPU/GPU constants (caps, array sizes).
 
@@ -143,33 +142,6 @@ one, but nothing about the shape is spotlight-specific.
 
 No enable flag. The consumer opt-in (`SpotLight.clipped`) is the only gate.
 Expected as coverage on shaded output, not folded into shading.
-
-### ShadowCaster
-
-`SpotlightConfig.shadowCaster` - a picture standing `wallDistance` px off the
-wall the lamps light, throwing a shadow of every lamp with
-`SpotLight.castsShadow` set. Declared in `config.h`, between `SpotLight` and
-`SpotlightConfig`. Every casting lamp stands `SPOT_LAMP_WALL_DISTANCE = 150` px off
-the wall (`spotlight-shadow-tuning.h`); only the ratio `t = wallDistance / 150`
-reaches the picture. Reference: `spotlight-shadow.md`.
-
-| Field | Unit | Default | Range | Meaning |
-|---|---|---|---|---|
-| `position` | px, app coords | `(0,0)` | no cap | Top-left corner of the picture |
-| `width, height` | px | `0 x 0` | `>= 0` | Picture size. `0 x 0` casts nothing (inert, not a trap) |
-| `cornerRadius` | px | `0` | `[0, min(w,h)/2]` | Clamped to half the shorter side; the shadow is rounded to match |
-| `wallDistance` | px | `0` | `>= 0` | The face's distance off the wall. `0` = flush, no visible shadow. Shadow = picture scaled `1 / (1 - t)` about the lamp. A panel at `>= 150` casts nothing; a solid caster that deep never ends |
-| `softness` | px on the wall | `1.0` | `>= 0` | Feather on top of the lamp's penumbra (`2 * apertureWidth * t / (1 - t)`) |
-| `opacity` | fraction | `1.0` | `[0, 1]` | Light the picture stops |
-| `fill` | fraction | `0` | `[0, 1]` | How far the OTHER lamps' light washes a lamp's shadow out. `0` physical; above `0` a second pass and a viewport-sized RGBA8 buffer |
-| `darkness` | fraction | `0` | `[0, 1]` | How far the shadow darkens what is behind the layer (premultiplied OVER, alpha included). `0` light only; above `0` one more pass |
-| `color` | linear `vec3` | black | `[0, 1]` | Colour `darkness` paints with |
-| `solid` | bool | `false` | - | A block from the wall to `wallDistance`: shadow attached, grazing lamps cast forever. Costs about a tenth more than the panel: its soft edge's search runs only along the block's sides (`spotSolidWall`) |
-| `frameWidth` | px | `0` | `[0, min(w,h)/2]` | Rail width; the picture is the rect inset by it |
-| `frameDepth` | px | `0` | `[0, wallDistance]` | Picture recess behind the rails; with `frameWidth` the top rail shades it |
-| `lightOnPicture` | fraction | `1.0` | `[0, 1]` | Casting lamps' light on the picture (the face, rails included). `1` lit like the wall; `0` the picture as drawn. The wall untouched. `darkness` acts on the rails' shadow on the picture as on the wall, so at `0` that shadow is `darkness` alone. Applies whatever `wallDistance` and `opacity` are |
-
-No enable flag. The per-lamp opt-in (`SpotLight.castsShadow`) is the only gate.
 
 ### ColorStop
 
@@ -426,7 +398,6 @@ Per lamp (`SpotLight`):
 | `tint` | linear `vec3`, unclamped | `(1,1,1)` | `>= 0`, no cap | Gel multiplier on blackbody. `>1` legal (grows strip), `0` = lamp off (no geometry) |
 | `enable` | bool | `true` | - | Skip without removing (stable indices/animations) |
 | `clipped` | bool | `false` | - | Opt into `clipArea`. Only gate (area has no enable). Set area size first (`0x0 KEEP_INSIDE` blanks the lamp). Also pins `SpotlightConfig.resolutionScale` to `1.0` while any enabled lamp has it set |
-| `castsShadow` | bool | `false` | - | Opt into `shadowCaster`. Only gate; an unset caster blocks nothing. Pins `resolutionScale` to `1.0` like `clipped`, unless the library is built with `PIN_RESOLUTION_SCALE` false (`spotlight-shadow.cpp`) |
 
 Layer (`SpotlightConfig`):
 
@@ -435,8 +406,7 @@ Layer (`SpotlightConfig`):
 | `enable` | bool | `false` | - | Master switch |
 | `lamps` | list | empty | first 8 entries | Past `SPOT_MAX_LAMPS = 8` ignored - entries 9+ dropped byte-for-byte, with one logged warning |
 | `clipArea` | `ClipArea` | `0x0 KEEP_INSIDE` | see `ClipArea` | Cut region. `KEEP_INSIDE` also narrows strips (buys fragments back); `KEEP_OUTSIDE` unbounded, cannot |
-| `shadowCaster` | `ShadowCaster` | `0x0`, flush | see `ShadowCaster` | The picture that shadows `castsShadow` lamps. Only removes light; strips unchanged |
-| `resolutionScale` | fraction `(0, 1]` | `1.0` | `[0.125, 1.0]` | Same two-path shape as neon/flare, no uniform differs (scale in viewport transform only). Floor is `0.125`, not neon's `0.001` - `0.001` through `0.125` are identical and `0.126` is the first that differs. Fixed blit floor (~922k frags at 720p) so only large rigs win; default `1.0`. Held at `1.0` while any enabled lamp is `clipped` or `castsShadow` (value kept, transitions logged); the `castsShadow` hold is a build switch, `PIN_RESOLUTION_SCALE` |
+| `resolutionScale` | fraction `(0, 1]` | `1.0` | `[0.125, 1.0]` | Same two-path shape as neon/flare, no uniform differs (scale in viewport transform only). Floor is `0.125`, not neon's `0.001` - `0.001` through `0.125` are identical and `0.126` is the first that differs. Fixed blit floor (~922k frags at 720p) so only large rigs win; default `1.0`. Held at `1.0` while any enabled lamp is `clipped` (value kept, transitions logged) |
 
 Caller owns GL state the pass assumes and never sets: cull off (or
 front-face surviving CCW strips), full color+alpha mask, `FUNC_ADD`, no

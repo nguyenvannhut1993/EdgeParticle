@@ -26,17 +26,15 @@ at all:
   `SpotLight::angle`. **Moving `geometry.position` moves the rect and leaves
   the lamps where they are.** If a rig should travel with the frame, the caller
   moves it.
-- **Nothing in the scene occludes a cone.** It crosses the rect, the droplets
-  and the flare freely; there is no rect gating. Two explicit things stop light,
-  both opted into per lamp: `spotlight.clipArea` (section 4.6), an area that
-  cuts the light off, and `spotlight.shadowCaster` (section 4.7), a picture
-  standing off the wall that throws a shadow away from the lamp.
+- **Nothing occludes a cone.** It crosses the rect, the droplets and the flare
+  freely. There is no shadow model and no rect gating. The one way to stop
+  light is `spotlight.clipArea` (section 4.6) - an explicit area, opted into per
+  lamp, that cuts the light off rather than casting a shadow from anything.
 - **Light only adds, but never past full scale.** The pass SCREENS -
   `glBlendFuncSeparate(GL_ONE_MINUS_DST_COLOR, GL_ONE, GL_ONE_MINUS_DST_ALPHA,
   GL_ONE)` - in the alpha channel as well as in colour. A lamp never darkens
-  what is under it (the one opt-in exception is a shadow with
-  `shadowCaster.darkness` above 0, section 4.7), but overlapping lamps approach
-  1.0 instead of summing past it, which is what stops two crossing beams clipping to a flat white disc (V12a
+  what is under it, but overlapping lamps approach 1.0 instead of summing past
+  it, which is what stops two crossing beams clipping to a flat white disc (V12a
   in [`review-findings.md`](../records/review-findings.md)). The screen is symmetric and
   associative, so the layer is still order-independent: the order of
   `SpotlightConfig::lamps` cannot change the image. It costs what the add did.
@@ -588,19 +586,6 @@ which is what ordinary resolution loss looks like. Both demo UIs say so beside
 the slider, since a knob that moves and changes nothing otherwise reads as
 broken.
 
-### 4.7 The shadow caster
-
-`spotlight.shadowCaster` is a picture standing off the wall the cones are drawn
-on, and every lamp opted in with `SpotLight::castsShadow` throws its shadow
-away from itself; the caster's face stays lit. It is a coverage multiply like
-the clip, so it moves none of this document's numbers, and like the clip it
-pins `resolutionScale` to 1.0 while a drawn lamp casts - unless the library is
-built with `PIN_RESOLUTION_SCALE` off (`spotlight-shadow.cpp`; what that
-trades is section 2 of the shadow's guide). Its fields, its looks
-(`fill`, `darkness`, the solid frame), its C ABI and where its code lives are
-in [`spotlight-shadow.md`](spotlight-shadow.md) - a document of its own,
-because the shadow is a module of its own.
-
 ---
 
 ## 5. Animating a lamp
@@ -740,10 +725,6 @@ Remember that every `el_effect_set_*` writes the handle's **staging** config
 and only `el_effect_update` hands it to the effect - a host that sets lamps and
 then calls only `el_effect_render` renders the previous frame's rig.
 
-The shadow caster's functions (`el_effect_*_spotlight_casts_shadow`,
-`el_effect_*_spotlight_shadow_*`) are listed in section 7 of
-[`spotlight-shadow.md`](spotlight-shadow.md).
-
 ---
 
 ## 8. Interaction cheatsheet
@@ -765,7 +746,6 @@ The shadow caster's functions (`el_effect_*_spotlight_casts_shadow`,
 | Keep light out of a region (a video surface, say) | `clipArea.mode = KEEP_OUTSIDE` |
 | Confine light to a region | `clipArea.mode = KEEP_INSIDE` (the default) |
 | Soften or sharpen the cut | `clipArea.edgeSoftness` (0 aliases; 1.0 is one pixel) |
-| A picture that throws a shadow | `SpotLight::castsShadow` + `spotlight.shadowCaster.*` - see [`spotlight-shadow.md`](spotlight-shadow.md) section 8 |
 | Turn the whole layer off | `spotlight.enable` |
 | Trade quality for speed (large rigs only) | `spotlight.resolutionScale` |
 

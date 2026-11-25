@@ -41,7 +41,6 @@ pass and shader stage, with renders from the library itself.
 | [`effect-reference.md`](guides/effect-reference.md) | What each neon parameter does to the picture, with recipes. |
 | [`config-reference.md`](guides/config-reference.md) | Every field of `lib/include/core/config.h`: type, unit, default, range. The lookup table; `effect-reference.md` is the explanation. |
 | [`spotlight-renderer.md`](guides/spotlight-renderer.md) | The spotlight layer: every `SpotLight` field, the app-coordinate convention, the measured cost of its resolution scale. |
-| [`spotlight-shadow.md`](guides/spotlight-shadow.md) | The spotlight's shadow caster: every `ShadowCaster` field, the fill and darkening looks, the solid frame, its C ABI, and which files hold it - a module of its own beside the light. |
 | [`upgrade-notes.md`](guides/upgrade-notes.md) | What a host moving from `main` has to change, silent changes first. Read before calling an upgrade drop-in. |
 
 ## pages/
@@ -64,8 +63,6 @@ Built plans:
 | [`neon-glow-cover-resolution-plan.md`](design/neon-glow-cover-resolution-plan.md) | The glow coverage table sized per light type, and what it measured. |
 | [`neon-shader-cleanup-plan.md`](design/neon-shader-cleanup-plan.md) | The neon's program slots and shader variants before the cleanup, and why each was kept or cut. |
 | [`spotlight-renderer-plan.md`](design/spotlight-renderer-plan.md) | The spotlight's design and the offscreen verification behind it. |
-| [`spotlight-shadow-plan.md`](design/spotlight-shadow-plan.md) | The spotlight shadow caster and its `fill`: the model, the decisions, and the offscreen verification. |
-| [`spotlight-solid-frame-plan.md`](design/spotlight-solid-frame-plan.md) | The caster as a solid block and a recessed frame: the search behind its soft edge, its exact early-out, and what it cost as built (the search bounded since: section 4 of the shadow guide). |
 
 Studies of specific mechanisms:
 

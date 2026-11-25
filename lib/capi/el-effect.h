@@ -656,19 +656,6 @@ extern "C"
     EL_API el_result_e el_effect_set_spotlight_clipped(el_effect_handle_t effect, int32_t index, el_bool_t clipped);
     EL_API el_result_e el_effect_get_spotlight_clipped(el_effect_handle_t effect, int32_t index, el_bool_t *outClipped);
 
-    /** @brief Whether lamp @p index throws a shadow of the shadow caster.
-     *  @details Per lamp, like el_effect_set_spotlight_clipped, and default
-     *           off. The only gate - the caster has no enable of its own - but
-     *           unlike the clip not a trap: an unset caster is 0 x 0 and
-     *           blocks nothing.
-     *  @note  Like a clipped lamp, a shadow-casting lamp holds
-     *         el_effect_set_spotlight_resolution_scale at 1.0 while it draws -
-     *         unless the library is built with PIN_RESOLUTION_SCALE false
-     *         (spotlight-shadow.cpp), which lets it run at the scale set
-     *         there, the picture's edges resolved at that scale. */
-    EL_API el_result_e el_effect_set_spotlight_casts_shadow(el_effect_handle_t effect, int32_t index, el_bool_t castsShadow);
-    EL_API el_result_e el_effect_get_spotlight_casts_shadow(el_effect_handle_t effect, int32_t index, el_bool_t *outCastsShadow);
-
     /** @brief Drop every lamp. Any index-bound animation becomes a no-op until
      *         the list is re-created via @ref el_effect_set_spotlight_count. */
     EL_API el_result_e el_effect_clear_spotlights(el_effect_handle_t effect);
@@ -736,134 +723,6 @@ extern "C"
     EL_API el_result_e el_effect_set_spotlight_clip_mode(el_effect_handle_t effect, el_clip_mode_e mode);
     EL_API el_result_e el_effect_get_spotlight_clip_mode(el_effect_handle_t effect, el_clip_mode_e *outMode);
 
-    /*
-     * Spotlight shadow caster (Config::spotlight.shadowCaster)
-     *
-     * ONE flat rounded rectangle - a picture - standing off the wall the lamps
-     * light, which throws a shadow of every lamp opted in with
-     * el_effect_set_spotlight_casts_shadow. The shadow is thrown away from the
-     * lamp and follows it; the caster's own face stays lit, so a host that
-     * draws its picture into this rectangle gets the picture lit and its
-     * shadow on the wall around it.
-     *
-     * LIGHT ONLY: a shadow is the lamp's light taken away, not a darkening of
-     * what the host drew, so it shows over a backdrop darker than the lamp.
-     *
-     * NAMING follows the clip area's split:
-     *   el_effect_*_spotlight_shadow_<noun>  - the CASTER. No index.
-     *   el_effect_*_spotlight_casts_shadow   - a LAMP's state. Takes an index.
-     */
-
-    /** @brief The caster's rectangle, in APP coordinates: TOP-LEFT corner plus
-     *         size. Same five parameters in the same order as
-     *         @ref el_effect_set_geometry and the clip rectangle, so a host can
-     *         forward its rect straight in. Default 0 x 0, which casts
-     *         nothing. */
-    EL_API el_result_e el_effect_set_spotlight_shadow_rect(el_effect_handle_t effect,
-                                                           float width, float height,
-                                                           float x, float y,
-                                                           float cornerRadius);
-    EL_API el_result_e el_effect_get_spotlight_shadow_rect(el_effect_handle_t effect,
-                                                           float *outWidth, float *outHeight,
-                                                           float *outX, float *outY,
-                                                           float *outCornerRadius);
-
-    /** @brief How far the caster's face stands off the wall, in px. Default 0
-     *         (flush - no visible shadow). The shadow's ONE distance.
-     *  @details Measured against lamps 150 px off the wall, the same for
-     *           every lamp: with t = this / 150 the shadow is the caster
-     *           scaled by 1 / (1 - t) about each casting lamp and its
-     *           penumbra 2 * apertureWidth * t / (1 - t) px wide, so a larger
-     *           value throws it further and softer. Near 150 a panel's
-     *           shadow grows out of view (at or past it, none); a solid
-     *           caster's that deep never ends. */
-    EL_API el_result_e el_effect_set_spotlight_shadow_distance(el_effect_handle_t effect, float wallDistance);
-    EL_API el_result_e el_effect_get_spotlight_shadow_distance(el_effect_handle_t effect, float *outWallDistance);
-
-    /** @brief Extra feather across the shadow's edge, in px on the wall, on top
-     *         of the penumbra the lamp's aperture produces. Default 1.0. */
-    EL_API el_result_e el_effect_set_spotlight_shadow_softness(el_effect_handle_t effect, float softness);
-    EL_API el_result_e el_effect_get_spotlight_shadow_softness(el_effect_handle_t effect, float *outSoftness);
-
-    /** @brief Fraction of a lamp's light the caster stops, in [0, 1]. Default
-     *         1.0 (opaque). */
-    EL_API el_result_e el_effect_set_spotlight_shadow_opacity(el_effect_handle_t effect, float opacity);
-    EL_API el_result_e el_effect_get_spotlight_shadow_opacity(el_effect_handle_t effect, float *outOpacity);
-
-    /** @brief How far the OTHER lamps' light washes a lamp's shadow out, in
-     *         [0, 1]. Default 0 (physical: a second lamp only adds its own
-     *         light inside the first one's shadow, so the shadow shows lighter
-     *         wherever the second lamp is weaker).
-     *  @details Above 0 this is a look, not physics: at 1 a shadow is gone
-     *           wherever the other lamps put at least half as much light on it
-     *           as the shadowed lamp would have. A lamp never washes out its
-     *           own shadow.
-     *  @note  Costs a second pass of the layer, plus a viewport-sized buffer,
-     *         while above 0 and some lamp casts a shadow. */
-    EL_API el_result_e el_effect_set_spotlight_shadow_fill(el_effect_handle_t effect, float fill);
-    EL_API el_result_e el_effect_get_spotlight_shadow_fill(el_effect_handle_t effect, float *outFill);
-
-    /** @brief How far the shadow darkens what is behind the layer, in [0, 1].
-     *         Default 0 (light only: the shadow is the lamp's light taken
-     *         away, so over a bright backdrop it all but disappears and its
-     *         umbra writes alpha 0).
-     *  @details Above 0 each casting lamp also darkens the destination inside
-     *           its shadow, before its light: by darkness * (1 - visibility),
-     *           faded out with the lamp's own light, written as premultiplied
-     *           shadow colour OVER the destination - alpha included, so a
-     *           video plane behind the surface darkens too.
-     *  @note  Costs one more pass over the casting lamps' strips while above
-     *         0. */
-    EL_API el_result_e el_effect_set_spotlight_shadow_darkness(el_effect_handle_t effect, float darkness);
-    EL_API el_result_e el_effect_get_spotlight_shadow_darkness(el_effect_handle_t effect, float *outDarkness);
-
-    /** @brief The colour the darkening paints the shadow with, linear RGB in
-     *         [0, 1]. Default black. */
-    EL_API el_result_e el_effect_set_spotlight_shadow_color(el_effect_handle_t effect, float r, float g, float b);
-    EL_API el_result_e el_effect_get_spotlight_shadow_color(el_effect_handle_t effect,
-                                                            float *outR, float *outG, float *outB);
-
-    /** @brief Whether the caster is a SOLID block from the wall out to its
-     *         distance (a framed picture) rather than a flat panel floating
-     *         that far in front of it. Default off.
-     *  @details A block's shadow is attached to it, and a block at least
-     *           150 px deep - as deep as the lamps are far from the wall -
-     *           throws a shadow that never ends: the light stops at the
-     *           frame. Costs about a tenth more than the panel: the search
-     *           behind its soft edge runs only where the shadow hangs from
-     *           the block's sides. See
-     *           docs/design/spotlight-solid-frame-plan.md. */
-    EL_API el_result_e el_effect_set_spotlight_shadow_solid(el_effect_handle_t effect, el_bool_t solid);
-    EL_API el_result_e el_effect_get_spotlight_shadow_solid(el_effect_handle_t effect, el_bool_t *outSolid);
-
-    /** @brief The caster's FRAME: rail width and how far the picture inside
-     *         sits behind the rails' front, both in px. Default 0, 0 - no
-     *         frame.
-     *  @details With both above 0 the rails shade the picture: lit from above,
-     *           the top rail casts a band across its top. Width is clamped to
-     *           the shorter half side, depth to the caster's distance. One call
-     *           for the pair, because they describe one frame. */
-    EL_API el_result_e el_effect_set_spotlight_shadow_frame(el_effect_handle_t effect,
-                                                            float frameWidth, float frameDepth);
-    EL_API el_result_e el_effect_get_spotlight_shadow_frame(el_effect_handle_t effect,
-                                                            float *outFrameWidth, float *outFrameDepth);
-
-    /** @brief How much of a casting lamp's light lands on the PICTURE - the
-     *         caster's whole face, frame included - in [0, 1]. Default 1.0
-     *         (lit like the wall).
-     *  @details The layer screens its light over what the host drew, so a
-     *           bright lamp washes a picture out. Below 1 the face shows that
-     *           fraction of the light, and at 0 it shows exactly as drawn. The
-     *           wall, its light and its shadow are untouched. The frame's
-     *           shadow on the recessed picture keeps the shadow darkness the
-     *           wall's has, so at 0 it is that darkness alone (none at
-     *           darkness 0). Applies to every lamp with
-     *           el_effect_set_spotlight_casts_shadow set, whatever the
-     *           caster's distance and opacity. */
-    EL_API el_result_e el_effect_set_spotlight_shadow_light_on_picture(el_effect_handle_t effect, float lightOnPicture);
-    EL_API el_result_e el_effect_get_spotlight_shadow_light_on_picture(el_effect_handle_t effect,
-                                                                       float *outLightOnPicture);
-
     /** @brief Fraction of the viewport the lamps render at before being
      *         bilinear-blitted back. 1.0 (default) draws direct - no offscreen
      *         buffer, no blit. Clamped to [0.125, 1.0] at draw time.
@@ -874,11 +733,7 @@ extern "C"
      *         to what the lamps light, so the blit's full viewport of
      *         fragments is a fixed cost. Measured at 1280x720 it only wins
      *         above roughly six lamps. Leave it at 1.0 unless a profile says
-     *         otherwise - one did for one wide lamp casting a shadow
-     *         (Picture Light, 1080p: 1.42x faster at 0.5 with darkness on),
-     *         which a build with PIN_RESOLUTION_SCALE false allows.
-     *  @note  Held at 1.0 while an enabled lamp is clipped, or casts a shadow
-     *         in a build with PIN_RESOLUTION_SCALE true (the default). */
+     *         otherwise. */
     EL_API el_result_e el_effect_set_spotlight_resolution_scale(el_effect_handle_t effect, float scale);
     EL_API el_result_e el_effect_get_spotlight_resolution_scale(el_effect_handle_t effect, float *outScale);
 

@@ -94,6 +94,9 @@ private:
     void buildDropletsSection(EdgeLighting::Config &cfg);
     void buildLensFlareSection(EdgeLighting::Config &cfg);
     void buildSpotlightSection(EdgeLighting::Config &cfg);
+    /// The framed artwork's mount shadow (SpotMount), inside the Spotlights
+    /// section.
+    void buildMountShadowSection(EdgeLighting::Config &cfg);
     void buildAnimationSection(EdgeLighting::Config &cfg,
                                EdgeLighting::AnimationManager &manager);
     void buildBackgroundSection();
@@ -118,6 +121,17 @@ private:
     /// Which lamp the Spotlights section is editing. Clamped to the live
     /// list every frame, so removing a lamp cannot leave it dangling.
     int mSpotlightSelected = 0;
+
+    // --- Mount shadow ---
+    /// How the UI's Depth reaches SpotMount, which has no depth of its own:
+    /// 0 = A (Shadow Length in px, tan(elev) = Depth / Length),
+    /// 1 = B (Shadow Length is px of shadow per px of Depth = 1 / tan(elev),
+    ///        length = Depth * ratio), 2 = Direct (length px and tan(elev) as
+    /// the shader takes them). Which one the mockup used is the open question
+    /// this switch exists to settle.
+    int mMountDepthMapping = 1;
+    float mMountDepth = 24.0f;      ///< px the mount stands off the wall (A, B).
+    float mMountShadowRatio = 2.5f; ///< B's Shadow Length, px per px of Depth.
 
     // --- Animation state ---
     // Animations are owned by the effect's AnimationManager (via

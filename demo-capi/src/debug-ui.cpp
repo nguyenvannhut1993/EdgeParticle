@@ -12,9 +12,6 @@
 
 namespace
 {
-    /// ShadowCaster::darkness the Picture Light / Solid Frame presets set, so
-    /// their shadow keeps its depth over a bright backdrop too.
-    constexpr float PRESET_SHADOW_DARKNESS = 0.6f;
     constexpr int MAX_COLOR_STOPS = 128;
     constexpr int MAX_SEGMENT_BOOSTS = 8;
     constexpr int MAX_ARCS = 8;
@@ -1054,23 +1051,18 @@ void DebugUI::buildSpotlightSection(el_effect_handle_t effect)
 
     if (resScale < 1.0f)
     {
-        // The library holds the scale at 1.0 while a clipped or shadow-casting
-        // lamp is enabled, because a mask edge has to be resolved at full
-        // resolution. Say so here, or the slider reads as broken: it moves and
-        // the frame does not change. Mirrors the library's own test - the lamps
-        // that DRAW, within the ceiling - as the library is built by default: a
-        // build with PIN_RESOLUTION_SCALE off (spotlight-shadow.cpp) does not
-        // hold it for a shadow-casting lamp, and the C ABI cannot say which,
-        // so there this line over-reports.
+        // The library holds the scale at 1.0 while a clipped lamp is enabled,
+        // because the clip edge has to be resolved at full resolution. Say so
+        // here, or the slider reads as broken: it moves and the frame does not
+        // change. Mirrors the library's own test - the lamps that DRAW, within
+        // the ceiling.
         const int drawnLamps = count < MAX_LAMPS ? count : MAX_LAMPS;
-        bool anyMaskedLamp = false;
+        bool anyClippedLamp = false;
         for (int i = 0; i < drawnLamps; i++)
         {
             el_bool_t lampClipped = 0;
-            el_bool_t lampShadowed = 0;
             el_bool_t lampEnabled = 0;
             el_effect_get_spotlight_clipped(effect, i, &lampClipped);
-            el_effect_get_spotlight_casts_shadow(effect, i, &lampShadowed);
             el_effect_get_spotlight_enabled(effect, i, &lampEnabled);
             // Intensity arrives with the rest of the look - there is no getter
             // for it alone, and adding one to read a hint would be the wrong
@@ -1079,16 +1071,16 @@ void DebugUI::buildSpotlightSection(el_effect_handle_t effect)
             float ignoredBloomRadius = 0.0f, ignoredColorTemp = 0.0f;
             el_effect_get_spotlight_look(effect, i, &lampIntensity, &ignoredBloom,
                                          &ignoredBloomRadius, &ignoredColorTemp);
-            if ((lampClipped || lampShadowed) && lampEnabled && lampIntensity > 0.0f)
+            if (lampClipped && lampEnabled && lampIntensity > 0.0f)
             {
-                anyMaskedLamp = true;
+                anyClippedLamp = true;
                 break;
             }
         }
 
-        if (anyMaskedLamp)
+        if (anyClippedLamp)
         {
-            ImGui::TextDisabled("Held at 1.0: a clipped or shadow-casting lamp is enabled.");
+            ImGui::TextDisabled("Held at 1.0: a clipped lamp is enabled.");
         }
         else
         {
@@ -1167,155 +1159,6 @@ void DebugUI::buildSpotlightSection(el_effect_handle_t effect)
         {
             ImGui::TextDisabled("Zero-size area: every clipped lamp draws nothing.");
         }
-
-        ImGui::Unindent();
-    }
-
-    // --- Shadow caster: ONE picture standing off the wall, opted into per
-    // lamp below with "Cast Shadow". Always shown for the reason the clip area
-    // is: it has no enable of its own.
-    ImGui::SeparatorText("Shadow Caster");
-    {
-        ImGui::Indent();
-
-        // Same parameter order as the clip and the geometry: w, h, x, y, radius.
-        float sw = 0.0f, sh = 0.0f, sx = 0.0f, sy = 0.0f, sr = 0.0f;
-        el_effect_get_spotlight_shadow_rect(effect, &sw, &sh, &sx, &sy, &sr);
-        bool shadowRectDirty = false;
-        shadowRectDirty |= ImGui::SliderFloat("X##SpotShadow", &sx, -200.0f, 2400.0f, "%.0f px");
-        shadowRectDirty |= ImGui::SliderFloat("Y##SpotShadow", &sy, -200.0f, 1600.0f, "%.0f px");
-        shadowRectDirty |= ImGui::SliderFloat("Width##SpotShadow", &sw, 0.0f, 2400.0f, "%.0f px");
-        shadowRectDirty |= ImGui::SliderFloat("Height##SpotShadow", &sh, 0.0f, 1600.0f, "%.0f px");
-        shadowRectDirty |= ImGui::SliderFloat("Corner Radius##SpotShadow", &sr, 0.0f, 400.0f, "%.0f px");
-        if (shadowRectDirty)
-        {
-            el_effect_set_spotlight_shadow_rect(effect, sw, sh, sx, sy, sr);
-        }
-
-        // How far the picture stands off the wall - the shadow's one
-        // distance, against lamps 150 px out: it sets how far the shadow is
-        // thrown and how soft its edge is.
-        float casterDistance = 0.0f;
-        el_effect_get_spotlight_shadow_distance(effect, &casterDistance);
-        if (ImGui::SliderFloat("Wall Distance##SpotShadow", &casterDistance, 0.0f, 200.0f, "%.0f px"))
-        {
-            el_effect_set_spotlight_shadow_distance(effect, casterDistance);
-        }
-        float shadowSoft = 1.0f;
-        el_effect_get_spotlight_shadow_softness(effect, &shadowSoft);
-        if (ImGui::SliderFloat("Softness##SpotShadow", &shadowSoft, 0.0f, 40.0f, "%.1f px"))
-        {
-            el_effect_set_spotlight_shadow_softness(effect, shadowSoft);
-        }
-        float shadowOpacity = 1.0f;
-        el_effect_get_spotlight_shadow_opacity(effect, &shadowOpacity);
-        if (ImGui::SliderFloat("Opacity##SpotShadow", &shadowOpacity, 0.0f, 1.0f, "%.2f"))
-        {
-            el_effect_set_spotlight_shadow_opacity(effect, shadowOpacity);
-        }
-        // 0 is physical; above it the other lamps wash a shadow out - a look,
-        // and a second pass of this layer.
-        float shadowFill = 0.0f;
-        el_effect_get_spotlight_shadow_fill(effect, &shadowFill);
-        if (ImGui::SliderFloat("Fill##SpotShadow", &shadowFill, 0.0f, 1.0f, "%.2f"))
-        {
-            el_effect_set_spotlight_shadow_fill(effect, shadowFill);
-        }
-        // Light only at 0; above it the shadow darkens what is behind the
-        // layer too, so it keeps its depth over a bright backdrop.
-        float shadowDarkness = 0.0f;
-        el_effect_get_spotlight_shadow_darkness(effect, &shadowDarkness);
-        if (ImGui::SliderFloat("Darkness##SpotShadow", &shadowDarkness, 0.0f, 1.0f, "%.2f"))
-        {
-            el_effect_set_spotlight_shadow_darkness(effect, shadowDarkness);
-        }
-        float shadowColor[3] = {0.0f, 0.0f, 0.0f};
-        el_effect_get_spotlight_shadow_color(effect, &shadowColor[0], &shadowColor[1], &shadowColor[2]);
-        if (ImGui::ColorEdit3("Shadow Color##SpotShadow", shadowColor, ImGuiColorEditFlags_NoInputs))
-        {
-            el_effect_set_spotlight_shadow_color(effect, shadowColor[0], shadowColor[1], shadowColor[2]);
-        }
-
-        // A solid block rather than a floating panel, and its frame: see
-        // docs/design/spotlight-solid-frame-plan.md.
-        el_bool_t solidOn = 0;
-        el_effect_get_spotlight_shadow_solid(effect, &solidOn);
-        bool solidEn = solidOn;
-        if (ImGui::Checkbox("Solid##SpotShadow", &solidEn))
-        {
-            el_effect_set_spotlight_shadow_solid(effect, solidEn ? 1 : 0);
-        }
-        float frameW = 0.0f, frameD = 0.0f;
-        el_effect_get_spotlight_shadow_frame(effect, &frameW, &frameD);
-        bool frameDirty = false;
-        frameDirty |= ImGui::SliderFloat("Frame Width##SpotShadow", &frameW, 0.0f, 200.0f, "%.0f px");
-        frameDirty |= ImGui::SliderFloat("Frame Depth##SpotShadow", &frameD, 0.0f, 100.0f, "%.0f px");
-        if (frameDirty)
-        {
-            el_effect_set_spotlight_shadow_frame(effect, frameW, frameD);
-        }
-        // How much of the casting lamps' light the picture takes: the layer
-        // screens its light over the picture, so a bright lamp washes it out.
-        // The frame's shadow on the picture keeps the wall's Darkness.
-        float lightOnPicture = 1.0f;
-        el_effect_get_spotlight_shadow_light_on_picture(effect, &lightOnPicture);
-        if (ImGui::SliderFloat("Light On Picture##SpotShadow", &lightOnPicture, 0.0f, 1.0f, "%.2f"))
-        {
-            el_effect_set_spotlight_shadow_light_on_picture(effect, lightOnPicture);
-        }
-        if (ImGui::IsItemHovered())
-        {
-            ImGui::SetTooltip("How much of the casting lamps' light lands on the picture (the caster's rectangle).\n"
-                              "1 = lit like the wall. Lower it when a bright lamp washes the picture out:\n"
-                              "at 0 the picture shows as drawn. The frame's shadow on it is drawn by Darkness,\n"
-                              "as the wall's is - raise Darkness to see it on an unlit picture.");
-        }
-
-        if (ImGui::SmallButton("Match Rect##SpotShadow"))
-        {
-            float rw = 0.0f, rh = 0.0f, rx = 0.0f, ry = 0.0f, radius = 0.0f;
-            el_effect_get_geometry(effect, &rw, &rh, &rx, &ry, &radius);
-            el_effect_set_spotlight_shadow_rect(effect, rw, rh, rx, ry, radius);
-        }
-        ImGui::SameLine();
-
-        // The same starting rigs as the C++ demo's buttons: the caster matched
-        // to the rect, one warm downlight a rect-height above it - and for
-        // "Solid Frame", the caster made a solid framed picture. Replaces the
-        // lamp list rather than adding to it.
-        const bool pictureLight = ImGui::SmallButton("Picture Light##SpotShadow");
-        ImGui::SameLine();
-        const bool solidFrame = ImGui::SmallButton("Solid Frame##SpotShadow");
-        if (pictureLight || solidFrame)
-        {
-            float rw = 0.0f, rh = 0.0f, rx = 0.0f, ry = 0.0f, radius = 0.0f;
-            el_effect_get_geometry(effect, &rw, &rh, &rx, &ry, &radius);
-            el_effect_set_spotlight_shadow_rect(effect, rw, rh, rx, ry, radius);
-            el_effect_set_spotlight_shadow_distance(effect, 27.1875f);
-            el_effect_set_spotlight_shadow_softness(effect, 6.0f);
-            el_effect_set_spotlight_shadow_opacity(effect, 1.0f);
-            el_effect_set_spotlight_shadow_fill(effect, 0.0f);
-            el_effect_set_spotlight_shadow_darkness(effect, PRESET_SHADOW_DARKNESS);
-            el_effect_set_spotlight_shadow_color(effect, 0.0f, 0.0f, 0.0f);
-            el_effect_set_spotlight_shadow_solid(effect, solidFrame ? 1 : 0);
-            const float shorter = rw < rh ? rw : rh;
-            el_effect_set_spotlight_shadow_frame(effect, solidFrame ? 0.04f * shorter : 0.0f,
-                                                 solidFrame ? 9.375f : 0.0f);
-            el_effect_set_spotlight_shadow_light_on_picture(effect, 1.0f);
-
-            el_effect_clear_spotlights(effect);
-            el_effect_set_spotlight_count(effect, 1);
-            const float lampY = (ry - rh) > 24.0f ? (ry - rh) : 24.0f;
-            el_effect_set_spotlight_placement(effect, 0, rx + rw * 0.5f, lampY, 90.0f);
-            el_effect_set_spotlight_beam(effect, 0, 64.0f, 1400.0f, 22.0f, 0.75f);
-            el_effect_set_spotlight_spread_falloff(effect, 0, 0.6f);
-            el_effect_set_spotlight_look(effect, 0, 4.0f, 0.6f, 22.0f, 2900.0f);
-            el_effect_set_spotlight_casts_shadow(effect, 0, 1);
-            mSpotlightSelected = 0;
-            count = 1;
-        }
-        ImGui::TextDisabled("copy once - it does not follow the rect");
-        ImGui::TextDisabled("Darkness 0 is light only: over a bright backdrop raise it.");
 
         ImGui::Unindent();
     }
@@ -1400,16 +1243,6 @@ void DebugUI::buildSpotlightSection(el_effect_handle_t effect)
     if (ImGui::Checkbox("Clip This Lamp##Spot", &lampClipEn))
     {
         el_effect_set_spotlight_clipped(effect, sel, lampClipEn ? 1 : 0);
-    }
-
-    // The shadow caster's per-lamp half: the switch alone. How far the
-    // shadow is thrown is the caster's Wall Distance, the same for every lamp.
-    el_bool_t lampShadowOn = 0;
-    el_effect_get_spotlight_casts_shadow(effect, sel, &lampShadowOn);
-    bool lampShadowEn = lampShadowOn;
-    if (ImGui::Checkbox("Cast Shadow##Spot", &lampShadowEn))
-    {
-        el_effect_set_spotlight_casts_shadow(effect, sel, lampShadowEn ? 1 : 0);
     }
 
     float x = 0.0f, y = 0.0f, angle = 0.0f;

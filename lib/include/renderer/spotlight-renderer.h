@@ -2,7 +2,6 @@
 #define _EDGE_LIGHTING_SPOTLIGHT_RENDERER_H_
 
 #include "renderer/base-renderer.h"
-#include "renderer/spotlight-shadow.h"
 #include "gl/shader-program.h"
 #include "gl/vertex-array.h"
 #include "gl/framebuffer.h"
@@ -181,9 +180,14 @@ namespace EdgeLighting
             /// costs nothing here: these are separate attribute pointers, not
             /// a std140 block.
             float spreadFalloff;
+            /// The lamp's own position, @c SpotLight::position in app px -
+            /// the same on every vertex of its strip. Read only by the mount
+            /// shadow's program (spotlight-mount.glsl), for the direction to
+            /// the lamp; the plain program leaves it unread.
+            float lampPos[2];
         } StripVertex;
 
-        static_assert(sizeof(StripVertex) == 17 * sizeof(float),
+        static_assert(sizeof(StripVertex) == 19 * sizeof(float),
                       "StripVertex must be tightly packed - ensureBuffer's "
                       "attribute pointers use sizeof(StripVertex) as the stride.");
 
@@ -240,8 +244,27 @@ namespace EdgeLighting
         /// target and the blend (UseScreenBlend in the .cpp).
         void drawLamps(int viewportWidth, int viewportHeight, bool scaled, const Config &config);
 
+        /// The lamps of a mounted artwork (SpotMount::mode not FLUSH), in place
+        /// of drawLamps' single draw: the darkening, then the light, each split
+        /// by scissor between the frame around the art where the shadow can
+        /// fall - the only fragments that need a mount program - and the rest,
+        /// which the plain program draws as if there were no art. Only at scale
+        /// 1.0, which a mount pins (GetClampedSpotScale). @p mvp is drawLamps'
+        /// projection; the plain program is bound with its uniforms set.
+        void drawMounted(int viewportWidth, int viewportHeight, const glm::mat4 &mvp, const Config &config);
+
+        /// The uniforms both mount programs read, into @p program (bound).
+        void uploadMountUniforms(ShaderProgram &program, const glm::mat4 &mvp, const Config &config);
+
     private:
         ShaderProgram mShaderProgram;
+        /// The mount shadow's two programs (spotlight-mount.glsl): spotlight.frag
+        /// with SPOT_FX_MOUNT, the light under the shadow, and with
+        /// SPOT_FX_MOUNT_DARKEN, the darkening under the light. Built with
+        /// the plain program in setupShaders; one that fails to build leaves the
+        /// light drawing without a mount.
+        ShaderProgram mMountShader;
+        ShaderProgram mMountDarkenShader;
         /// Scaled path only: composites the scaled buffer back at full res,
         /// and dithers it on the way (spotlight-blit.frag). Built
         /// unconditionally rather than lazily - a shader compile in the
@@ -289,11 +312,6 @@ namespace EdgeLighting
         /// What this frame's @ref RenderOffscreen left for @ref Render - see
         /// @ref FrameState.
         FrameState mFrame;
-
-        /// THE SHADOW caster (@c SpotlightConfig::shadowCaster), every bit of
-        /// it: a module of its own this class only calls at marked hooks.
-        /// See spotlight-shadow.h.
-        SpotlightShadow mShadow;
     };
 }
 

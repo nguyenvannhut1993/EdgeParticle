@@ -1130,20 +1130,6 @@ namespace EdgeLighting
         /// blanks the lamp. Set the rectangle first.
         bool clipped = false;
 
-        /// Whether @c SpotlightConfig::shadowCaster throws a shadow of THIS
-        /// lamp's light. Per lamp for the reason @ref clipped is: a key light
-        /// over a picture should cast one, a fill lamp washing the scene may
-        /// not. Default false, so adding a caster to an existing rig changes
-        /// nothing until a lamp asks for it.
-        ///
-        /// The only gate - @ref ShadowCaster has no enable of its own - but
-        /// not a trap: an unset caster is 0 x 0 and blocks nothing.
-        ///
-        /// Like @ref clipped, it pins @c SpotlightConfig::resolutionScale to
-        /// 1.0 while the lamp draws: the boundary between the lit picture and
-        /// its shadow is a hard, per-fragment edge.
-        bool castsShadow = false;
-
         bool operator==(const SpotLight &o) const
         {
             return position == o.position &&
@@ -1159,225 +1145,74 @@ namespace EdgeLighting
                    colorTemp == o.colorTemp &&
                    tint == o.tint &&
                    enable == o.enable &&
-                   castsShadow == o.castsShadow &&
                    clipped == o.clipped;
         }
         bool operator!=(const SpotLight &o) const { return !(*this == o); }
     } SpotLight;
 
-    /// A flat rounded-rectangle picture hung IN FRONT of the wall the lamps
-    /// light, in APP coordinates - the thing that throws a shadow.
-    ///
-    /// The spotlight layer draws its cones on one plane, the wall. This puts a
-    /// second plane between the wall and the lamps: the caster's face sits
-    /// @c wallDistance px off the wall, and every lamp opted in with
-    /// @c SpotLight::castsShadow is taken to stand SPOT_LAMP_WALL_DISTANCE
-    /// (150) px off it - one distance for the whole rig, because only the
-    /// ratio of the two reaches the picture (see @ref wallDistance). A
-    /// fragment on the wall is in shadow when the straight line from it to the
-    /// lamp crosses the caster - so the shadow is the caster's rectangle
-    /// scaled up about the lamp's position by `150 / (150 - wallDistance)`,
-    /// pushed AWAY from the lamp. A lamp above a picture puts a thick band under it
-    /// and thin bands down both sides, and nothing above it, because the top
-    /// of the shadow lands behind the picture itself.
-    ///
-    /// The face of the caster is in front of the plane it blocks, so it stays
-    /// LIT: the light is removed only from the wall around it. That is what
-    /// lets a host draw its picture into this rectangle, under the effect, and
-    /// get both a lit picture and its shadow from one layer. How much light
-    /// the picture itself takes is @ref lightOnPicture.
-    ///
-    /// **LIGHT ONLY by default, like the rest of the layer.** A shadow here is
-    /// this layer's own light taken away - a coverage multiply on the lamp's
-    /// shading, as @ref ClipArea is - not a darkening of what the host drew.
-    /// Over a dark backdrop that reads exactly as a shadow; over a backdrop
-    /// already brighter than the lamp, there is little light to take away and
-    /// so little shadow to see. @ref darkness is the opt-in that darkens the
-    /// backdrop as well.
-    ///
-    /// **Inert by default.** A 0 x 0 caster, or one at @c wallDistance 0 (flush
-    /// with the wall, where its shadow lies entirely behind it), blocks nothing
-    /// - unlike a zero-size @c ClipMode::KEEP_INSIDE area, which blanks a lamp.
-    /// So opting a lamp in before the rectangle is set changes nothing. (A
-    /// flush caster with @ref lightOnPicture below 1 still dims its picture -
-    /// that is a choice made on the caster, not a shadow.)
-    ///
-    /// Its own rectangle rather than @c Config::geometry, for the reason
-    /// @ref ClipArea gives: the spotlight layer reads nothing but
-    /// @c Config::spotlight. A host that wants the shadow under its rect copies
-    /// the numbers across. The reference is docs/guides/spotlight-shadow.md.
-    typedef struct ShadowCaster
+    /// How the artwork sits on the wall, for the spotlight's mount shadow
+    /// (@ref SpotMount). The values ARE the shader's mode, uArtLevels.z.
+    typedef enum class MountMode
     {
-        /// TOP-LEFT corner in APP coordinates - the same space as
-        /// @c RectGeometry::position and @c SpotLight::position.
-        glm::vec2 position = glm::vec2(0.0f, 0.0f);
-        float width = 0.0f;  ///< Size in px. Zero on either axis casts nothing.
-        float height = 0.0f; ///< See @ref width.
-        /// Corner rounding in px, clamped by the renderer to half the shorter
-        /// side. The shadow is rounded to match.
-        float cornerRadius = 0.0f;
+        FLUSH,   ///< 0: no shadow, no bevel - the light draws through its plain program.
+        RAISED,  ///< 1: the panel stands off the wall; its shadow falls on the wall, away from each lamp.
+        RECESSED ///< 2: the art sits behind an opening; the edge nearest a lamp shades a band of the art,
+                 ///<    and a 45 degree bevel round the opening is lit by how it faces the lamp.
+    } MountMode;
 
-        /// How far the caster's face stands off the wall, in px - the depth
-        /// that turns a flat rectangle into something with a shadow, and the
-        /// ONE distance the shadow has. 0 is flush and casts nothing visible.
-        ///
-        /// It is measured against lamps SPOT_LAMP_WALL_DISTANCE (150) px off
-        /// the wall, the same for every lamp, as `t = wallDistance / 150`:
-        /// the shadow is the caster scaled by `1 / (1 - t)` about each
-        /// casting lamp's position, and its penumbra is
-        /// `2 * apertureWidth * t / (1 - t)` px wide plus @ref softness. So a
-        /// larger value throws the shadow further and softens its edge. Only
-        /// that ratio reaches the picture - scaling every distance by one
-        /// factor changes nothing - which is why the lamps carry no distance
-        /// of their own.
-        ///
-        /// As it nears 150 a PANEL's shadow grows out of view, and at or
-        /// past it the panel casts nothing (the lamps are behind its face).
-        /// A SOLID caster that deep throws a shadow that never ends: the
-        /// lamps graze its side, and light along the wall stops at the block
-        /// - except a lamp inside the block's footprint, which casts nothing.
-        float wallDistance = 0.0f;
-
-        /// Extra feather across the shadow's edge, in px ON THE WALL, on top
-        /// of the penumbra the lamp's own size produces. 1.0 - the default -
-        /// is a single pixel, enough to antialias a lamp small enough to cast
-        /// a hard shadow. Larger values are a look.
-        float softness = 1.0f;
-
-        /// Fraction of a lamp's light the caster stops, in [0, 1]. 1 is an
-        /// opaque picture; below that some light reaches the wall behind it -
-        /// a translucent panel, or a way to keep the shadow from going all the
-        /// way down to the bare backdrop.
-        float opacity = 1.0f;
-
-        /// How far the OTHER lamps' light washes a lamp's shadow out, in
-        /// [0, 1]. **0 - the default - is physical**: a point in lamp A's
-        /// shadow receives exactly the light of every other lamp that reaches
-        /// it, so where lamp B is weaker than A the shadow still shows,
-        /// lighter. Above 0 this is a LOOK, not physics: A's shadow fades
-        /// wherever the other lamps put light on it, and at 1 it is gone
-        /// wherever they reach half of what A would have put there
-        /// (SPOT_FILL_FULL_RATIO).
-        ///
-        /// It never fills a shadow with the shadowed lamp's own light
-        /// alone - a lamp cannot wash out its own penumbra - and it only
-        /// counts light that actually REACHES the point: a second lamp that is
-        /// itself blocked there fills nothing.
-        ///
-        /// **Costs a second pass** while above 0 and a lamp casts a shadow:
-        /// the lamps are drawn once into a viewport-sized RGBA8 buffer to find
-        /// how much light reaches each point, then again onto the target
-        /// reading it - every strip rasterised twice, plus clearing and
-        /// holding that buffer. At 0, or with no lamp casting, there is no
-        /// second pass and no buffer.
-        float fill = 0.0f;
-
-        /// How far the shadow darkens what is BEHIND this layer, in [0, 1].
-        /// **0 - the default - is light only**: a shadow is just the lamp's
-        /// light taken away, so over a backdrop brighter than the lamp it all
-        /// but disappears (5 levels over 0.85 grey where it is 28 over 0.1),
-        /// and over a transparent surface the umbra writes alpha 0, so a
-        /// compositor shows what is behind it at full brightness.
-        ///
-        /// Above 0 each casting lamp also darkens the destination inside its
-        /// shadow, BEFORE the light is screened on, by
-        /// `darkness * (1 - visibility) * reach`: reach rises from 0 where the
-        /// lamp puts no light to 1 where it puts SPOT_SHADOW_FULL_REACH of
-        /// full scale, so there is no shadow where there is no light and the
-        /// shadow fades out with the beam. It is written as premultiplied
-        /// @ref color over the destination, alpha included, so the umbra
-        /// carries coverage and a video plane behind the surface darkens too.
-        /// The other lamps' light still lands on top, and @ref fill lifts the
-        /// darkening with the shadow. It darkens whatever the framebuffer
-        /// already holds there.
-        ///
-        /// Costs one more pass over the casting lamps' strips while above 0.
+    /// The spotlight's MOUNT SHADOW: a framed artwork on the wall that shades
+    /// the cones falling on it (lib/shaders/spotlight-mount.glsl). It
+    /// multiplies each lamp's CONE, never its bloom, and only ever darkens it -
+    /// except on a recessed bevel turned toward a lamp, which brightens up to
+    /// SPOT_FX_BEVEL_MAX_GAIN. Every field is what the shader reads, 1:1.
+    ///
+    /// Inert at @c MountMode::FLUSH (the default), where the renderer draws
+    /// with the program it always had. Any other mode holds the layer's
+    /// resolution scale at 1.0: the shadow's edges are as narrow as the clip
+    /// area's and blur the same way in a reduced buffer.
+    typedef struct SpotMount
+    {
+        MountMode mode = MountMode::FLUSH;    ///< -> uArtLevels.z
+        glm::vec2 position = glm::vec2(0.0f); ///< Artwork top-left, app px (origin top-left, +y down).
+        float width = 0.0f;                   ///< Artwork width, px.
+        float height = 0.0f;                  ///< Artwork height, px.
+        float cornerRadius = 0.0f;            ///< px, clamped to the shorter half extent -> uArtShape.x
+        float shadowLength = 60.0f;           ///< How far the shadow reaches, px -> uArtMount.x
+        float shadowSoftness = 0.1f;          ///< Penumbra px gained per px from the occluder -> uArtMount.y
+        float shadowStrength = 0.8f;          ///< [0, 1], 0 = no shadow -> uArtLevels.w
+        /// How far the shadow darkens what is BEHIND the light, [0, 1]. The
+        /// light only ever adds, so on a bright background a shadow that merely
+        /// withholds it is invisible: this lays black over the shadow instead,
+        /// before the light is drawn - on a transparent surface over a video, as
+        /// alpha. 0 (the default) draws nothing extra. It scales with
+        /// @c shadowStrength and with the cone's own light, so it fades out with
+        /// the beam. It darkens everything already drawn in the shadow, other
+        /// layers included: put the spotlight at the bottom of the layer order
+        /// to spare them.
         float darkness = 0.0f;
+        float bevel = 0.0f;                   ///< Bevel width round the opening, px, RECESSED only -> uArtMount.z
+        /// tan of the lamps' elevation above the wall -> uArtMount.w. Shades
+        /// the bevel only. A mount standing @c d px off the wall casts a
+        /// shadow @c d / tanElevation px long, which is how a host derives this
+        /// from a mount depth.
+        float tanElevation = 0.5f;
 
-        /// The colour @ref darkness paints the shadow with, linear RGB in
-        /// [0, 1]. Black - the default - scales the backdrop down; a dark warm
-        /// tone reads as a shadow on a lit warm wall. Exact under a
-        /// premultiplied compositor; black is exact under any.
-        glm::vec3 color = glm::vec3(0.0f, 0.0f, 0.0f);
-
-        /// Whether the caster is a SOLID BLOCK from the wall out to
-        /// @c wallDistance - a framed picture - rather than a flat panel
-        /// floating that far in front of it. Default false: the panel.
-        ///
-        /// A block's shadow is everything its whole depth projects, so it is
-        /// attached to the caster (under a lamp above it, the side shadows
-        /// start at its top corners and widen downward) where a panel's is a
-        /// detached copy. And a block at least SPOT_LAMP_WALL_DISTANCE deep -
-        /// as deep as the lamps are far from the wall - throws a shadow that
-        /// never ends: light along the wall stops at the block, where a
-        /// panel that deep casts nothing. The caster's face stays lit either
-        /// way. See
-        /// docs/design/spotlight-solid-frame-plan.md.
-        ///
-        /// Costs about a tenth more than the panel: the search behind its soft
-        /// edge (SPOT_SOLID_SEARCH_STEPS signed-distance evaluations) runs
-        /// only where the shadow hangs from the block's sides, and the rest
-        /// of a casting lamp's strip is settled, exactly, from the two ends of
-        /// each fragment's line to the lamp - see spotSolidWall in
-        /// spotlight-shadow.glsl.
-        bool solid = false;
-
-        /// Width of a FRAME's rails, in px. The picture is the caster's
-        /// rectangle inset by this much, and with @c frameDepth above 0 the
-        /// rails shade it. 0 - the default - is no frame. Clamped to the
-        /// shorter half side.
-        float frameWidth = 0.0f;
-
-        /// How far the picture sits behind the rails' front, in px. Lit from
-        /// above, the top rail then casts a band of shadow across the top of
-        /// the picture, deeper as this grows. 0 -
-        /// the default - is flush: no rail shadow. Clamped to
-        /// @c wallDistance. Works for a panel or a block.
-        float frameDepth = 0.0f;
-
-        /// How much of a casting lamp's light lands on the PICTURE, in
-        /// [0, 1]: the caster's whole face, rails included - the rectangle a
-        /// host draws its picture into. **1 - the default - lights it like
-        /// the wall.**
-        ///
-        /// The layer SCREENS its light over whatever the host drew, so a
-        /// bright lamp lifts every dark part of a picture towards the lamp's
-        /// own colour and the picture washes out: real light multiplies a
-        /// surface, this adds to it. Below 1 the face shows only that
-        /// fraction of the light, and at 0 it shows exactly what the host
-        /// drew. The wall, its light and its shadow are untouched.
-        ///
-        /// The rails' shadow on the picture (@ref frameWidth,
-        /// @ref frameDepth) is drawn as every shadow is - the light it takes
-        /// away, of which less is left on the face, plus @ref darkness at the
-        /// same strength as on the wall, in @ref color. So at 0 that shadow
-        /// is @ref darkness alone: raise it to see the shadow on an unlit
-        /// picture, as on a wall with no light to take.
-        ///
-        /// Applies to every lamp with @c SpotLight::castsShadow, whatever
-        /// @ref wallDistance and @ref opacity are. Costs one rounded-box SDF
-        /// per fragment of each such lamp while below 1; at 1 nothing runs.
-        float lightOnPicture = 1.0f;
-
-        bool operator==(const ShadowCaster &o) const
+        bool operator==(const SpotMount &o) const
         {
-            return position == o.position &&
+            return mode == o.mode &&
+                   position == o.position &&
                    width == o.width &&
                    height == o.height &&
                    cornerRadius == o.cornerRadius &&
-                   wallDistance == o.wallDistance &&
-                   softness == o.softness &&
-                   opacity == o.opacity &&
-                   fill == o.fill &&
+                   shadowLength == o.shadowLength &&
+                   shadowSoftness == o.shadowSoftness &&
+                   shadowStrength == o.shadowStrength &&
                    darkness == o.darkness &&
-                   color == o.color &&
-                   solid == o.solid &&
-                   frameWidth == o.frameWidth &&
-                   frameDepth == o.frameDepth &&
-                   lightOnPicture == o.lightOnPicture;
+                   bevel == o.bevel &&
+                   tanElevation == o.tanElevation;
         }
-        bool operator!=(const ShadowCaster &o) const { return !(*this == o); }
-    } ShadowCaster;
+        bool operator!=(const SpotMount &o) const { return !(*this == o); }
+    } SpotMount;
 
     /// Spotlight renderer configuration: a list of independently placed lamps.
     ///
@@ -1390,10 +1225,6 @@ namespace EdgeLighting
     /// The one thing that DOES stop light is @c clip - an explicit area, opted
     /// into per lamp by @c SpotLight::clipped. That is a cut, not a shadow:
     /// nothing in the scene casts it and nothing in the scene blocks it.
-    ///
-    /// With the shadow caster there is a second: @c shadowCaster, opted into
-    /// per lamp by @c SpotLight::castsShadow - a picture standing off the
-    /// wall, whose shadow moves with the lamp. See @ref ShadowCaster.
     typedef struct SpotlightConfig
     {
         bool enable = false; ///< Enable or disable the spotlight renderer
@@ -1413,11 +1244,9 @@ namespace EdgeLighting
         /// and that the @c KEEP_INSIDE case also narrows the strip geometry.
         ClipArea clipArea;
 
-        /// The picture that throws a shadow of the lamps with
-        /// @c SpotLight::castsShadow set. Inert for every other lamp, and for
-        /// all of them while it is 0 x 0 or flush with the wall. See
-        /// @ref ShadowCaster.
-        ShadowCaster shadowCaster;
+        /// The framed artwork's mount shadow. Inert at its default
+        /// (@c MountMode::FLUSH). See @ref SpotMount.
+        SpotMount mount;
 
         /// Fraction of the viewport the lamps are rendered at before being
         /// bilinear-blitted back to full resolution. 1.0 draws straight onto
@@ -1455,17 +1284,13 @@ namespace EdgeLighting
         /// large rig anyway. The value is kept, not rewritten - drop the clip
         /// and it takes effect again - and the renderer logs both transitions
         /// so the override is never silent.
-        ///
-        /// A lamp with @c SpotLight::castsShadow set holds it the same way,
-        /// for the same reason - the edge between a lit picture and its shadow
-        /// is hard - and the shadow logs its own transitions.
         float resolutionScale = 1.0f;
 
         bool operator==(const SpotlightConfig &o) const
         {
             return enable == o.enable && lamps == o.lamps &&
                    clipArea == o.clipArea &&
-                   shadowCaster == o.shadowCaster &&
+                   mount == o.mount &&
                    resolutionScale == o.resolutionScale;
         }
         bool operator!=(const SpotlightConfig &o) const { return !(*this == o); }

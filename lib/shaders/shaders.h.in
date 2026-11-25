@@ -142,16 +142,28 @@ namespace EdgeLighting
 )shadersrc";
 
                 static const char *const SPOTLIGHT_VERT_SRC = R"shadersrc(@GLSL_VERSION@
-@SPOTLIGHT_SHADOW_TUNING@
-@SPOTLIGHT_SHADOW_VERT@
 @SPOTLIGHT_VERT_CONTENT@
 )shadersrc";
 
                 static const char *const SPOTLIGHT_FRAG_SRC = R"shadersrc(@GLSL_VERSION@
 @SPOTLIGHT_TUNING@
-@SPOTLIGHT_SHADOW_TUNING@
 @SPOTLIGHT_DITHER@
-@SPOTLIGHT_SHADOW@
+@SPOTLIGHT_FRAG_CONTENT@
+)shadersrc";
+
+                static const char *const SPOTLIGHT_MOUNT_FRAG_SRC = R"shadersrc(@GLSL_VERSION@
+#define SPOT_FX_MOUNT
+@SPOTLIGHT_TUNING@
+@SPOTLIGHT_DITHER@
+@SPOTLIGHT_MOUNT@
+@SPOTLIGHT_FRAG_CONTENT@
+)shadersrc";
+
+                static const char *const SPOTLIGHT_MOUNT_DARKEN_FRAG_SRC = R"shadersrc(@GLSL_VERSION@
+#define SPOT_FX_MOUNT_DARKEN
+@SPOTLIGHT_TUNING@
+@SPOTLIGHT_DITHER@
+@SPOTLIGHT_MOUNT@
 @SPOTLIGHT_FRAG_CONTENT@
 )shadersrc";
 

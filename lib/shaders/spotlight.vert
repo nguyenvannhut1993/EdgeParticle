@@ -47,6 +47,10 @@ layout(location = 5) in float aClipWeight; ///< 1 where this lamp honours the cl
 /// Exponent on the cone's spread term - SpotLight::spreadFalloff, clamped.
 /// Its own attribute because aP0 and aP1 are full; see StripVertex.
 layout(location = 6) in float aSpreadFalloff;
+/// The lamp's own position, SpotLight::position in app px - the same value on
+/// every vertex of a lamp's strip. Read only by the SPOT_FX_MOUNT variant of
+/// spotlight.frag (spotlight-mount.glsl), for the direction to the lamp.
+layout(location = 7) in vec2 aLampPos;
 
 out vec2 vLocal;
 out vec2 vApp;
@@ -55,6 +59,7 @@ flat out vec4 vP1;
 flat out vec3 vColor;
 flat out float vClipWeight;
 flat out float vSpreadFalloff;
+flat out vec2 vLampPos;
 
 uniform mat4 uMVP;
 
@@ -66,7 +71,6 @@ void main() {
     vColor = aColor;
     vClipWeight = aClipWeight;
     vSpreadFalloff = aSpreadFalloff;
-    // THE SHADOW's per-lamp attributes - spotlight-shadow-vert.glsl.
-    spotShadowForward();
+    vLampPos = aLampPos;
     gl_Position = uMVP * vec4(aPos, 0.0, 1.0);
 }

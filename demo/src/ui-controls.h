@@ -3,8 +3,6 @@
 
 #include "core/edge-lighting.h"
 #include "renderer/spotlight-tuning.h" // SPOT_MAX_LAMPS + SPOT_BLOOM_WINDOW_OUTER
-#include "renderer/spotlight-shadow-tuning.h" // SPOT_LAMP_WALL_DISTANCE
-#include "renderer/spotlight-shadow.h"        // SpotlightShadow::PinsResolutionScale
 #include "util/geometry-utils.h"       // sun placement, shared with the renderer
 #include <iostream>
 #include <iomanip>
@@ -138,13 +136,11 @@ namespace EdgeLightingDemo
     /// because none of them is visible in the sub-config a reader would go
     /// looking in: the droplet band takes its SIDE from NeonConfig::glowSide,
     /// the flare's perimeter fraction runs along the OFFSET rect rather than
-    /// the perimeter printed at the top, and an enabled clipped or
-    /// shadow-casting lamp holds SpotlightConfig::resolutionScale at 1.0
-    /// whatever the field says.
+    /// the perimeter printed at the top, and an enabled clipped lamp holds
+    /// SpotlightConfig::resolutionScale at 1.0 whatever the field says.
     ///
     /// Every position printed here is in APP coordinates (origin top-left, +y
-    /// down) - the rect, the sun, the lamps, the clip area and the shadow
-    /// caster alike.
+    /// down) - the rect, the sun, the lamps and the clip area alike.
     inline void PrintFullConfig(const EdgeLighting::Config &config, bool isPlaying)
     {
         using namespace EdgeLighting;
@@ -359,20 +355,16 @@ namespace EdgeLightingDemo
         const char *clipItems[] = {"KEEP_INSIDE", "KEEP_OUTSIDE"};
         size_t drawnLamps = std::min(sp.lamps.size(), static_cast<size_t>(SPOT_MAX_LAMPS));
 
-        // The lamps that DRAW, within the ceiling, of either kind. A clipped
-        // one holds resolutionScale at 1.0 (this mirrors the light's
-        // HasClippedLamp); whether a casting one does is asked of the library
-        // below, since a build can switch that pin off (PIN_RESOLUTION_SCALE
-        // in spotlight-shadow.cpp).
+        // Mirrors SpotlightRenderer's HasClippedLamp: the lamps that DRAW,
+        // within the ceiling. One of these holds resolutionScale at 1.0.
         bool anyClippedLamp = false;
-        bool anyShadowLamp = false;
         for (size_t i = 0; i < drawnLamps; ++i)
         {
             const auto &l = sp.lamps[i];
-            if (l.enable && l.intensity > 0.0f)
+            if (l.clipped && l.enable && l.intensity > 0.0f)
             {
-                anyClippedLamp = anyClippedLamp || l.clipped;
-                anyShadowLamp = anyShadowLamp || l.castsShadow;
+                anyClippedLamp = true;
+                break;
             }
         }
         // A zero-size KEEP_INSIDE area keeps nothing, and ClipArea has no
@@ -393,10 +385,9 @@ namespace EdgeLightingDemo
         std::cout << "  resolutionScale  " << std::setprecision(2) << sp.resolutionScale
                   << (sp.resolutionScale < 1.0f ? "   (scaled buffer + blit)"
                                                 : "   (full res, direct)");
-        if (sp.resolutionScale < 1.0f &&
-            (anyClippedLamp || EdgeLighting::SpotlightShadow::PinsResolutionScale(sp)))
+        if (sp.resolutionScale < 1.0f && anyClippedLamp)
         {
-            std::cout << "   [HELD AT 1.0: a clipped or shadow-casting lamp is enabled]";
+            std::cout << "   [HELD AT 1.0: a clipped lamp is enabled]";
         }
         std::cout << "\n";
 
@@ -413,45 +404,6 @@ namespace EdgeLightingDemo
         else if (clipBlanks)
         {
             std::cout << "                   [ZERO-SIZE KEEP_INSIDE: every clipped lamp draws nothing]\n";
-        }
-
-        const auto &sc = sp.shadowCaster;
-        std::cout << "  shadowCaster     " << std::setprecision(0)
-                  << sc.width << " x " << sc.height
-                  << " at (" << sc.position.x << ", " << sc.position.y << ")"
-                  << ", corner " << sc.cornerRadius
-                  << ", off wall " << sc.wallDistance << " px"
-                  << ", soft " << std::setprecision(1) << sc.softness << " px"
-                  << ", opacity " << std::setprecision(2) << sc.opacity
-                  << ", fill " << sc.fill
-                  << (sc.fill > 0.0f ? " (washed out by other lamps - two passes)" : " (physical)") << "\n";
-        std::cout << "                   darkness " << std::setprecision(2) << sc.darkness
-                  << (sc.darkness > 0.0f ? " (darkens the backdrop - one more pass)" : " (light only)")
-                  << ", color (" << sc.color.r << ", " << sc.color.g << ", " << sc.color.b << ")\n";
-        std::cout << "                   " << (sc.solid ? "SOLID block" : "panel")
-                  << ", frame " << std::setprecision(0) << sc.frameWidth << " px wide, picture "
-                  << sc.frameDepth << " px behind the rails"
-                  << ((sc.frameWidth > 0.0f && sc.frameDepth > 0.0f) ? " (rails shade the picture)" : " (no rail shadow)")
-                  << "\n";
-        std::cout << "                   light on picture " << std::setprecision(2) << sc.lightOnPicture
-                  << (sc.lightOnPicture < 1.0f ? " (casting lamps' light on the picture dimmed; Darkness draws the frame's shadow on it)"
-                                               : " (lit like the wall)")
-                  << "\n";
-        if (!anyShadowLamp)
-        {
-            std::cout << "                   [inert: no drawn lamp has castsShadow set]\n";
-        }
-        else if (sc.width <= 0.0f || sc.height <= 0.0f || sc.wallDistance <= 0.0f || sc.opacity <= 0.0f)
-        {
-            std::cout << "                   [casts nothing: zero size, flush with the wall, or transparent]\n";
-        }
-        else if (sc.wallDistance >= static_cast<float>(SPOT_LAMP_WALL_DISTANCE))
-        {
-            // Every lamp stands SPOT_LAMP_WALL_DISTANCE off the wall. A
-            // panel that deep has the lamps behind its face; a solid block
-            // that deep is the grazing case, whose shadow never ends.
-            std::cout << (sc.solid ? "                   [as deep as the lamps are far out: they graze it, its shadow never ends]\n"
-                                   : "                   [as far out as the lamps: they are behind its face, casts nothing]\n");
         }
 
         std::cout << "\n  lamps (" << sp.lamps.size() << ")\n";
@@ -505,7 +457,6 @@ namespace EdgeLightingDemo
             {
                 std::cout << "   [zero-size KEEP_INSIDE: draws nothing]";
             }
-            std::cout << "  shadow " << (l.castsShadow ? "ON" : "OFF");
             std::cout << "\n";
         }
 

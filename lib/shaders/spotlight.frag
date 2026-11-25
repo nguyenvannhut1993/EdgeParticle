@@ -158,18 +158,19 @@ float spotClipMask(vec2 app) {
 uniform float uDither;
 
 void main() {
-    // THE SHADOW's darkening variant (spotlight-shadow.glsl) takes its mask
-    // before the light, with the aperture floored as apertureWidth is below:
-    // where nothing is in shadow it writes an exact 0 without shading the lamp
-    // at all.
-#ifdef SPOT_SHADOW_DARKEN
-    float shadowCover = spotShadowDarkenCover(vApp, max(vP1.x, SPOT_MIN_APERTURE));
-    if (shadowCover >= 1.0) {
+#if defined(SPOT_FX_MOUNT_DARKEN)
+    // MOUNT DARKENING - the SPOT_FX_MOUNT_DARKEN variant only, drawn before the
+    // light under an over-black blend. The shadow's mask first: where it is 0
+    // there is nothing to draw and none of the falloff below is worth its
+    // exp and pow. The rest of this variant is the block after the cone.
+    vec2 darkLampV = vLampPos - vApp;
+    float darkDist = length(darkLampV);
+    float darkShadow = mountShadow(vApp, darkLampV / max(darkDist, 1.0e-3), darkDist);
+    if (darkShadow <= 0.0) {
         fragColor = vec4(0.0);
         return;
     }
 #endif
-
     float along = vLocal.x;
     float across = vLocal.y;
 
@@ -220,6 +221,30 @@ void main() {
                 ? apertureWidth / halfW
                 : pow(apertureWidth / halfW, vSpreadFalloff);
 
+#if defined(SPOT_FX_MOUNT)
+    // MOUNT SHADOW - the SPOT_FX_MOUNT variant only; the functions, uniforms
+    // and vLampPos are in spotlight-mount.glsl. On the cone alone, before the
+    // bloom joins it (the bloom is glare at the lens, not light on the wall),
+    // and before the highlight shoulder and the clip, like every other factor
+    // of the falloff. vApp is read here as well as by the clip.
+    vec2 toLampV = vLampPos - vApp;
+    float distLamp = length(toLampV);
+    vec2 toLamp = toLampV / max(distLamp, 1.0e-3);
+    float mountF = (1.0 - mountShadow(vApp, toLamp, distLamp)) *
+                   bevelFacing(vApp, toLamp);
+    cone *= mountF;
+#endif
+
+#if defined(SPOT_FX_MOUNT_DARKEN)
+    float darkAlpha = mountDarken(darkShadow, cone * intensity * max(max(vColor.r, vColor.g), vColor.b),
+                                  mix(1.0, spotClipMask(vApp), vClipWeight));
+    // Dithered like the light - a shallow alpha ramp over a bright background
+    // bands in 8 bits - but an exact 0 stays 0: no speckle outside the shadow.
+    fragColor = vec4(0.0, 0.0, 0.0,
+                     darkAlpha > 0.0 ? max(darkAlpha + spotDitherOffset(vLocal), 0.0) : 0.0);
+    return;
+#endif
+
     float d2 = along * along + across * across;
     float r2 = bloomRadius * bloomRadius;
     float bloom = bloomStrength * r2 / (d2 + r2);
@@ -262,16 +287,6 @@ void main() {
     // and unclipped lamps shades them at the same cost - vClipWeight is flat,
     // so this is one lerp against a value constant across the triangle.
     lit *= mix(1.0, spotClipMask(vApp), vClipWeight);
-
-    // THE SHADOW (spotlight-shadow.glsl), in the same place as the clip and
-    // for its reasons. The darkening variant writes the shadow instead of the
-    // light, and stops here.
-#ifdef SPOT_SHADOW_DARKEN
-    fragColor = spotShadowDarken(vApp, shadowCover, lit, spotDitherOffset(vLocal) * uDither);
-    return;
-#else
-    lit = spotShadowLight(vApp, lit, apertureWidth);
-#endif
 
     // Coverage = brightest channel, exactly as in neon.frag and
     // lens-flare.frag: a bright aperture core reads as solid to whatever
